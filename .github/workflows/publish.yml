@@ -4,6 +4,13 @@ name: auto-publish
 # Protocol: add a `## [x.y.z] - date` section at the top of CHANGELOG.md, push.
 # Everything else — tests, package.json stamp, npm publish, git tag, GitHub
 # release, version-bump commit back to main — is automatic.
+#
+# Uses npm Trusted Publishing (OIDC): no NPM_TOKEN secret exists anywhere.
+# One-time setup after the first (manual, local) publish of the package:
+# npmjs.com → package → Settings → Trusted publisher →
+#   owner avinaxhroy, repo brushrouter, workflow filename publish.yml
+# (npm's OIDC cannot publish a package's very first version — npm/cli #8544 —
+#  so the bootstrap is one local `npm publish`.)
 
 on:
   push:
@@ -19,12 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # tag + release + version-bump commit
+      id-token: write # OIDC claim for npm trusted publishing — replace the token
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, pinned to SHA
+        with:
+          persist-credentials: false # job pushes via explicit x-access-token URL; don't leak the rev token into later steps
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0, pinned to SHA
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm CLI >= 11.5.1; Node 22 ships 10.x
+      - run: npm install -g npm@latest
 
       - name: Read newest version from CHANGELOG.md
         id: ver
@@ -67,11 +79,9 @@ jobs:
           CHANGELOG_VERSION: ${{ steps.ver.outputs.version }}
         run: npm version "$CHANGELOG_VERSION" --allow-same-version --no-git-tag-version
 
-      - name: Publish to npm
+      - name: Publish to npm (trusted publisher — OIDC, no token)
         if: steps.gate.outputs.skip == 'false'
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Tag, release, push version bump
         if: steps.gate.outputs.skip == 'false'
