@@ -1,0 +1,56 @@
+{
+  "id": "illustration",
+  "label": "Illustration & art",
+  "intent": "Drawn rather than photographed. The style has to hold together across the whole frame.",
+  "aliases": ["illustration", "art", "drawing", "painting", "artwork", "storybook", "comic", "manga", "anime", "cartoon", "sketch", "watercolour", "watercolor", "vector art", "concept art", "line art"],
+  "recipes": [
+    {
+      "id": "storybook-spread",
+      "goal": "A painted scene with narrative warmth, like a page from a picture book.",
+      "when": "Children's book, editorial illustration, a gentle scene that has to feel hand-made.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "render", "subject"],
+      "defaults": { "ratio": "4:3", "composition": "wide establishing", "lighting": "golden hour", "grading": "warm muted", "mood": "nostalgic", "render": "digital painting" },
+      "text": "Create a {ratio} storybook illustration of {subject}.\nSCENE — {subject}, staged as a moment in a longer story. Include one or two supporting details that imply something happened before this frame and something will happen after it.\nCOMPOSITION — {composition}. Keep the main subject clear and give the eye a path through the image rather than a symmetrical arrangement.\nSTYLE — {render} with a visible hand: soft edges, deliberate brush marks, simplified shapes rather than photographic detail. Consistent handling across the whole frame — no mixing of techniques.\nLIGHTING — {lighting}, warm and directional, with soft shadows.\nCOLOUR — {grading}, a limited palette of five or six colours at most.\nMOOD — {mood}.\nNo text anywhere in the frame.",
+      "image": {
+        "accepts": "a photo of a person, place or object",
+        "preserve": ["the subject's likeness", "key objects", "the scene's layout"],
+        "skeleton": "Use the supplied image as the reference for the subject of this illustration. Keep the person or place recognisable, but translate it fully into the illustration style rather than tracing the photograph.\n\nCreate a {ratio} {render} storybook illustration: {subject}, staged as a moment in a longer story with one or two details implying what came before and after. {composition} with a clear path for the eye. Visible hand — soft edges, deliberate brush marks, simplified shapes, consistent handling throughout. {lighting}, {grading} held to five or six colours, {mood}. No text in the frame."
+      },
+      "negatives": ["no photographic realism", "no mixed illustration techniques", "no text or lettering", "no watermark", "no more than six colours", "no stiff symmetrical staging"],
+      "example": "Create a 4:3 storybook illustration of a girl and a fox sheltering under a large mushroom during rain. SCENE — the two huddled together, dry; a discarded boot and a half-eaten apple nearby imply they have been walking a long way. COMPOSITION — wide establishing, the mushroom on the left third, open wet meadow to the right giving the eye somewhere to travel. STYLE — digital painting with visible brush marks, soft edges and simplified shapes, consistent handling across the whole frame. LIGHTING — golden hour breaking through the rain from the right, soft long shadows. COLOUR — warm muted, six colours only. MOOD — nostalgic and safe. No text anywhere."
+    },
+    {
+      "id": "style-transfer",
+      "goal": "An existing image redrawn in a chosen artistic style.",
+      "when": "You have a real image and want it as art: a photo as an oil painting, a portrait as a woodblock print.",
+      "shape": "single",
+      "slots": ["ratio", "grading", "mood", "render", "subject"],
+      "defaults": { "ratio": "3:4", "grading": "rich saturated", "mood": "calm", "render": "digital painting" },
+      "text": "Redraw the supplied image as a {ratio} artwork in the style of {subject}.\nFIDELITY — keep the composition, the placement of every major element and the identity of any person exactly as they are in the source. This is a restatement of the same image, not a new picture inspired by it.\nSTYLE — {render}. Apply the technique consistently across the entire frame: same mark-making, same level of detail, same edge quality everywhere. Do not leave any region looking photographic.\nSIMPLIFY — reduce photographic detail to the shapes the style actually needs. A brush does not render every leaf.\nCOLOUR — {grading}, chosen for the style rather than copied from the source.\nMOOD — {mood}.\nRENDER — one coherent technique from edge to edge, with visible evidence of the medium.",
+      "image": {
+        "accepts": "any photo",
+        "preserve": ["composition", "placement of major elements", "the subject's identity"],
+        "skeleton": "Redraw the supplied photograph as a {ratio} artwork in the style of {subject}. Keep the composition and the placement of every major element exactly as they are, and preserve the identity of anyone in it.\n\nSTYLE — {render}, applied consistently edge to edge: same mark-making, same detail level, same edge quality everywhere, with visible evidence of the medium. Reduce photographic detail to the shapes the style actually needs. {grading} chosen for the style rather than copied from the photo. {mood}. No region of the frame may still look photographic."
+      },
+      "negatives": ["no photographic regions left in frame", "no changing the composition", "no altering the subject's identity", "no mixed styles within one image", "no watermark", "no over-detailed rendering that fights the style"],
+      "example": "Redraw the supplied photograph as a 3:4 artwork in the style of a mid-century Japanese woodblock print. FIDELITY — keep the composition and the placement of every element exactly as in the source, and preserve the identity of the person in it. STYLE — digital painting emulating woodblock: flat areas of colour, bold carved outlines, visible paper grain, consistent handling edge to edge with no photographic region left. SIMPLIFY — reduce the foliage to a handful of carved shapes; do not render individual leaves. COLOUR — rich saturated, indigo, ochre and bone. MOOD — calm."
+    },
+    {
+      "id": "concept-key-visual",
+      "goal": "A world or scene invented from scratch, cinematic in scale.",
+      "when": "Game or film concept art, a book cover, a setting that needs to feel like a real place.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "render", "subject"],
+      "defaults": { "ratio": "16:9", "composition": "wide establishing", "lighting": "single dramatic source", "grading": "cool desaturated", "mood": "dramatic", "render": "digital painting" },
+      "text": "Create a {ratio} concept artwork of {subject}.\nWORLD — establish a place with real scale and a clear sense of history. Something in the scene should suggest how it got this way, and something should suggest what it costs to be here.\nSCALE — include a human-scale reference point so the viewer can measure the space. Use atmospheric perspective: distant forms lose contrast and detail.\nCOMPOSITION — {composition}, with a strong foreground, a clear midground subject and depth behind it.\nLIGHTING — {lighting}, giving the scene a readable value structure from dark to light.\nCOLOUR — {grading}, with one warm accent reserved for the focal point.\nMOOD — {mood}.\nRENDER — {render}, cinematic and deliberate. Every element should look placed rather than incidental.",
+      "image": {
+        "accepts": "a photo of a location or a sketch",
+        "preserve": ["the location's defining features", "layout", "scale relationships"],
+        "skeleton": "Use the supplied image as the reference for the setting. Keep its defining features, layout and scale relationships, then push it into concept-art treatment.\n\nCreate a {ratio} {render} concept artwork: {subject}. Establish real scale with a human reference point and atmospheric perspective. {composition} with a strong foreground, a clear midground subject and depth behind. {lighting} for a readable value structure, {grading} with one warm accent reserved for the focal point, {mood}. Cinematic and deliberate; every element placed rather than incidental."
+      },
+      "negatives": ["no flat or even lighting", "no readable scale ambiguity", "no photobashed mismatched elements", "no watermark", "no focal point competing with the accent colour", "no text or lettering"],
+      "example": "Create a 16:9 concept artwork of a flooded city intersection thirty years after the water arrived. WORLD — traffic lights still standing above the surface, now colonised by nesting birds; a makeshift jetty of salvaged signage suggests someone still lives here. SCALE — a single small boat in the midground gives the towers their height. Atmospheric perspective fades the far skyline. COMPOSITION — wide establishing, foreground water and debris, the boat on the midground third, towers behind. LIGHTING — one cold source low behind the buildings, a readable dark-to-light value structure. COLOUR — cool desaturated blue-grey, with one warm sodium-lamp accent marking the jetty. MOOD — dramatic and quiet. RENDER — digital painting, cinematic, deliberate."
+    }
+  ]
+}

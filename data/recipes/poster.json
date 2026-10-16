@@ -1,0 +1,51 @@
+{
+  "id": "poster",
+  "label": "Posters & covers",
+  "intent": "One frame that has to work as a thumbnail and as a printed object. Big idea, few elements, readable at any size.",
+  "aliases": ["poster", "cover", "key art", "movie poster", "album cover", "flyer", "thumbnail", "youtube thumbnail", "billboard", "one sheet", "key visual", "print", "album art"],
+  "recipes": [
+    {
+      "id": "hero-poster",
+      "goal": "A single strong poster: one subject, one light, one line of type.",
+      "when": "Film poster, album cover, event flyer. The image must survive being shrunk to a thumbnail.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "type", "text", "subject"],
+      "defaults": { "ratio": "2:3", "composition": "centred hero", "lighting": "single dramatic source", "grading": "high-contrast cinematic", "mood": "dramatic", "type": "condensed grotesque" },
+      "text": "Create a {ratio} poster.\nSUBJECT — {subject}, treated as the single dominant element. Simplify: one focal point, not a busy scene.\nCOMPOSITION — {composition}, with the lower third kept quiet enough to carry type.\nLIGHTING — {lighting}.\nCOLOUR — {grading}, held to a tight palette so it reads at thumbnail size.\nMOOD — {mood}.\nTYPE — the exact text \"{text}\" set in {type}, placed in the quiet zone, clearly legible, correctly spelled, no other lettering anywhere.\nRENDER — print-ready poster art with a strong silhouette and clear figure-ground separation.",
+      "image": {
+        "accepts": "a photo of the subject or scene",
+        "preserve": ["the subject's identity", "key objects", "the scene's defining features"],
+        "skeleton": "Use the supplied image as the reference for the subject of this poster. Preserve what makes it recognisable.\n\nRecompose it as a {ratio} poster: {subject}, simplified to one dominant focal point rather than a busy scene. {composition} with the lower third kept quiet for type. {lighting}, {grading}, {mood}. Set the exact text \"{text}\" in {type} in that quiet zone — legible, correctly spelled, and the only lettering in the frame. Print-ready, strong silhouette, clear figure-ground separation."
+      },
+      "negatives": ["no gibberish or misspelled text", "no extra lettering beyond the specified line", "no cluttered composition", "no watermark", "no muddy midtones", "no more than three dominant colours"],
+      "example": "Create a 2:3 poster for a film about a long desert drive. SUBJECT — a lone 1970s sedan seen from behind, small in frame, a wall of dust rising behind it. COMPOSITION — centred hero, the horizon low, the entire lower third quiet empty road. LIGHTING — one hard low sun straight down the road, the car a dark silhouette. COLOUR — high-contrast cinematic, burnt orange and near-black only. MOOD — ominous and slow. TYPE — the exact text \"RING OF FIRE\" in condensed grotesque, bottom centre, legible and correctly spelled, no other lettering. RENDER — print-ready poster art, strong silhouette, clear figure-ground separation."
+    },
+    {
+      "id": "thumbnail",
+      "goal": "A small, loud image built to be clicked at 320 pixels wide.",
+      "when": "Video thumbnail, social card, ad slot. Legibility at tiny size beats beauty.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "type", "text", "subject"],
+      "defaults": { "ratio": "16:9", "composition": "close-up detail", "lighting": "rim-lit on dark", "grading": "rich saturated", "mood": "energetic", "type": "bold geometric sans" },
+      "text": "Create a {ratio} video thumbnail.\nSUBJECT — {subject}, cropped close so the face or the key object is unmistakable at 320 pixels wide. Maximum two elements in the frame.\nCOMPOSITION — {composition}, with a clear empty zone reserved for the text.\nLIGHTING — {lighting}, so the subject separates hard from the background.\nCOLOUR — {grading}. Push saturation and contrast well beyond natural; this is competing in a feed.\nMOOD — {mood}.\nTYPE — the exact text \"{text}\" in {type}, very large, high contrast against what sits behind it, no more than five words, no other lettering.\nRENDER — a designed graphic, not a natural photograph. Clean edges, obvious focal point, readable in a glance.",
+      "negatives": ["no small or thin text", "no more than five words", "no gibberish lettering", "no busy background", "no watermark", "no subtle or muted colour"],
+      "example": "Create a 16:9 video thumbnail for a video about learning to solder. SUBJECT — a hand holding an iron against a circuit board, extreme close-up, the molten joint glowing. Two elements only: hand and board. COMPOSITION — close-up detail on the right, the left third left deliberately empty. LIGHTING — rim-lit on dark so the hand and iron edge-light against a near-black background. COLOUR — rich saturated, the orange glow pushed hard. MOOD — energetic. TYPE — the exact text \"IT WORKED\" in bold geometric sans, huge, white on black, no other lettering. RENDER — designed graphic with clean edges, readable at a glance."
+    },
+    {
+      "id": "collage-grid",
+      "goal": "Several moments from one subject arranged into a single composed poster.",
+      "when": "You have a subject with range — a person, a product line, a place — and want one image that shows all of it.",
+      "shape": "grid",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "text", "subject"],
+      "defaults": { "ratio": "3:4", "composition": "rule of thirds", "lighting": "hard side sunlight", "grading": "warm muted", "mood": "nostalgic" },
+      "text": "Create a {ratio} collage poster built from four to six rectangular panels arranged asymmetrically, like a torn-and-taped editorial layout.\nCONTENT — every panel shows a different moment of the same subject: {subject}. Different distance, different angle, different action, but clearly the same person or thing.\nCOMPOSITION — {composition}. Panels of unequal size, some bleeding off the canvas edge. Deliberate overlap, thin paper-white borders, a few degrees of rotation on two panels so the layout reads as handmade rather than gridded.\nLIGHTING — {lighting}, consistent enough that the panels look like one shoot.\nCOLOUR — {grading}.\nMOOD — {mood}.\nTYPE — the exact text \"{text}\" if any, set small and unobtrusive in one corner.\nRENDER — printed-matter collage: visible paper edges, a little misregistration, no digital gloss.",
+      "image": {
+        "accepts": "one or more photos of the subject",
+        "preserve": ["the subject's identity", "distinguishing features", "outfit or product details"],
+        "skeleton": "Use the supplied image or images as the reference for the subject of this collage. Keep the person or object recognisably the same across every panel.\n\nBuild a {ratio} collage poster from four to six rectangular panels arranged asymmetrically like a torn-and-taped editorial layout. Each panel shows a different moment, distance and angle of that same subject. {composition} with unequal panel sizes, some bleeding off the edge, thin paper-white borders and two panels rotated a few degrees. {lighting}, {grading}, {mood}. Set the exact text \"{text}\" small in one corner. Printed-matter feel: visible paper edges, slight misregistration, no digital gloss."
+      },
+      "negatives": ["no identical repeated panel", "no changing the subject between panels", "no neat uniform grid", "no digital gloss or drop shadows", "no watermark", "no gibberish text"],
+      "example": "Create a 3:4 collage poster about a bakery's first year. CONTENT — five panels, each a different moment in the same shop: hands shaping dough, the oven door, a tray of loaves, the counter at opening, the empty shop at night. Same place throughout, different distance and angle. COMPOSITION — rule of thirds; unequal panel sizes, two bleeding off the canvas edge, thin paper-white borders, two panels rotated slightly. LIGHTING — hard side sunlight through the shop window. COLOUR — warm muted. MOOD — nostalgic. TYPE — the exact text \"ONE YEAR\" set small in the lower right. RENDER — printed-matter collage with visible paper edges and slight misregistration."
+    }
+  ]
+}

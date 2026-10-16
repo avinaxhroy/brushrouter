@@ -1,0 +1,46 @@
+{
+  "id": "infographic",
+  "label": "Explainers & diagrams",
+  "intent": "Teach something. Accuracy of the labelled content matters as much as the picture.",
+  "aliases": ["infographic", "diagram", "explainer", "chart", "graph", "process", "steps", "how to", "tutorial", "educational", "edu", "comparison", "timeline", "map", "visual guide", "spec sheet"],
+  "recipes": [
+    {
+      "id": "process-board",
+      "goal": "A step-by-step visual sequence, like a film's pre-production board.",
+      "when": "Showing stages: how something is made, how a suit goes on, how a routine progresses.",
+      "shape": "grid",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "render", "subject"],
+      "defaults": { "ratio": "16:9", "composition": "full-body", "background": "seamless warm grey", "lighting": "even flat studio light", "grading": "neutral and true", "render": "studio catalogue photography" },
+      "text": "Create a single {ratio} image: a numbered process board laid out as a 4 by 2 grid of eight panels, reading left to right, top to bottom.\nSUBJECT — {subject}. The same subject appears in every panel, at the same scale and the same camera distance, so the eight panels read as a single continuous sequence.\nPROGRESSION — each panel advances the process by one clear step. The change between adjacent panels should be obvious at a glance and nothing else in the frame should move.\nCOMPOSITION — {composition} in every panel, {background} behind each.\nLIGHTING — {lighting}, identical in all eight panels so no panel looks like a different shoot.\nCOLOUR — {grading}.\nLABELS — a small number 1 to 8 in one corner of each panel. No other text anywhere.\nRENDER — {render}, consistent across all panels.",
+      "image": {
+        "accepts": "a photo of the subject or the starting state",
+        "preserve": ["the subject's identity", "key equipment or clothing", "scale"],
+        "skeleton": "Use the supplied image as the reference for the subject of this process board. Keep the subject recognisably identical in all eight panels.\n\nCreate a single {ratio} image: a numbered process board as a 4 by 2 grid of eight panels read left to right, top to bottom, showing {subject} advancing one clear step per panel. Same subject, same scale, same camera distance throughout so it reads as one continuous sequence. {composition} in every panel, {background} behind each, {lighting} identical throughout, {grading}, {render}. A small number 1 to 8 in one corner of each panel; no other text."
+      },
+      "negatives": ["no changing subject between panels", "no captions or explanatory paragraphs", "no more than a single digit of text per panel", "no inconsistent scale", "no watermark", "no missing or repeated step"],
+      "example": "Create a single 16:9 image: a numbered process board as a 4 by 2 grid of eight panels, reading left to right, top to bottom, showing a firefighter putting on a full protective suit. PROGRESSION — boots, trousers, jacket, harness, mask, helmet, gloves, final check. One step per panel; nothing else changes. COMPOSITION — full-body in every panel, same scale and camera distance, seamless warm grey behind each. LIGHTING — even flat studio light, identical in all eight. COLOUR — neutral and true. LABELS — a small number 1 to 8 in the lower-left corner of each panel; no other text. RENDER — studio catalogue photography, consistent throughout."
+    },
+    {
+      "id": "data-poster",
+      "goal": "A poster that communicates one body of information clearly.",
+      "when": "A single dense explainer: a timeline, a comparison, a set of figures you want to look designed.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "grading", "type", "text", "subject"],
+      "defaults": { "ratio": "2:3", "composition": "symmetrical", "background": "seamless white", "grading": "neutral and true", "type": "monospaced technical" },
+      "text": "Create a {ratio} infographic poster about {subject}.\nSTRUCTURE — a clear top-to-bottom hierarchy: title block at the top, the main visual in the middle, supporting detail below. Everything sits on one consistent baseline grid.\nMAIN VISUAL — the central diagram or chart must be genuinely informative: axes or sequence labelled, proportions visually accurate, no decorative data that means nothing.\nTYPOGRAPHY — {type} throughout; set the title \"{text}\" as the largest element, then a clear three-level hierarchy of heading, label and caption. All text must be real, correctly spelled and readable — never placeholder glyphs.\nCOMPOSITION — {composition} with generous margins.\nBACKGROUND — {background}.\nCOLOUR — {grading}, with a two-colour accent used consistently to mean the same thing everywhere.",
+      "negatives": ["no gibberish or lorem-ipsum text", "no fake data labels", "no unlabelled axes", "no watermark", "no decorative elements that carry no information", "no more than three type sizes"],
+      "example": "Create a 2:3 infographic poster explaining how a guitar's tone circuit works. STRUCTURE — title block at the top, a large annotated cutaway in the middle, a small parts list below, all on one baseline grid. MAIN VISUAL — the cutaway labels every component: pickups, volume pot, tone pot, capacitor and output jack, with the signal path drawn as one continuous line. TYPOGRAPHY — monospaced technical throughout; title \"TONE, EXPLAINED\" as the largest element, then component labels, then one-line captions. All text real and correctly spelled. COMPOSITION — symmetrical with generous margins. BACKGROUND — seamless white. COLOUR — neutral and true with one amber accent marking the signal path only."
+    },
+    {
+      "id": "comparison-sheet",
+      "goal": "Put variants side by side so the differences are the point.",
+      "when": "A/B options, before-and-after, versions of a design, competing approaches.",
+      "shape": "grid",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "type", "subject"],
+      "defaults": { "ratio": "16:9", "composition": "centred hero", "background": "seamless white", "lighting": "even flat studio light", "grading": "neutral and true", "type": "bold geometric sans" },
+      "text": "Create a single {ratio} image: a side-by-side comparison sheet split into equal panels by thin vertical rules.\nSUBJECT — {subject}. Each panel shows the same subject with exactly one variable changed. Everything else — framing, scale, lighting, background — must be identical across panels so the single difference is unmistakable.\nPANELS — give each one a short {type} label at the top stating what is different about it. Labels must be real words, correctly spelled, no longer than three words.\nCOMPOSITION — {composition} in every panel.\nBACKGROUND — {background}. LIGHTING — {lighting}. COLOUR — {grading}.\nRENDER — clean designed layout, perfectly aligned panel edges, equal panel widths.",
+      "negatives": ["no differing backgrounds between panels", "no differing scale or framing", "no gibberish labels", "no more than three words per label", "no watermark", "no unequal panel widths"],
+      "example": "Create a single 16:9 comparison sheet split into three equal panels by thin vertical rules, comparing three lighting setups on the same ceramic vase. SUBJECT — the same matte ceramic vase, identical framing, scale and white background in all three panels. PANELS — labelled \"HARD\", \"SOFT\" and \"RIM\" in bold geometric sans at the top of each. The only difference between panels is the light. COMPOSITION — centred hero in each. BACKGROUND — seamless white. LIGHTING — hard single source, then softbox with fill, then rim light on dark. COLOUR — neutral and true. RENDER — clean designed layout, perfectly aligned edges, equal panel widths."
+    }
+  ]
+}

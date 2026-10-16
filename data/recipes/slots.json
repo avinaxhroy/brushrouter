@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "note": "Brushrouter's own prompt recipes. Written by us, not copied from anywhere. The STRUCTURE is derived from an analysis of 150 published image prompts (see docs/TECHNICAL.md section 9): ~95% of them are assembled from the same small set of named slots, so the reusable asset is the recipe, not any individual prompt. Two invariants hold across every file in this directory: (1) every recipe has a `text` skeleton, so an agent holding no source image is never blocked; (2) `image` is an optional upgrade on top of `text`, never a requirement. Placeholders are written in {braces} and must resolve against `slots` below.",
+  "slots": {
+    "ratio": {
+      "label": "Aspect ratio",
+      "options": ["1:1", "4:5", "3:4", "9:16", "16:9", "2:3", "4:3"]
+    },
+    "composition": {
+      "label": "Composition",
+      "options": ["centred hero", "rule of thirds", "flat-lay top-down", "three-quarter angle", "close-up detail", "full-body", "overhead", "symmetrical", "wide establishing", "diagonal"]
+    },
+    "lighting": {
+      "label": "Lighting",
+      "options": ["softbox key with fill card", "natural window light", "hard side sunlight", "rim-lit on dark", "golden hour", "even flat studio light", "single dramatic source", "soft gradient backdrop", "overcast diffuse", "neon practicals"]
+    },
+    "grading": {
+      "label": "Colour grading and palette",
+      "options": ["neutral and true", "warm muted", "cool desaturated", "high-contrast cinematic", "pastel", "rich saturated", "monochrome", "sepia-toned"]
+    },
+    "surface": {
+      "label": "Surface or material",
+      "options": ["seamless paper", "brushed metal", "wet stone", "linen", "matte ceramic", "glass", "plaster wall", "concrete floor", "raw wood", "fabric drape"]
+    },
+    "background": {
+      "label": "Background",
+      "options": ["seamless white", "seamless warm grey", "gradient backdrop", "environmental and in-context", "dark textured", "flat colour field", "blurred location"]
+    },
+    "render": {
+      "label": "Render style",
+      "options": ["editorial photography", "studio catalogue photography", "3D product render", "isometric illustration", "flat vector", "analogue film photograph", "digital painting", "clay render", "technical line drawing", "risograph print"]
+    },
+    "mood": {
+      "label": "Mood",
+      "options": ["calm", "premium", "energetic", "nostalgic", "playful", "clinical", "dramatic", "warm and human"]
+    },
+    "type": {
+      "label": "Typography",
+      "options": ["bold geometric sans", "high-contrast serif display", "condensed grotesque", "hand-lettered script", "monospaced technical", "no type in frame"]
+    },
+    "subject": {
+      "label": "Subject",
+      "free": true,
+      "options": []
+    },
+    "subject_action": {
+      "label": "What the subject is doing",
+      "free": true,
+      "options": []
+    },
+    "prop": {
+      "label": "Object or product in frame",
+      "free": true,
+      "options": []
+    },
+    "location": {
+      "label": "Place or setting",
+      "free": true,
+      "options": []
+    },
+    "wardrobe": {
+      "label": "What the person is wearing",
+      "free": true,
+      "options": []
+    },
+    "accent_symbol": {
+      "label": "Small mark, badge or symbol",
+      "free": true,
+      "options": []
+    },
+    "secondary_text": {
+      "label": "Supporting text: subhead, caption, footer",
+      "free": true,
+      "options": []
+    },
+    "text": {
+      "label": "Exact text to render",
+      "free": true,
+      "options": []
+    }
+  },
+  "shapes": {
+    "single": "one finished image",
+    "grid": "one image containing several panels",
+    "sheet": "a reference sheet: one subject repeated in fixed views",
+    "document": "a designed page: image plus structured information around it"
+  }
+}

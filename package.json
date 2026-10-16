@@ -1,0 +1,72 @@
+{
+  "name": "brushrouter",
+  "version": "0.1.0",
+  "description": "Provider-agnostic image generation router: one CLI + MCP server that auto-routes across the AI backends you already have (native Codex CLI, ChatGPT subscription, Gemini/Antigravity, OpenRouter, fal.ai, custom HTTP), and hands agents a prompt library so they can brief an image from text alone — 27 recipes we author plus 137 vendored visual styles. No hardcoded paths, no secrets exposed to models.",
+  "type": "module",
+  "bin": {
+    "brushrouter": "./bin/brushrouter.js",
+    "br": "./bin/brushrouter.js"
+  },
+  "main": "./src/router.js",
+  "exports": {
+    ".": "./src/router.js",
+    "./config": "./src/config.js",
+    "./redact": "./src/util/redact.js",
+    "./library": "./src/library.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "doctor": "node bin/brushrouter.js doctor",
+    "setup": "node bin/brushrouter.js setup",
+    "install:mcp": "node bin/brushrouter.js install",
+    "recipes:check": "node scripts/check-recipes.mjs",
+    "styles:vendor": "node scripts/vendor-styles.mjs",
+    "styles:check": "node scripts/vendor-styles.mjs --check",
+    "corpus:analyze": "node scripts/analyze-corpus.mjs",
+    "corpus:check": "node scripts/analyze-corpus.mjs --check",
+    "corpus:fetch": "node scripts/analyze-corpus.mjs --fetch"
+  },
+  "files": [
+    "brushrouterlogo.png",
+    "bin",
+    "src",
+    "docs",
+    "data/recipes",
+    "data/styles",
+    "scripts/check-recipes.mjs",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "image-generation",
+    "router",
+    "mcp",
+    "model-context-protocol",
+    "image-prompts",
+    "prompt-library",
+    "prompt-recipes",
+    "agent-tools",
+    "codex",
+    "chatgpt",
+    "gemini",
+    "antigravity",
+    "openrouter",
+    "fal",
+    "agent",
+    "ai",
+    "cli"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avinaxhroy/brushrouter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/avinaxhroy/brushrouter/issues"
+  },
+  "homepage": "https://github.com/avinaxhroy/brushrouter#readme"
+}

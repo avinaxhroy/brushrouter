@@ -1,0 +1,51 @@
+{
+  "id": "ad-creative",
+  "label": "Ads & campaigns",
+  "intent": "Persuade in one frame, then survive being cut into ten sizes.",
+  "aliases": ["ad", "advert", "advertisement", "campaign", "promo", "marketing", "social media post", "instagram", "tiktok", "banner", "creative", "brand campaign", "sportswear ad", "billboard ad"],
+  "recipes": [
+    {
+      "id": "social-ad",
+      "goal": "One square post that stops a scroll.",
+      "when": "Feed placement. One idea, one subject, one line of copy.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "mood", "type", "text", "subject"],
+      "defaults": { "ratio": "1:1", "composition": "centred hero", "background": "flat colour field", "lighting": "rim-lit on dark", "grading": "rich saturated", "mood": "energetic", "type": "bold geometric sans" },
+      "text": "Create a {ratio} social media advertisement for {subject}.\nIDEA — one clear proposition, expressed visually. Not a scene, not a story: a single idea that lands in under a second.\nCOMPOSITION — {composition} with a bold, simple silhouette and a deliberately empty zone for the copy.\nBACKGROUND — {background} so the subject separates instantly from it.\nLIGHTING — {lighting}. COLOUR — {grading}, saturated and confident.\nMOOD — {mood}.\nCOPY — the exact text \"{text}\" in {type}, large, placed in the empty zone. Correctly spelled, no other lettering anywhere in the frame.\nRENDER — designed graphic with hard edges and obvious hierarchy, built to be legible as a small square.",
+      "image": {
+        "accepts": "a product photo or a photo of a person",
+        "preserve": ["the product's form and colour", "the person's identity", "label text"],
+        "skeleton": "Use the supplied image as the exact reference for {subject}. Preserve its form, colour and any label text; if it is a person, preserve their identity.\n\nBuild a {ratio} social media advertisement around it: {composition} with a bold simple silhouette, {background}, {lighting}, {grading}, {mood}. Keep a deliberately empty zone for copy and set the exact text \"{text}\" in {type} there — large, correctly spelled, the only lettering in the frame. Hard edges, obvious hierarchy, legible as a small square."
+      },
+      "negatives": ["no misspelled copy", "no extra lettering or logos", "no busy background", "no more than six words of copy", "no watermark", "no low-contrast subject"],
+      "example": "Create a 1:1 social media advertisement for a running shoe. IDEA — the shoe caught mid-stride against a black void, sole glowing, nothing else in frame. COMPOSITION — centred hero, the shoe large and angled, the lower third deliberately empty. BACKGROUND — flat near-black. LIGHTING — rim-lit on dark so the sole edge glows orange. COLOUR — rich saturated. MOOD — energetic. COPY — the exact text \"RUN LATER\" in bold geometric sans, huge, white, in the empty lower third; no other lettering. RENDER — designed graphic with hard edges and obvious hierarchy."
+    },
+    {
+      "id": "campaign-key-visual",
+      "goal": "The one image a whole campaign is built around.",
+      "when": "The anchor asset. Everything else will be cut from this, so it must be strong and simple.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "render", "type", "text", "subject"],
+      "defaults": { "ratio": "4:5", "composition": "rule of thirds", "lighting": "single dramatic source", "grading": "high-contrast cinematic", "mood": "dramatic", "render": "editorial photography", "type": "condensed grotesque" },
+      "text": "Create a {ratio} campaign key visual for {subject}.\nBIG IDEA — the image must express one clear attitude. Every element in the frame should be there because of that idea; remove anything that is merely decorative.\nCOMPOSITION — {composition}, with the subject given real presence and the frame left open enough that copy can be added later without crowding it. Keep a safe margin on all sides so the image survives being cropped to other ratios.\nLIGHTING — {lighting}.\nCOLOUR — {grading}, restricted to a tight palette that reads as a deliberate brand choice.\nMOOD — {mood}.\nRENDER — {render}. High craft: believable materials, real shadows, no visible artefacts.\nTYPE — the exact text \"{text}\" in {type}, held small and confident rather than shouted.",
+      "image": {
+        "accepts": "a product photo, a portrait, or a location photo",
+        "preserve": ["the product's form and colour", "the person's identity", "the location's character"],
+        "skeleton": "Use the supplied image as the exact reference for {subject}. Preserve what makes it recognisable — product form and colour, a person's identity, or the character of the place.\n\nBuild a {ratio} campaign key visual around it expressing one clear attitude. {composition} with real presence for the subject and open space for copy, plus a safe margin on all sides so it survives cropping. {lighting}, {grading} held to a tight palette, {mood}, {render} with believable materials and real shadows. Set the exact text \"{text}\" in {type}, small and confident."
+      },
+      "negatives": ["no clutter or decorative props", "no misspelled text", "no visible generation artefacts", "no flat or even lighting", "no watermark", "no subject touching the frame edge"],
+      "example": "Create a 4:5 campaign key visual for a winter outerwear brand. BIG IDEA — one person standing still in weather that is trying to move them. COMPOSITION — rule of thirds, the figure on the right third, the storm filling the left two thirds, safe margin on all sides so it survives cropping. LIGHTING — one hard cold source from behind, the coat edge-lit. COLOUR — high-contrast cinematic, slate blue and bone only. MOOD — dramatic and resolute. RENDER — editorial photography with believable fabric and real shadows. TYPE — the exact text \"STAND STILL\" in condensed grotesque, small, lower left."
+    },
+    {
+      "id": "ad-variants",
+      "goal": "The same ad in several formats at once, so a campaign ships consistently.",
+      "when": "You need one creative across feed, story and banner without the set drifting apart.",
+      "shape": "grid",
+      "slots": ["ratio", "background", "lighting", "grading", "type", "text", "subject"],
+      "defaults": { "ratio": "16:9", "background": "flat colour field", "lighting": "even flat studio light", "grading": "rich saturated", "type": "bold geometric sans" },
+      "text": "Create a single {ratio} image: an ad format set, showing the same advertisement in four shapes laid out in a row with even gaps on a neutral board.\nSUBJECT — {subject}. The creative is identical in all four: same subject, same treatment, same colour, same copy. Only the proportions of the canvas change.\nFORMATS — square, vertical, landscape and a tall banner. Reframe the same creative for each rather than redesigning it; the subject may be cropped differently but must never change size relative to the frame.\nCOPY — the exact text \"{text}\" in {type}, present and correctly spelled in every format, repositioned as needed so it never collides with the subject.\nLIGHTING — {lighting}. COLOUR — {grading}. BACKGROUND — {background} within each ad.\nRENDER — flat designed presentation, aligned baselines, no device frames, no perspective, no shadow on the board.",
+      "negatives": ["no different creative between formats", "no misspelled copy", "no copy overlapping the subject", "no device frames or perspective", "no watermark", "no uneven gaps between formats"],
+      "example": "Create a single 16:9 image: an ad format set showing the same advertisement in four shapes laid out in a row with even gaps on a neutral grey board. SUBJECT — a can of sparkling water; same can, same rim light, same deep green background in all four. FORMATS — square, vertical story, landscape banner and tall skyscraper; the can is cropped differently in each but never changes size relative to its frame. COPY — the exact text \"NOTHING ADDED\" in bold geometric sans, correctly spelled and present in all four, repositioned so it never touches the can. LIGHTING — even flat studio light. COLOUR — rich saturated. RENDER — flat designed presentation, aligned baselines, no device frames."
+    }
+  ]
+}
