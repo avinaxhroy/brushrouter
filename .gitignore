@@ -1,3 +1,7 @@
 node_modules/
 *.tgz
 .DS_Store
+
+# gptweb2api sidecar runtime dirs (vendored binary + per-instance files)
+.gptweb2api-api/
+.gptweb2api-files/
