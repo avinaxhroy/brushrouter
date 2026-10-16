@@ -74,6 +74,10 @@ br models           # model ids (live for OpenRouter)
 br prompts          # 27 recipes + 137 looks for briefing an image
 br doctor           # full connectivity diagnosis
 br setup            # first-run auto-connect
+br login            # sign in to ChatGPT for the codex route (browser OAuth, no API key)
+br vendor gptweb2api  # install the browserless ChatGPT-web gateway binary
+br batch            # generate several prompts in parallel across backends
+br init             # write a starter config
 br install          # add brushrouter to detected agent MCP configs
 br rules            # inject compact guidance into AGENTS.md / .cursorrules
 br update           # update to latest version and verify health
