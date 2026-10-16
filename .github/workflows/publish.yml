@@ -1,26 +1,92 @@
-name: publish
+name: auto-publish
+
+# Publishes when CHANGELOG.md gains a version the npm registry doesn't have yet.
+# Protocol: add a `## [x.y.z] - date` section at the top of CHANGELOG.md, push.
+# Everything else — tests, package.json stamp, npm publish, git tag, GitHub
+# release, version-bump commit back to main — is automatic.
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch: # manual button on the Actions page for a redeploy
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: true
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub release from the tag
+      contents: write # tag + release + version-bump commit
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - run: npm test
-      - run: npm publish --access public
+
+      - name: Read newest version from CHANGELOG.md
+        id: ver
+        run: |
+          V=$(grep -m1 -E '^## \[?v?[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?')
+          if [ -z "$V" ]; then
+            echo "::error ::No '## [x.y.z]' version heading found in CHANGELOG.md"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Newest CHANGELOG version: $V"
+
+      - name: Gate on registry state
+        id: gate
+        env:
+          CHANGELOG_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          V="$CHANGELOG_VERSION"
+          REG=$(npm view brushrouter version 2>/dev/null || true)
+          if [ "$REG" = "$V" ]; then
+            echo "Registry already at $V — nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$REG" ]; then
+            if [ "$(printf '%s\n%s\n' "$V" "$REG" | sort -V | head -1)" = "$V" ]; then
+              echo "::error ::CHANGELOG version $V is not newer than published $REG — bump the version in CHANGELOG.md"
+              exit 1
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        if: steps.gate.outputs.skip == 'false'
+        run: npm test
+
+      - name: Stamp package.json from CHANGELOG
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          CHANGELOG_VERSION: ${{ steps.ver.outputs.version }}
+        run: npm version "$CHANGELOG_VERSION" --allow-same-version --no-git-tag-version
+
+      - name: Publish to npm
+        if: steps.gate.outputs.skip == 'false'
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: GitHub release
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes
+
+      - name: Tag, release, push version bump
+        if: steps.gate.outputs.skip == 'false'
         env:
+          CHANGELOG_VERSION: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="$CHANGELOG_VERSION"
+          # release notes = the new section's body, up to the next version heading
+          awk '/^## \[?v?[0-9]+/{c++; next} c==1{print}' CHANGELOG.md > release-notes.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): v${V} [skip ci]" || true
+          git tag "v${V}"
+          gh release create "v${V}" --title "v${V}" --notes-file release-notes.md
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin main --tags
