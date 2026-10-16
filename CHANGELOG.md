@@ -1,7 +1,5 @@
 # Changelog
 
-All notable changes live here. **To release: add a `## [x.y.z] - date` section at the top and push** — CI tests, stamps `package.json`, publishes to npm, tags, and creates the GitHub release automatically. Same version already on the registry → run is a no-op.
-
 ## [0.1.0] - 2026-02-18
 
 Initial public release.
