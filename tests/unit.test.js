@@ -1188,8 +1188,12 @@ test("cli batch dry-run prints multiple items and concurrency across backends", 
   const { spawn } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
   const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  // A clean runner has no ready backend, so concurrency is undefined there.
+  // Give the child a fal key: probe() reports available with a key present and
+  // (dry-run) never contacts the API, so concurrency >= 1 holds everywhere.
   const child = spawn(process.execPath, [bin, "batch", "prompt alpha", "prompt beta", "--dry-run", "--json"], {
     stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, BRUSHROUTER_FAL_KEY: "br-test-fake-key-not-real" },
   });
   let out = "";
   child.stdout.on("data", (d) => (out += d));
@@ -1375,6 +1379,11 @@ test("gptweb2api: probe tracks local credential presence once vendored", async (
   const fake = join(tmpdir(), `br-fake-gw-${Date.now()}`);
   writeFileSync(fake, "not-a-real-binary");
   try {
+    // readAuth() throws when no credential exists (clean runners); the sibling
+    // concurrent-spawn test skips in that case — do the same here.
+    let hasAuth = false;
+    try { hasAuth = Boolean(readAuth({ bin: fake })); } catch {}
+    if (!hasAuth) return;
     const r = await gptweb2apiProvider.probe({ bin: fake });
     assert.equal(r.available, Boolean(readAuth({ bin: fake })), "probe availability must mirror readAuth result");
     if (r.available) assert.equal(r.auth, "builtin");
