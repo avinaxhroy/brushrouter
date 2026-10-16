@@ -1,0 +1,56 @@
+{
+  "id": "character-design",
+  "label": "Characters & creatures",
+  "intent": "A character another person could draw again. Consistency and clean anatomy are the whole job.",
+  "aliases": ["character", "creature", "mascot", "turnaround", "model sheet", "expression sheet", "oc", "original character", "figure", "doll", "toy", "bobblehead", "hero design", "concept art"],
+  "recipes": [
+    {
+      "id": "character-sheet",
+      "goal": "The canonical reference sheet: one character, all the views, one page.",
+      "when": "Before anything else gets drawn. This is the asset every later generation gets checked against.",
+      "shape": "sheet",
+      "slots": ["ratio", "background", "grading", "render", "text", "subject"],
+      "defaults": { "ratio": "16:9", "background": "seamless white", "grading": "neutral and true", "render": "digital painting" },
+      "text": "Create a {ratio} character reference sheet for {subject}.\nLAYOUT — four full-body views in a single row, at identical scale, with even gaps: front, three-quarter, side and back. Below them, one head close-up and one three-quarter head.\nCONSISTENCY — this is the critical requirement. Height, build, head size, hair, outfit, colours and every accessory must be identical in all six drawings. Only the viewing angle changes. Treat the six as one character observed from six positions.\nANATOMY — clean, correct and simple: five fingers per hand, two arms, two legs, feet planted on a consistent ground line. No extra or missing limbs, no merged fingers, no asymmetry that is not intentional.\nSTYLING — {render}, flat neutral lighting so the costume design reads clearly and no colour is lost in shadow.\nCOLOUR — {grading}. BACKGROUND — {background}.\nLABELS — small {text} labels under each view naming the angle. No other text.",
+      "image": {
+        "accepts": "a drawing or photo of the character",
+        "preserve": ["silhouette", "outfit", "colours", "signature accessories", "face shape"],
+        "skeleton": "Use the supplied image as the exact reference for this character. Its silhouette, outfit, colours, signature accessories and face shape must be preserved precisely and must be identical in every drawing on the sheet.\n\nCreate a {ratio} character reference sheet: four full-body views in one row at identical scale — front, three-quarter, side, back — plus one head close-up and one three-quarter head below. Only the viewing angle changes; nothing about the character does. Clean correct anatomy, five fingers per hand, a consistent ground line, no extra or missing limbs. {render}, flat neutral lighting, {grading}, {background}. Small labels under each view naming the angle."
+      },
+      "negatives": ["no inconsistency between views", "no extra or missing limbs", "no merged or six-fingered hands", "no changing outfit or colours", "no dramatic lighting that hides design details", "no watermark"],
+      "example": "Create a 16:9 character reference sheet for a courier in a near-future city: a wiry woman in her twenties, shaved sides with a long blue braid, an oversized rust-orange jacket with reflective piping, grey cargo trousers and scuffed white boots. LAYOUT — four full-body views in a row at identical scale: front, three-quarter, side, back; plus a head close-up and a three-quarter head below. CONSISTENCY — identical height, build, hair, outfit, colours and piping in all six; only the angle changes. ANATOMY — clean and correct, five fingers per hand, feet on one consistent ground line. STYLING — digital painting, flat neutral lighting, neutral and true colour, seamless white background. LABELS — small monospaced technical labels under each view naming the angle."
+    },
+    {
+      "id": "expression-grid",
+      "goal": "One face, many emotions, on a single consistent grid.",
+      "when": "You need the emotional range of a character pinned down, for animation, comics or a casting sheet.",
+      "shape": "grid",
+      "slots": ["ratio", "background", "lighting", "grading", "render", "text", "subject"],
+      "defaults": { "ratio": "1:1", "background": "seamless white", "lighting": "even flat studio light", "grading": "neutral and true", "render": "digital painting" },
+      "text": "Create a single {ratio} image: a 3 by 3 expression grid, nine head-and-shoulders panels of the same character.\nCHARACTER — {subject}. The face must be identical in all nine panels: same head shape, same hair, same features, same colours. Only the expression changes.\nEXPRESSIONS — neutral, smiling, laughing, surprised, angry, sad, confused, tired and determined. Each must be clearly readable as that emotion without a caption.\nFRAMING — identical head size, identical crop, identical eye line in every panel. The panels should look like nine frames from one continuous take.\nSTYLING — {render}, {lighting} so nothing is hidden in shadow. COLOUR — {grading}. BACKGROUND — {background}.\nLABELS — a small {text} label under each panel naming the emotion. No other text.",
+      "image": {
+        "accepts": "a drawing or photo of the character's face",
+        "preserve": ["face shape", "hair", "features", "colours"],
+        "skeleton": "Use the supplied image as the exact reference for this character's face. The head shape, hair, features and colours must be identical in all nine panels.\n\nCreate a single {ratio} image: a 3 by 3 expression grid of head-and-shoulders panels of that same character, showing neutral, smiling, laughing, surprised, angry, sad, confused, tired and determined. Only the expression changes — never the face. Identical head size, crop and eye line in every panel, as if from one continuous take. {render}, {lighting}, {grading}, {background}. Small labels under each panel naming the emotion."
+      },
+      "negatives": ["no changing facial features between panels", "no inconsistent crop or head size", "no ambiguous expressions", "no watermark", "no captions beyond the emotion labels", "no extra characters"],
+      "example": "Create a single 1:1 image: a 3 by 3 expression grid of head-and-shoulders panels of the same character — a teenage boy with a round face, thick black eyebrows and a messy dark brown fringe. EXPRESSIONS — neutral, smiling, laughing, surprised, angry, sad, confused, tired and determined, each instantly readable. FRAMING — identical head size, crop and eye line in all nine. STYLING — digital painting, even flat studio light, neutral and true colour, seamless white background. LABELS — a small monospaced technical label under each panel naming the emotion."
+    },
+    {
+      "id": "creature-design",
+      "goal": "An invented creature or mascot, designed and explained.",
+      "when": "A brand mascot, a fantasy creature, a game enemy: something that does not exist and has to be specified clearly.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "render", "subject"],
+      "defaults": { "ratio": "4:5", "composition": "three-quarter angle", "background": "gradient backdrop", "lighting": "soft gradient backdrop", "grading": "rich saturated", "render": "digital painting" },
+      "text": "Create a {ratio} character design of {subject}, a creature that does not exist.\nDESIGN — the silhouette must be readable as a single shape at small size. Give it a clear anatomy with a stated number of limbs, and make each one visible and correctly attached. Establish what it is made of — fur, scale, chitin, gel — and keep that material consistent across the whole body.\nCOMPOSITION — {composition}, full body, grounded and balanced, with a sense of weight. Not floating.\nEXPRESSION — readable personality, so a viewer can tell whether it is friendly, wary or hostile.\nLIGHTING — {lighting}, with a clear key light and a visible rim so the silhouette separates from the backdrop.\nBACKGROUND — {background}, plain enough that the creature is unmistakably the subject.\nCOLOUR — {grading}, held to a limited palette so the design reads as one creature rather than a patchwork.\nRENDER — {render} with deliberate, confident shapes.",
+      "image": {
+        "accepts": "a sketch or reference of the creature",
+        "preserve": ["silhouette", "limb count", "material", "colour palette", "facial structure"],
+        "skeleton": "Use the supplied image as the exact reference for this creature. Its silhouette, limb count, material, colour palette and facial structure must be preserved — refine the rendering, do not redesign the anatomy.\n\nProduce a {ratio} {render} character design: {composition}, full body, grounded with a sense of weight. Clear readable personality, {lighting} with a visible rim separating the silhouette from the backdrop, {grading} held to a limited palette. Every limb visible and correctly attached."
+      },
+      "negatives": ["no ambiguous or unreadable silhouette", "no extra or missing limbs", "no mixed materials on one body", "no floating pose", "no watermark", "no more than one creature in frame"],
+      "example": "Create a 4:5 character design of a deep-sea courier creature that does not exist. DESIGN — a rounded, heavy body like a stone dumpling, four short paddle limbs and one long prehensile tail, all visible and correctly attached; skin like wet slate with a bioluminescent seam along the spine. COMPOSITION — three-quarter angle, full body, grounded and heavy, not floating. EXPRESSION — patient and slightly weary, unmistakably not hostile. LIGHTING — soft gradient backdrop with a cool rim light picking out the glowing spine seam. COLOUR — rich saturated, deep teal and cold white only. RENDER — digital painting with deliberate, confident shapes."
+    }
+  ]
+}

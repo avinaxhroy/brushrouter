@@ -1,0 +1,51 @@
+{
+  "id": "portrait",
+  "label": "People & portraits",
+  "intent": "A person, and specifically the same person across every frame. Identity is the hard constraint.",
+  "aliases": ["portrait", "headshot", "person", "face", "people", "model", "avatar", "profile picture", "selfie", "head shot", "likeness", "identity", "casting", "passport photo"],
+  "recipes": [
+    {
+      "id": "studio-headshot",
+      "goal": "A clean, professional portrait of a person.",
+      "when": "Team page, profile picture, casting card. The person is the whole subject.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "render", "subject"],
+      "defaults": { "ratio": "4:5", "composition": "close-up detail", "background": "seamless warm grey", "lighting": "softbox key with fill card", "grading": "neutral and true", "render": "editorial photography" },
+      "text": "Create a {ratio} portrait of {subject}.\nCOMPOSITION — {composition}, head and shoulders, eyes on the upper third line, looking into the lens.\nBACKGROUND — {background}, deliberately plain so nothing competes with the face.\nLIGHTING — {lighting}. Catchlights visible in both eyes, soft shadow under the chin, no hot spot on the forehead.\nCOLOUR — {grading}. Skin must keep realistic tone and texture — visible pores, not plastic smoothing.\nRENDER — {render} at around 85mm, shallow but not extreme depth of field, focus exactly on the near eye.",
+      "negatives": ["no plastic or airbrushed skin", "no extra fingers or hands", "no warped ears or hairline", "no watermark", "no heavy beauty retouching", "no distorted facial symmetry"],
+      "example": "Create a 4:5 portrait of a woman in her late thirties with short dark curly hair and a plain navy shirt. COMPOSITION — close-up, head and shoulders, eyes on the upper third, looking straight into the lens with a relaxed half-smile. BACKGROUND — seamless warm grey. LIGHTING — softbox key from upper left with a fill card; catchlights in both eyes, soft shadow under the chin. COLOUR — neutral and true, skin with realistic tone and visible pores. RENDER — editorial photography at 85mm, focus on the near eye."
+    },
+    {
+      "id": "editorial-portrait",
+      "goal": "A portrait with an idea in it — a mood, a place, a story.",
+      "when": "The image has to say something beyond \"this is a person\": a magazine feature, a campaign, a cover.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "render", "subject"],
+      "defaults": { "ratio": "3:4", "composition": "rule of thirds", "lighting": "single dramatic source", "grading": "high-contrast cinematic", "mood": "dramatic", "render": "analogue film photograph" },
+      "text": "Create a {ratio} editorial portrait of {subject}.\nCONCEPT — the frame should carry a mood, not just a face. Give the setting and the styling a reason to exist.\nCOMPOSITION — {composition}. Let the subject sit off-centre with the environment doing work around them.\nLIGHTING — {lighting}, with the falloff deliberately visible.\nCOLOUR — {grading}.\nMOOD — {mood}.\nRENDER — {render}. Grain is welcome. A slight imperfection in the framing reads as intentional rather than careless.",
+      "image": {
+        "accepts": "a photo of the person's face",
+        "preserve": ["facial identity", "bone structure", "hairline", "skin tone"],
+        "skeleton": "Use the supplied photograph as the exact facial identity reference for {subject}. The face, bone structure, hairline and skin tone must stay recognisably the same person — do not beautify, slim or reshape the features.\n\nRe-stage them as a {ratio} {render} editorial portrait: {composition}, {lighting}, {grading}, {mood}. Give the setting and styling a reason to exist. You may change wardrobe, hair styling, pose, lighting and environment freely, but never the identity."
+      },
+      "negatives": ["no changing the person's identity", "no beautifying or reshaping features", "no watermark", "no extra limbs", "no uncanny symmetrical perfection", "no flat even lighting"],
+      "example": "Create a 3:4 editorial portrait of a jazz trumpet player in his sixties. CONCEPT — the frame is about late-night practice, not about his face alone. COMPOSITION — rule of thirds; he sits on the left third, the room dark and heavy on the right. LIGHTING — one hard practical lamp from the upper right, falloff visible across the frame. COLOUR — high-contrast cinematic, deep shadows. MOOD — dramatic but unhurried. RENDER — analogue film photograph with visible grain."
+    },
+    {
+      "id": "identity-grid",
+      "goal": "The same person, several times, in different poses — a consistency sheet.",
+      "when": "You need the person to hold together across multiple frames, or you are building a reference set for later generations.",
+      "shape": "grid",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "render", "subject"],
+      "defaults": { "ratio": "16:9", "composition": "full-body", "background": "seamless warm grey", "lighting": "even flat studio light", "grading": "neutral and true", "render": "studio catalogue photography" },
+      "text": "Create a single {ratio} image containing a 2 by 3 grid of six panels, all showing the same person: {subject}.\nCONSISTENCY — the face, hair, body proportions and outfit must be identical in every panel. Vary only the pose. Treat the six panels as six photographs of one person taken minutes apart.\nPANELS — front neutral, three-quarter turn, profile, seated, mid-gesture, and one relaxed candid.\nSTYLING — {composition} in every panel, {background} behind each, {lighting} throughout so no panel is lit differently from the others.\nCOLOUR — {grading}.\nRENDER — {render}. Thin white gutters between panels, no captions, no labels, no panel numbers.",
+      "image": {
+        "accepts": "a clear photo of the person's face and body",
+        "preserve": ["facial identity", "hair", "body proportions", "outfit"],
+        "skeleton": "Use the supplied photograph as the exact identity reference for the person shown. Their face, hair, body proportions and outfit must be preserved precisely and must be identical in every panel.\n\nCreate a single {ratio} image containing a 2 by 3 grid of six panels of that same person: front neutral, three-quarter turn, profile, seated, mid-gesture, relaxed candid. {composition} in each, {background} behind each, {lighting} throughout, {grading}, {render}. Vary only the pose — never the identity, the hair or the clothing. Thin white gutters, no captions."
+      },
+      "negatives": ["no drift in facial identity between panels", "no changing hair or clothing", "no panel numbers or captions", "no inconsistent lighting", "no extra people", "no watermark"],
+      "example": "Create a single 16:9 image containing a 2 by 3 grid of six panels of the same person: a man in his early thirties with a shaved head, short black beard and olive chore jacket. CONSISTENCY — identical face, hair and clothing in every panel; only the pose changes. PANELS — front neutral, three-quarter turn, profile, seated, mid-gesture, relaxed candid. STYLING — full-body in each panel, seamless warm grey behind, even flat studio light throughout. COLOUR — neutral and true. RENDER — studio catalogue photography, thin white gutters, no captions or panel numbers."
+    }
+  ]
+}

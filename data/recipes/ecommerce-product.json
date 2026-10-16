@@ -1,0 +1,56 @@
+{
+  "id": "ecommerce-product",
+  "label": "Product & commerce",
+  "intent": "Sell one object. The product is the hero and must stay faithful to the real thing.",
+  "aliases": ["product", "product shot", "packshot", "hero shot", "ecommerce", "e-commerce", "shop", "store", "listing", "catalogue", "catalog", "amazon", "shopify", "merch", "packaging", "bottle", "cosmetic", "sneaker", "still life"],
+  "recipes": [
+    {
+      "id": "product-hero",
+      "goal": "A single clean product image for a listing or a paid ad.",
+      "when": "You have one product and need the shop-card shot: isolated, well lit, nothing competing.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "surface", "grading", "render", "subject"],
+      "defaults": { "ratio": "4:5", "composition": "centred hero", "background": "seamless warm grey", "lighting": "softbox key with fill card", "surface": "seamless paper", "grading": "neutral and true", "render": "studio catalogue photography" },
+      "text": "Create a {ratio} product photograph of {subject}.\nCOMPOSITION — {composition}. The product fills roughly two thirds of the frame with clean margin on all sides.\nBACKGROUND — {background}, with a soft contact shadow anchoring the product so it does not float.\nLIGHTING — {lighting}. One clear light direction; keep the shadow soft-edged and readable.\nSURFACE — {surface}.\nCOLOUR — {grading}. The product's own colours must stay accurate; do not tint them.\nRENDER — {render}. Sharp focus across the whole product, no shallow depth of field that blurs the far edge.",
+      "image": {
+        "accepts": "a photo of the real product",
+        "preserve": ["form", "proportions", "materials", "label and logo text", "exact colour"],
+        "skeleton": "Use the supplied product photograph as the one and only reference for {subject}. Preserve its form, proportions, materials, surface finish and any label or logo text exactly — do not redesign, restyle or re-letter it.\n\nRe-render it as a {ratio} {render}: {composition} on {surface}, with {background} and {lighting}. Grade {grading} but keep the product's own colours accurate. Clean up the background and any lens artefacts from the source. Soft contact shadow under the product. No text, no watermark, no props."
+      },
+      "negatives": ["no text or watermark", "no extra products", "no hands or people", "no busy background", "no distorted or invented proportions", "no blur across the product"],
+      "example": "Create a 4:5 product photograph of a matte sage-green glass lotion bottle with a brushed aluminium cap. COMPOSITION — centred hero, filling two thirds of the frame with clean margin. BACKGROUND — seamless warm grey with a soft contact shadow. LIGHTING — softbox key from upper left with a white fill card on the right; the shadow stays soft-edged. SURFACE — seamless paper. COLOUR — neutral and true; the sage green must read exactly as it does in life. RENDER — studio catalogue photography, sharp focus across the whole bottle."
+    },
+    {
+      "id": "lifestyle-scene",
+      "goal": "The product in a believable place, so it reads as part of someone's real day.",
+      "when": "The listing shot exists and you need the brand-feel image: the product in use, in a room, on a table, in a hand.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "render", "subject"],
+      "defaults": { "ratio": "3:4", "composition": "rule of thirds", "lighting": "natural window light", "grading": "warm muted", "mood": "warm and human", "render": "editorial photography" },
+      "text": "Create a {ratio} lifestyle photograph of {subject}, placed in a real setting rather than a studio.\nSCENE — a believable, lived-in environment that suits the product. Include two or three supporting objects that belong there, none of them competing for attention.\nCOMPOSITION — {composition}. The product is clearly the subject even though the frame is not empty.\nLIGHTING — {lighting}. Let real light fall across the scene and cast natural shadows.\nCOLOUR — {grading}.\nMOOD — {mood}.\nRENDER — {render}, with the product in sharp focus and the surroundings softly behind it. Slight imperfection is good: a used surface, a stray crumb, a real shadow.",
+      "image": {
+        "accepts": "a photo of the real product",
+        "preserve": ["form", "proportions", "materials", "label text", "exact colour"],
+        "skeleton": "Use the supplied product photograph as the exact reference for {subject}. Preserve its form, proportions, materials and label text precisely; do not restyle it.\n\nPlace that product into a {ratio} {render} lifestyle scene: {composition}, {lighting}, {grading}, {mood}. Build a believable lived-in setting around it with two or three supporting objects that belong there. The product must remain the sharp, accurate hero of the frame while the surroundings fall softly behind it."
+      },
+      "negatives": ["no studio backdrop", "no extra products", "no watermark", "no distorted product geometry", "no floating or shadowless product", "no cluttered or implausible setting"],
+      "example": "Create a 3:4 lifestyle photograph of a matte ceramic pour-over coffee set, placed on a real kitchen counter rather than a studio backdrop. SCENE — a sunlit kitchen corner: a worn wooden board, a folded linen cloth, a few loose coffee beans. Nothing else competes. COMPOSITION — rule of thirds, the set on the left third, counter space breathing on the right. LIGHTING — natural window light from the right, casting a soft long shadow across the counter. COLOUR — warm muted. MOOD — warm and human, a slow morning. RENDER — editorial photography, the set in sharp focus, the room softly behind it."
+    },
+    {
+      "id": "catalog-page",
+      "goal": "A designed page that shows the product and also explains it.",
+      "when": "You need the spec-sheet look: a hero image plus structured detail, for a brand book, a deck or a spec page.",
+      "shape": "document",
+      "slots": ["ratio", "composition", "lighting", "surface", "grading", "type", "subject"],
+      "defaults": { "ratio": "3:4", "composition": "centred hero", "lighting": "even flat studio light", "surface": "seamless paper", "grading": "neutral and true", "type": "monospaced technical" },
+      "text": "Create a {ratio} product specification page, laid out as a clean modular grid on a warm neutral paper-like background.\nTOP SECTION — lifestyle hero: {subject}, {composition}, on {surface}, lit with {lighting}, generous whitespace around it.\nBOTTOM SECTION — technical panel in a tidy modular grid:\n- Orthographic line drawings of the product: front, side and three-quarter view, drawn in fine {type} technical weight.\n- Three or four short labelled callouts pointing at real features, set in {type} at small size.\nCOLOUR — {grading}. Keep the drawings monochrome so the hero image carries the colour.\nRENDER — the page should read as printed matter, not as a screen.",
+      "image": {
+        "accepts": "a photo of the real product",
+        "preserve": ["form", "proportions", "materials", "label text"],
+        "skeleton": "Use the supplied product photograph as the exact reference for {subject}. Preserve its form, proportions, materials and label text.\n\nLay it out as a {ratio} specification page on a warm neutral paper background. TOP — the product as a {composition} hero shot on {surface}, lit with {lighting}, with generous whitespace. BOTTOM — a modular technical panel: orthographic front, side and three-quarter line drawings of the same product in fine {type} weight, plus three or four short labelled callouts at real features. {grading}. The page must read as printed matter."
+      },
+      "negatives": ["no gibberish or placeholder text", "no watermark", "no invented product features", "no gradients or glow", "no clip-art icons", "no clutter in the whitespace"],
+      "example": "Create a 3:4 product specification page for a titanium travel mug, laid out on a warm neutral paper background. TOP SECTION — the mug as a centred hero on seamless paper under even flat studio light, with generous whitespace. BOTTOM SECTION — a modular technical panel: orthographic front, side and three-quarter line drawings in fine monospaced technical weight, plus four short labelled callouts for the lid thread, vacuum wall, base ring and handle mount. COLOUR — neutral and true. The whole page should read as printed matter, not as a screen."
+    }
+  ]
+}

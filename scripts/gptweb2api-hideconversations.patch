@@ -1,0 +1,267 @@
+diff --git a/cmd/gptweb2api/main.go b/cmd/gptweb2api/main.go
+index ab406ae..f4db434 100644
+--- a/cmd/gptweb2api/main.go
++++ b/cmd/gptweb2api/main.go
+@@ -137,22 +137,23 @@ func run() error {
+ 		streamMaxHandoffs = parsed
+ 	}
+ 	directBackend := chatgpt.New(chatgpt.Config{
+-		BaseURL:            cfg.ChatGPTBase,
+-		Cookie:             cookie,
+-		AccessToken:        accessToken,
+-		AccountID:          accountID,
+-		DeviceID:           cfg.ChatGPTDeviceID,
+-		UserAgent:          cfg.UserAgent,
+-		Language:           cfg.Language,
+-		ClientVersion:      cfg.OAIClientVersion,
+-		ClientBuildNumber:  cfg.OAIClientBuildNumber,
+-		Timezone:           cfg.Timezone,
+-		TimezoneOffsetMin:  cfg.TimezoneOffsetMin,
+-		Timeout:            cfg.Timeout,
+-		UpstreamMaxRetries: cfg.UpstreamMaxRetries,
+-		StreamMaxHandoffs:  streamMaxHandoffs,
+-		Requirements:       requirements,
+-		Credentials:        credentials,
++		BaseURL:             cfg.ChatGPTBase,
++		Cookie:              cookie,
++		AccessToken:         accessToken,
++		AccountID:           accountID,
++		DeviceID:            cfg.ChatGPTDeviceID,
++		UserAgent:           cfg.UserAgent,
++		Language:            cfg.Language,
++		ClientVersion:       cfg.OAIClientVersion,
++		ClientBuildNumber:   cfg.OAIClientBuildNumber,
++		Timezone:            cfg.Timezone,
++		TimezoneOffsetMin:   cfg.TimezoneOffsetMin,
++		Timeout:             cfg.Timeout,
++		UpstreamMaxRetries:  cfg.UpstreamMaxRetries,
++		StreamMaxHandoffs:   streamMaxHandoffs,
++		Requirements:        requirements,
++		Credentials:         credentials,
++		GenerationProjectID: strings.TrimSpace(os.Getenv("GPTWEB_GENERATION_PROJECT_ID")),
+ 	})
+ 	// Transport selection stays inside the large-context wrapper so an
+ 	// oversized request is uploaded once and the resulting Web file IDs can be
+diff --git a/internal/chatgpt/client.go b/internal/chatgpt/client.go
+index 8baf14e..9f30faf 100644
+--- a/internal/chatgpt/client.go
++++ b/internal/chatgpt/client.go
+@@ -38,8 +38,11 @@ type Config struct {
+ 	// StreamMaxHandoffs bounds resumed-stream segments per turn. Zero selects
+ 	// the default; modern Web streams segment often, so the default is generous.
+ 	StreamMaxHandoffs int
+-	Requirements      RequirementsProvider
+-	Credentials       CredentialSource
++	// GenerationProjectID, when set, anchors image-generation turns in the
++	// named ChatGPT project ("workspace") instead of the main chat history.
++	GenerationProjectID string
++	Requirements        RequirementsProvider
++	Credentials         CredentialSource
+ }
+ 
+ type Client struct {
+@@ -56,18 +59,19 @@ type Client struct {
+ 	upstreamMaxRetries int
+ 	streamMaxHandoffs  int
+ 
+-	mu                sync.Mutex
+-	cookie            string
+-	accessToken       string
+-	tokenExpiry       time.Time
+-	staticAccessToken string
+-	accountID         string
+-	deviceID          string
+-	modelCache        []Model
+-	modelCacheAccount string
+-	modelCacheUntil   time.Time
+-	sessionExchange   chan struct{}
+-	modelRefresh      chan struct{}
++	mu                  sync.Mutex
++	cookie              string
++	accessToken         string
++	tokenExpiry         time.Time
++	staticAccessToken   string
++	accountID           string
++	deviceID            string
++	generationProjectID string
++	modelCache          []Model
++	modelCacheAccount   string
++	modelCacheUntil     time.Time
++	sessionExchange     chan struct{}
++	modelRefresh        chan struct{}
+ }
+ 
+ type RequirementsProvider interface {
+@@ -153,22 +157,23 @@ func New(cfg Config) *Client {
+ 	}
+ 
+ 	return &Client{
+-		baseURL:            baseURL,
+-		userAgent:          strings.TrimSpace(cfg.UserAgent),
+-		language:           language,
+-		clientVersion:      strings.TrimSpace(cfg.ClientVersion),
+-		clientBuildNumber:  strings.TrimSpace(cfg.ClientBuildNumber),
+-		timezone:           tz,
+-		timezoneOffsetMin:  cfg.TimezoneOffsetMin,
+-		http:               &http.Client{Transport: transport, Jar: jar},
+-		requirements:       req,
+-		credentials:        cfg.Credentials,
+-		upstreamMaxRetries: retries,
+-		streamMaxHandoffs:  streamMaxHandoffs,
+-		cookie:             manualCookie,
+-		staticAccessToken:  strings.TrimSpace(cfg.AccessToken),
+-		accountID:          strings.TrimSpace(cfg.AccountID),
+-		deviceID:           device,
++		baseURL:             baseURL,
++		userAgent:           strings.TrimSpace(cfg.UserAgent),
++		language:            language,
++		clientVersion:       strings.TrimSpace(cfg.ClientVersion),
++		clientBuildNumber:   strings.TrimSpace(cfg.ClientBuildNumber),
++		timezone:            tz,
++		timezoneOffsetMin:   cfg.TimezoneOffsetMin,
++		http:                &http.Client{Transport: transport, Jar: jar},
++		requirements:        req,
++		credentials:         cfg.Credentials,
++		upstreamMaxRetries:  retries,
++		streamMaxHandoffs:   streamMaxHandoffs,
++		cookie:              manualCookie,
++		staticAccessToken:   strings.TrimSpace(cfg.AccessToken),
++		accountID:           strings.TrimSpace(cfg.AccountID),
++		deviceID:            device,
++		generationProjectID: cfg.GenerationProjectID,
+ 	}
+ }
+ 
+@@ -230,11 +235,11 @@ func (c *Client) Stream(ctx context.Context, in Request, emit func(Event) error)
+ 				content["content_type"] = "multimodal_text"
+ 				for _, img := range images {
+ 					pointer := map[string]any{
+-						"content_type": "image_asset_pointer",
++						"content_type":  "image_asset_pointer",
+ 						"asset_pointer": "file-service://" + img.fileID,
+-						"size_bytes":   img.size,
+-						"fovea":        nil,
+-						"metadata":     map[string]any{"dalle": nil, "gizmo": nil},
++						"size_bytes":    img.size,
++						"fovea":         nil,
++						"metadata":      map[string]any{"dalle": nil, "gizmo": nil},
+ 					}
+ 					if img.width > 0 {
+ 						pointer["width"] = img.width
+@@ -635,6 +640,11 @@ func buildConversationPayload(in Request, timezone string, timezoneOffsetMin int
+ 	if continuing {
+ 		payload["conversation_id"] = strings.TrimSpace(in.ConversationID)
+ 	}
++	// ChatGPT projects ("workspaces"): when a project is bound to the turn, the
++	// conversation starts life inside that project folder instead of main history.
++	if strings.TrimSpace(in.ProjectID) != "" {
++		payload["project_id"] = strings.TrimSpace(in.ProjectID)
++	}
+ 	return payload
+ }
+ 
+diff --git a/internal/chatgpt/hide.go b/internal/chatgpt/hide.go
+new file mode 100644
+index 0000000..b2b2f65
+--- /dev/null
++++ b/internal/chatgpt/hide.go
+@@ -0,0 +1,64 @@
++package chatgpt
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"time"
++)
++
++// hideFromHistory best-effort hides a throwaway conversation in the account
++// history. The Web UI's own delete sends PATCH /backend-api/conversation/{id}
++// with {"is_visible": false}; no sentinel or PoW is involved on that route.
++// Failure is silent: the image is already in hand, a leftover chat entry is
++// cosmetic. Opt out with GPTWEB_AUTO_HIDE_CONVERSATIONS=0.
++func (c *Client) hideFromHistory(ctx context.Context, conversationID string) {
++	if strings.EqualFold(strings.TrimSpace(os.Getenv("GPTWEB_AUTO_HIDE_CONVERSATIONS")), "0") ||
++		strings.EqualFold(strings.TrimSpace(os.Getenv("GPTWEB_AUTO_HIDE_CONVERSATIONS")), "false") {
++		return
++	}
++	conversationID = strings.TrimSpace(conversationID)
++	if conversationID == "" {
++		return
++	}
++	hideCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	token, cookie, accountID, err := c.session(hideCtx)
++	if err != nil || strings.TrimSpace(token) == "" {
++		return
++	}
++	endpoint := fmt.Sprintf("%s/backend-api/conversation/%s", c.baseURL, conversationID)
++	payload, err := json.Marshal(map[string]any{"is_visible": false})
++	if err != nil {
++		return
++	}
++	req, err := http.NewRequestWithContext(hideCtx, http.MethodPatch, endpoint, bytes.NewReader(payload))
++	if err != nil {
++		return
++	}
++	for k, v := range c.webHeaders(c.deviceID, newUUID()) {
++		req.Header.Set(k, v)
++	}
++	req.Header.Set("Authorization", "Bearer "+token)
++	if accountID != "" {
++		req.Header.Set("ChatGPT-Account-ID", accountID)
++	}
++	if cookie != "" {
++		req.Header.Set("Cookie", cookie)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode >= 300 {
++		fmt.Fprintf(os.Stderr, "gptweb: hide conversation %s rejected (status %d)\n", conversationID, resp.StatusCode)
++	}
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
++}
+diff --git a/internal/chatgpt/images_direct.go b/internal/chatgpt/images_direct.go
+index eb78740..14053d0 100644
+--- a/internal/chatgpt/images_direct.go
++++ b/internal/chatgpt/images_direct.go
+@@ -40,6 +40,7 @@ func (c *Client) GenerateImage(ctx context.Context, in ImageGenerationRequest) (
+ 		Model:           strings.TrimSpace(in.Model),
+ 		Turns:           []Turn{{Role: "user", Text: prompt}},
+ 		HistoryDisabled: &historyKept,
++		ProjectID:       c.generationProjectID,
+ 		Attachments:     in.Attachments,
+ 	}
+ 	var pointers []string
+@@ -74,6 +75,9 @@ func (c *Client) GenerateImage(ctx context.Context, in ImageGenerationRequest) (
+ 	if err != nil {
+ 		return ImageGenerationResult{}, err
+ 	}
++	// brushrouter patch: the throwaway image conversation is never reused,
++	// so hide it from account history immediately (best-effort, non-fatal).
++	c.hideFromHistory(ctx, conversationID)
+ 	return ImageGenerationResult{
+ 		Created: time.Now().Unix(),
+ 		Images:  []GeneratedImage{{MIMEType: mimeType, DataBase64: base64.StdEncoding.EncodeToString(data)}},
+diff --git a/internal/chatgpt/types.go b/internal/chatgpt/types.go
+index acb1ba4..b21d36a 100644
+--- a/internal/chatgpt/types.go
++++ b/internal/chatgpt/types.go
+@@ -40,6 +40,8 @@ type Request struct {
+ 	// non-nil. Multi-turn synthesized conversations must set false so the
+ 	// server keeps the exchange and accepts continuations.
+ 	HistoryDisabled *bool
++	// ProjectID anchors the turn in a ChatGPT project (workspace); empty = none.
++	ProjectID string
+ }
+ 
+ type FeatureLimit struct {

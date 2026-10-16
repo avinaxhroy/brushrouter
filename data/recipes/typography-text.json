@@ -1,0 +1,51 @@
+{
+  "id": "typography-text",
+  "label": "Logos & lettering",
+  "intent": "Text that is the image. The letters must be correct, and the material has to sell them.",
+  "aliases": ["logo", "wordmark", "lettering", "typography", "brand mark", "emblem", "monogram", "signage", "badge", "font", "type", "text effect", "letter", "calligraphy"],
+  "recipes": [
+    {
+      "id": "logo-mark",
+      "goal": "A single logo or wordmark, rendered as a physical object.",
+      "when": "Brand mark, app icon, signage mockup. One word or one symbol, nothing else.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "surface", "render", "text"],
+      "defaults": { "ratio": "1:1", "composition": "centred hero", "background": "flat colour field", "lighting": "even flat studio light", "surface": "brushed metal", "render": "3D product render" },
+      "text": "Create a {ratio} logo render of the word or mark \"{text}\".\nLETTERING — spell it exactly as given. Draw every letterform deliberately and correctly; no invented or substituted characters. Set it in a single consistent style, evenly spaced, optically aligned.\nCOMPOSITION — {composition}, generous margin, the mark filling roughly 60 percent of the frame.\nMATERIAL — the mark is a physical object made of {surface}, with believable thickness and edge highlights.\nBACKGROUND — {background}, plain and untextured so the mark is the only subject.\nLIGHTING — {lighting}.\nRENDER — {render} with clean, straight edges and true circles.",
+      "image": {
+        "accepts": "an existing logo file or a photo of the mark",
+        "preserve": ["the exact letterforms", "proportions", "spacing", "mark geometry"],
+        "skeleton": "Use the supplied logo as the exact reference. Reproduce its letterforms, proportions and spacing faithfully — do not redraw, restyle, re-space or substitute any character.\n\nRender that same mark as a {ratio} {render}: the logo realised as a physical object in {surface}, with believable thickness and edge highlights. {composition} with generous margin. {background}, lit with {lighting}. The mark must remain instantly recognisable as the one supplied."
+      },
+      "negatives": ["no misspelled or substituted letters", "no invented extra characters", "no gradient backgrounds", "no watermark", "no drop shadow", "no distorted or uneven letter spacing"],
+      "example": "Create a 1:1 logo render of the wordmark \"NORTHWIND\". LETTERING — spell it exactly, all caps, single weight, even spacing, optically aligned. COMPOSITION — centred hero, filling about 60 percent of the frame with generous margin. MATERIAL — the wordmark as a brushed metal object with real thickness and a bright top edge. BACKGROUND — flat deep teal. LIGHTING — even flat studio light. RENDER — 3D product render with clean straight edges and true circles."
+    },
+    {
+      "id": "type-hero",
+      "goal": "Type carrying a whole design, not just labelling it.",
+      "when": "A campaign where the words are the art: a headline-led poster, a book cover, a social statement.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "surface", "type", "text"],
+      "defaults": { "ratio": "3:4", "composition": "centred hero", "lighting": "hard side sunlight", "grading": "high-contrast cinematic", "mood": "dramatic", "surface": "plaster wall", "type": "high-contrast serif display" },
+      "text": "Create a {ratio} type-led design where the words are the entire subject.\nTEXT — the exact words \"{text}\". Spell them correctly, character for character. No other lettering appears anywhere in the frame.\nTYPOGRAPHY — set in {type}, very large, the text treated as a solid graphic mass. Tighten the leading, let the type fill and bleed off the edges.\nCOMPOSITION — {composition}. The type's shape is the composition.\nMATERIAL — give the letterforms a physical presence against {surface}, casting a real shadow, so they read as objects rather than pixels.\nLIGHTING — {lighting}, raking across the letterforms so their depth is visible.\nCOLOUR — {grading}.\nMOOD — {mood}.",
+      "negatives": ["no misspelled words", "no additional lettering", "no decorative clip-art", "no watermark", "no thin or small type", "no illegible overlaps"],
+      "example": "Create a 3:4 type-led design where the words are the entire subject. TEXT — the exact words \"NOT FOR EVERYONE\". Spell them correctly; no other lettering appears anywhere. TYPOGRAPHY — high-contrast serif display, very large, set as three stacked lines that bleed off the left and right edges. COMPOSITION — centred hero, the block of type filling the canvas. MATERIAL — the letterforms cast in relief against a plaster wall, throwing a real shadow. LIGHTING — hard side sunlight raking across the letters so their depth is visible. COLOUR — high-contrast cinematic, near-black and bone white. MOOD — dramatic."
+    },
+    {
+      "id": "brand-identity-set",
+      "goal": "A small identity system: mark, wordmark and application, on one sheet.",
+      "when": "A brand needs more than one asset and you want them consistent in a single generation.",
+      "shape": "grid",
+      "slots": ["ratio", "background", "surface", "lighting", "grading", "type", "text"],
+      "defaults": { "ratio": "16:9", "background": "seamless white", "surface": "matte ceramic", "lighting": "even flat studio light", "grading": "neutral and true", "type": "bold geometric sans" },
+      "text": "Create a single {ratio} image: a brand identity sheet laid out as a 2 by 2 grid of four panels with thin grey dividers.\nTOP LEFT — the primary wordmark \"{text}\" in {type}, black on {background}.\nTOP RIGHT — the same wordmark reversed: white on a solid block of the brand colour.\nBOTTOM LEFT — the mark applied to a physical object in {surface}, showing how it behaves on a real surface.\nBOTTOM RIGHT — the wordmark at small size, as it would appear on stationery.\nCONSISTENCY — the letterforms, spacing and proportions must be identical in all four panels. This is one brand shown four ways, not four designs.\nLIGHTING — {lighting}. COLOUR — {grading}.\nNo captions, no panel numbers, no explanatory text of any kind.",
+      "image": {
+        "accepts": "an existing logo file",
+        "preserve": ["exact letterforms", "spacing", "mark geometry", "brand colour"],
+        "skeleton": "Use the supplied logo as the exact reference. Its letterforms, spacing, mark geometry and colour must be reproduced faithfully in every panel — no redrawing or restyling.\n\nCreate a single {ratio} image: a brand identity sheet as a 2 by 2 grid with thin grey dividers. TOP LEFT — the mark in black on {background}. TOP RIGHT — the same mark reversed out of a solid brand-colour block. BOTTOM LEFT — the mark applied to an object in {surface}. BOTTOM RIGHT — the mark small, as on stationery. Identical letterforms and proportions in all four panels. {lighting}, {grading}. No captions or panel numbers."
+      },
+      "negatives": ["no misspelled text", "no differing letterforms between panels", "no panel numbers or captions", "no invented sub-logos", "no watermark", "no inconsistent brand colour"],
+      "example": "Create a single 16:9 image: a brand identity sheet as a 2 by 2 grid with thin grey dividers, for a coffee roaster called \"HALFLIGHT\". TOP LEFT — the wordmark HALFLIGHT in bold geometric sans, black on seamless white. TOP RIGHT — the same wordmark reversed white out of a solid burnt-orange block. BOTTOM LEFT — the wordmark applied to a matte ceramic cup. BOTTOM RIGHT — the wordmark small, as it would sit on a business card. CONSISTENCY — identical letterforms and spacing in all four panels; one brand shown four ways. LIGHTING — even flat studio light. COLOUR — neutral and true. No captions, no panel numbers."
+    }
+  ]
+}

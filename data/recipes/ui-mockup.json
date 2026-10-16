@@ -1,0 +1,46 @@
+{
+  "id": "ui-mockup",
+  "label": "Interfaces & screens",
+  "intent": "Software that looks real. Screen contents must be plausible, aligned and correctly spelled.",
+  "aliases": ["ui", "ux", "app", "interface", "dashboard", "mockup", "screen", "website", "web design", "landing page", "mobile app", "desktop", "saas", "wireframe", "case study", "app store"],
+  "recipes": [
+    {
+      "id": "app-screen",
+      "goal": "A single convincing product screen.",
+      "when": "You need one screen that looks like a shipping product, not a wireframe.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "background", "lighting", "grading", "type", "subject"],
+      "defaults": { "ratio": "9:16", "composition": "centred hero", "background": "dark textured", "lighting": "even flat studio light", "grading": "neutral and true", "type": "bold geometric sans" },
+      "text": "Create a {ratio} mockup of the {subject} screen of a real-looking mobile app.\nSCREEN CONTENT — invent a plausible product and populate the screen with real interface copy: a real title, real navigation labels, real list items with real names, realistic numbers and dates. Every string must be a correctly spelled word or phrase that belongs on that screen. No placeholder text, no lorem ipsum, no keyboard mash.\nLAYOUT — strict alignment: one consistent grid, one consistent left margin, consistent spacing between elements, a clear hierarchy of title, body and metadata. Tap targets look genuinely tappable.\nTYPE — {type}, a clear three-level hierarchy.\nPRESENTATION — the screen shown flat and head-on, scaled to fill the frame, {composition}, on {background}. Optionally one soft device shadow.\nCOLOUR — {grading}. LIGHTING — {lighting}.",
+      "image": {
+        "accepts": "a screenshot or an existing UI",
+        "preserve": ["layout structure", "navigation", "content hierarchy", "brand colour"],
+        "skeleton": "Use the supplied screenshot as the exact structural reference. Keep its layout, navigation and content hierarchy recognisable.\n\nRe-render it as a polished {ratio} {subject} screen mockup with real interface copy: correct titles, labels, list items and realistic figures, all properly spelled. Strict alignment on one grid with consistent spacing and a clear type hierarchy. {type}, {grading}. Present it flat and head-on, {composition}, on {background}. Improve the visual craft without changing what the screen does."
+      },
+      "negatives": ["no gibberish or lorem-ipsum text", "no misaligned or crowded elements", "no fake or illegible icons", "no watermark", "no overlapping text", "no more than one device shadow"],
+      "example": "Create a 9:16 mockup of the home screen of a real-looking mobile app for tracking houseplants. SCREEN CONTENT — title \"My Plants\", four list rows each with a real plant name and a real last-watered date, a bottom navigation bar labelled Today, Plants, Schedule and Me, and a small status line reading \"3 need water today\". Every string correctly spelled. LAYOUT — strict single-column grid, consistent left margin, consistent spacing, clear hierarchy between plant name and metadata. TYPE — bold geometric sans in three sizes. PRESENTATION — flat and head-on, centred hero, on a dark textured background with one soft device shadow. COLOUR — neutral and true."
+    },
+    {
+      "id": "case-study-page",
+      "goal": "A designed page that presents work as a case study.",
+      "when": "Portfolio piece, marketing page, design-process writeup. Image plus structure plus a little story.",
+      "shape": "document",
+      "slots": ["ratio", "background", "grading", "type", "text", "subject"],
+      "defaults": { "ratio": "3:4", "background": "seamless white", "grading": "neutral and true", "type": "bold geometric sans" },
+      "text": "Create a {ratio} page presenting {subject} as a design case study.\nLAYOUT — a real editorial page on a strict grid: a wide title block at the top, one large hero image, then two columns of shorter supporting content below it.\nTITLE — the exact text \"{text}\" as the page headline, set in {type} at the largest size on the page.\nSUPPORTING CONTENT — real sentences, correctly spelled, describing the problem, the approach and the outcome. Two short paragraphs, no filler, no repeated words.\nSTRUCTURE — a clear three-level type hierarchy, consistent baseline grid, generous margins, and one accent colour used to mark section labels only.\nBACKGROUND — {background}. COLOUR — {grading}.\nRENDER — a clean, flat designed page. No device frame, no perspective, no gloss.",
+      "negatives": ["no lorem ipsum or gibberish", "no placeholder image boxes", "no more than three type sizes", "no device frames or perspective", "no watermark", "no crowded margins"],
+      "example": "Create a 3:4 page presenting a redesign of a bicycle repair booking flow as a design case study. LAYOUT — wide title block at the top, one large hero image of the new booking screen, then two columns of supporting text below. TITLE — the exact text \"BOOKING, REBUILT\" as the headline in bold geometric sans, the largest element on the page. SUPPORTING CONTENT — two short real paragraphs: one on why the old flow lost people at the date step, one on what changed and the measured result. STRUCTURE — three type sizes, consistent baseline grid, generous margins, one accent colour marking the two section labels. BACKGROUND — seamless white. COLOUR — neutral and true. RENDER — flat designed page, no device frame or perspective."
+    },
+    {
+      "id": "pov-overlay",
+      "goal": "A screen element seen in the world — camera view, AR overlay, heads-up display.",
+      "when": "You need the product to feel embedded in reality rather than shown on a device.",
+      "shape": "single",
+      "slots": ["ratio", "composition", "lighting", "grading", "mood", "type", "subject"],
+      "defaults": { "ratio": "9:16", "composition": "overhead", "lighting": "natural window light", "grading": "neutral and true", "mood": "calm", "type": "bold geometric sans" },
+      "text": "Create a {ratio} first-person point-of-view photograph of {subject}.\nCAMERA — a real handheld viewpoint: slight tilt, natural framing, mild motion blur at the edges. It should feel photographed, not rendered.\nOVERLAY — a minimal heads-up interface floating in the view: two or three small labelled markers, thin leader lines, one short status line, all in {type}. The overlay is perfectly crisp while the photographed world behind it is soft. Every label must be a real, correctly spelled word.\nCOMPOSITION — {composition}. The overlay must never obscure the thing it is annotating.\nLIGHTING — {lighting}. COLOUR — {grading}. MOOD — {mood}.",
+      "negatives": ["no gibberish interface labels", "no overlay covering the subject", "no heavy chrome or bezels", "no watermark", "no more than four interface elements", "no perfectly level camera"],
+      "example": "Create a 9:16 first-person point-of-view photograph of a supermarket shelf being scanned while shopping. CAMERA — handheld, slightly tilted, the shelf filling the frame at a natural arm's length, mild blur at the edges. OVERLAY — a thin rectangle around one cereal box, a small label above it reading \"Matches your list\", a second label reading \"2 for 5.00\", and one status line at the top reading \"List: 6 of 9\". Overlay crisp, world soft. COMPOSITION — overhead, the overlay never covering the product it marks. LIGHTING — natural window light from the aisle end. COLOUR — neutral and true. MOOD — calm."
+    }
+  ]
+}
