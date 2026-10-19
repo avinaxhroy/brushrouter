@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 
 export const RULE_START_MARKER = "<!-- BRUSHROUTER_START -->";
 export const RULE_END_MARKER = "<!-- BRUSHROUTER_END -->";
@@ -20,8 +20,21 @@ export const BRUSHROUTER_RULE_SNIPPET = `${RULE_START_MARKER}\n${BRUSHROUTER_RUL
 
 /**
  * Returns known coding tool rule file locations (both global and project-level).
+ *
+ * Each target carries a `probe`: a zero-arg predicate answering "is this harness
+ * installed/relevant here?". `rules` is smart by default — it only writes where
+ * the file exists OR the probe is true — and the user overrides with --all,
+ * --global, --project, or --only <ids>.
  */
-export function getKnownRuleTargets({ cwd = process.cwd(), home = homedir() } = {}) {
+export function getKnownRuleTargets({ cwd = process.cwd(), home = homedir(), os = platform(), env = process.env } = {}) {
+  const dir = (...parts) => existsSync(join(...parts));
+  const appDir = (leaf) => dirHomeApp(home, os, env, leaf);
+  const vscodeDir = dir(appDir("Code"));
+  const jetbrainsDir = dir(appDir("JetBrains"));
+  const anyTool = () => dir(home, ".claude") || dir(home, ".codex") || dir(home, ".gemini") || dir(home, ".pi") ||
+    dir(home, ".omp") || dir(home, ".cursor") || dir(home, ".codeium") || dir(home, ".config", "opencode") ||
+    existsSync(join(home, ".cursorrules"));
+
   return [
     // Global rule files
     {
@@ -29,18 +42,49 @@ export function getKnownRuleTargets({ cwd = process.cwd(), home = homedir() } = 
       name: "Oh-My-Pi Global Rules",
       path: join(home, ".omp", "agent", "AGENTS.md"),
       scope: "global",
+      probe: () => dir(home, ".omp"),
+    },
+    {
+      id: "pi-global",
+      name: "Pi Global Rules",
+      path: join(home, ".pi", "agent", "AGENTS.md"),
+      scope: "global",
+      probe: () => dir(home, ".pi"),
+    },
+    {
+      id: "codex-global",
+      name: "Codex CLI Global Rules",
+      path: join(home, ".codex", "AGENTS.md"),
+      scope: "global",
+      probe: () => dir(home, ".codex"),
+    },
+    {
+      id: "dsh-global",
+      name: "DeepSeek Harness (DSH) Global Rules",
+      path: join(home, ".dsh", "AGENTS.md"),
+      scope: "global",
+      probe: () => dir(home, ".dsh"),
     },
     {
       id: "claude-global",
       name: "Claude Code Global Rules",
       path: join(home, ".claude", "CLAUDE.md"),
       scope: "global",
+      probe: () => dir(home, ".claude"),
+    },
+    {
+      id: "gemini-global",
+      name: "Gemini CLI Global Rules",
+      path: join(home, ".gemini", "GEMINI.md"),
+      scope: "global",
+      probe: () => dir(home, ".gemini"),
     },
     {
       id: "cursor-global",
       name: "Cursor Global Rules",
       path: join(home, ".cursorrules"),
       scope: "global",
+      probe: () => dir(home, ".cursor") || existsSync(join(home, ".cursorrules")),
     },
     // Project-level rule files
     {
@@ -48,32 +92,65 @@ export function getKnownRuleTargets({ cwd = process.cwd(), home = homedir() } = 
       name: "Project AGENTS.md",
       path: join(cwd, "AGENTS.md"),
       scope: "project",
+      probe: anyTool,
     },
     {
       id: "project-claude",
       name: "Project CLAUDE.md",
       path: join(cwd, "CLAUDE.md"),
       scope: "project",
+      probe: () => dir(home, ".claude"),
+    },
+    {
+      id: "project-gemini",
+      name: "Project GEMINI.md",
+      path: join(cwd, "GEMINI.md"),
+      scope: "project",
+      probe: () => dir(home, ".gemini"),
     },
     {
       id: "project-cursor",
       name: "Project .cursorrules",
       path: join(cwd, ".cursorrules"),
       scope: "project",
-    },
-    {
-      id: "project-windsurf",
-      name: "Project .windsurfrules",
-      path: join(cwd, ".windsurfrules"),
-      scope: "project",
+      probe: () => dir(home, ".cursor") || existsSync(join(cwd, ".cursorrules")),
     },
     {
       id: "project-cursor-mdc",
       name: "Project Cursor Rule (.cursor/rules/brushrouter.mdc)",
       path: join(cwd, ".cursor", "rules", "brushrouter.mdc"),
       scope: "project",
+      probe: () => dir(home, ".cursor"),
+    },
+    {
+      id: "project-windsurf",
+      name: "Project .windsurfrules",
+      path: join(cwd, ".windsurfrules"),
+      scope: "project",
+      probe: () => dir(home, ".codeium"),
+    },
+    {
+      id: "project-copilot",
+      name: "Project Copilot Instructions (.github/copilot-instructions.md)",
+      path: join(cwd, ".github", "copilot-instructions.md"),
+      scope: "project",
+      probe: () => dir(cwd, ".github") || dir(vscodeDir),
+    },
+    {
+      id: "project-junie",
+      name: "Project Junie Guidelines (.junie/guidelines.md)",
+      path: join(cwd, ".junie", "guidelines.md"),
+      scope: "project",
+      probe: () => dir(cwd, ".junie") || dir(jetbrainsDir),
     },
   ];
+}
+
+// Per-app config dir under the OS's Application Support / AppData location.
+function dirHomeApp(home, os, env, leaf) {
+  if (os === "darwin") return join(home, "Library", "Application Support", leaf);
+  if (os === "win32" && env.APPDATA) return join(env.APPDATA, leaf);
+  return join(home, ".config", leaf);
 }
 
 /**
@@ -86,6 +163,13 @@ export function detectRuleFiles(options = {}) {
     const parentExists = existsSync(dirname(target.path));
     let hasRule = false;
     let isCurrent = false;
+    let installed = false;
+
+    if (target.probe) {
+      try {
+        installed = Boolean(target.probe());
+      } catch {}
+    }
 
     if (exists) {
       try {
@@ -101,6 +185,7 @@ export function detectRuleFiles(options = {}) {
       ...target,
       exists,
       parentExists,
+      installed,
       hasRule,
       isCurrent,
     };

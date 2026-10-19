@@ -1,6 +1,6 @@
 {
   "name": "brushrouter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Provider-agnostic image generation router: one CLI + MCP server that auto-routes across the AI backends you already have (native Codex CLI, ChatGPT subscription, Gemini/Antigravity, OpenRouter, fal.ai, custom HTTP), and hands agents a prompt library so they can brief an image from text alone — 27 recipes we author plus 137 vendored visual styles. No hardcoded paths, no secrets exposed to models.",
   "type": "module",
   "bin": {

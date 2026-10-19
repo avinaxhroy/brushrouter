@@ -99,9 +99,37 @@ test("injectRuleToFile respects dry-run and create options", () => {
   }
 });
 
-test("CLI rules --dry-run and --version execute successfully", () => {
+test("detectRuleFiles probes harness installation for smart targeting", () => {
+  const home = mkdtempSync(join(tmpdir(), "rules-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "rules-cwd-"));
+  try {
+    mkdirSync(join(home, ".codex"));
+    mkdirSync(join(cwd, ".github"));
+
+    const detected = detectRuleFiles({ cwd, home });
+    const byId = Object.fromEntries(detected.map((d) => [d.id, d]));
+
+    // Codex installed => its global rules are eligible even with no file yet.
+    assert.equal(byId["codex-global"].exists, false);
+    assert.equal(byId["codex-global"].installed, true);
+    // AGENTS.md is the universal target: relevant when any tool is installed.
+    assert.equal(byId["project-agents"].installed, true);
+    // Copilot detected via project .github dir.
+    assert.equal(byId["project-copilot"].installed, true);
+    // Pi not installed and no file: not eligible under smart default.
+    assert.equal(byId["pi-global"].exists, false);
+    assert.equal(byId["pi-global"].installed, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+import { mkdirSync } from "node:fs";
+
+test("CLI rules --dry-run respects --only and succeeds", () => {
   const binPath = resolve("./bin/brushrouter.js");
-  
+
   const ver = spawnSync(process.execPath, [binPath, "--version"], { encoding: "utf8" });
   assert.equal(ver.status, 0);
   assert.match(ver.stdout, /brushrouter v\d+\.\d+\.\d+/);
@@ -109,6 +137,9 @@ test("CLI rules --dry-run and --version execute successfully", () => {
   const rulesDry = spawnSync(process.execPath, [binPath, "rules", "--dry-run"], { encoding: "utf8" });
   assert.equal(rulesDry.status, 0);
   assert.match(rulesDry.stdout, /brushrouter rules — Coding Tool Guidance Injection/);
+
+  const only = spawnSync(process.execPath, [binPath, "rules", "--dry-run", "--only", "project-agents"], { encoding: "utf8" });
+  assert.equal(only.status, 0);
 
   const updateDry = spawnSync(process.execPath, [binPath, "update", "--dry-run"], { encoding: "utf8" });
   assert.equal(updateDry.status, 0);

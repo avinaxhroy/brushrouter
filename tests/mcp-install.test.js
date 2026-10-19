@@ -171,13 +171,88 @@ test("installMcpToAgent supports Zed context_servers format", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+test("installMcpToAgent handles DeepSeek Harness (dsh) YAML patch format", () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-dsh-test-"));
+  const profileDir = join(dir, "profiles", "desktop");
+  mkdirSync(profileDir, { recursive: true });
+  const entry = { command: "brushrouter", args: ["serve"] };
+
+  try {
+    const patchPath = join(profileDir, "cordis.patch.yml");
+    const agent = { name: "dsh", label: "DeepSeek Harness (DSH)", path: patchPath, custom: "dsh-yaml" };
+
+    // 1. Appends our block to a populated patch file, preserving user entries.
+    writeFileSync(
+      patchPath,
+      "- id: mcp-semble\n  name: \"@deepseek-ai/dsh-mcp-client\"\n  config:\n    serverName: semble\n\n# user comment kept\n"
+    );
+    const res = installMcpToAgent(agent, entry);
+    assert.equal(res.status, "updated");
+    assert.ok(res.backup && existsSync(res.backup));
+
+    const content = readFileSync(patchPath, "utf8");
+    assert.ok(content.includes("serverName: semble"));
+    assert.ok(content.includes("# user comment kept"));
+    assert.ok(content.includes("serverName: brushrouter"));
+    assert.ok(content.includes('args: ["serve"]'));
+
+    // 2. Idempotent.
+    assert.equal(installMcpToAgent(agent, entry).status, "already-installed");
+
+    // 3. Stale block is replaced in place, user entries preserved.
+    writeFileSync(
+      patchPath,
+      "# doc\n"
+        + "# <!-- BRUSHROUTER_START -->\n"
+        + "- id: mcp-brushrouter\n"
+        + "  config:\n    command: old\n"
+        + "# <!-- BRUSHROUTER_END -->\n"
+        + "\n- id: mcp-semble\n"
+    );
+    const res2 = installMcpToAgent(agent, entry);
+    assert.equal(res2.status, "updated");
+    const content2 = readFileSync(patchPath, "utf8");
+    assert.ok(content2.includes("command: brushrouter"));
+    assert.ok(!content2.includes("command: old"));
+    assert.ok(content2.includes("mcp-semble"));
+    assert.ok(content2.includes("# doc"));
+
+    // 4. Bare `[]` is replaced with our block (stays a valid list).
+    writeFileSync(patchPath, "[]\n");
+    assert.equal(installMcpToAgent(agent, entry).status, "updated");
+    const content3 = readFileSync(patchPath, "utf8");
+    assert.ok(content3.includes("- id: mcp-brushrouter"));
+    assert.ok(!content3.includes("[]"));
+
+    // 5. Detect flags DSH via the marker block, with no JSON parse error.
+    const detected = detectInstalledAgents([agent]);
+    assert.equal(detected[0].hasBrushrouter, true);
+    assert.equal(detected[0].parseError, null);
+
+    // 6. Missing parents refuse unless forced.
+    const absent = { name: "dsh", path: join(dir, "no", "such", "cordis.patch.yml"), custom: "dsh-yaml" };
+    assert.equal(installMcpToAgent(absent, entry).status, "not-present");
+    assert.equal(installMcpToAgent(absent, entry, { force: true }).status, "created");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("install.sh script syntax and execution", () => {
   const check = spawnSync("bash", ["-n", "install.sh"]);
   assert.equal(check.status, 0);
-  const run = spawnSync("./install.sh", ["--help"], { encoding: "utf8" });
-  assert.equal(run.status, 0);
-  assert.match(run.stdout, /brushrouter installer/);
-  assert.match(run.stdout, /provider-agnostic image generation router/);
+  const home = mkdtempSync(join(tmpdir(), "br-install-test-"));
+  try {
+    const run = spawnSync("./install.sh", ["--help"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home },
+    });
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /brushrouter installer/);
+    assert.match(run.stdout, /provider-agnostic image generation router/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 test("getKnownAgentConfigs adapts to Windows, Linux, and macOS platforms", () => {
   const home = "/Users/testuser";

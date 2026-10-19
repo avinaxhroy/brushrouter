@@ -127,7 +127,7 @@ const SECRET_KEY_RE = /(token|secret|password|apikey|api_key|authorization|beare
 // which meant a credential nested deeper than the limit reached the model
 // untouched. A string leaf is now redacted at any depth, and a container past
 // the limit collapses to a marker rather than passing through.
-const MAX_REDACT_DEPTH = 8;
+const MAX_REDACT_DEPTH = 32;
 
 export function redactValue(value, depth = 0) {
   if (typeof value === "string") return redact(value);

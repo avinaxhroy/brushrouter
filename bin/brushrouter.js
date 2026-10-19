@@ -104,6 +104,7 @@ function parse(argv) {
       project: { type: "boolean", default: false },
       global: { type: "boolean", default: false },
       create: { type: "boolean", default: false },
+      only: { type: "string" },
       version: { type: "boolean", short: "V", default: false },
     },
   });
@@ -148,7 +149,8 @@ ${paint(C.bold, "COMMANDS")}
   prompts [query]          Find a prompt recipe or a look to build an image from
   init [--force]           Write a starter config to ${dim(USER_CONFIG_PATH)}
   install [--dry-run]      Add brushrouter to detected agent MCP configs
-  rules [--dry-run]        Inject or update clean brushrouter guidance in AI coding tools
+  rules [--dry-run]        Inject or update clean brushrouter guidance in AI coding
+                           tools (targets detected harnesses; see options below)
   update                   Update brushrouter to the latest version and verify health
   serve                    Run as an MCP server on stdio (for agents)
 
@@ -184,6 +186,10 @@ ${paint(C.bold, "OPTIONS")}
       --force              gen: overwrite -o instead of saving a new version.
                            init: overwrite an existing config
   -v, --verbose            Show routing decisions
+      --global, --project  rules: restrict to global / project rule files
+      --all, --only <ids>  rules: include undetected harnesses / cherry-pick ids
+       --create            rules: create missing project rule files (--global or
+                           --all must be alongside to create global ones)
   -h, --help               Show this help
 
 ${paint(C.bold, "EXAMPLES")}
@@ -969,29 +975,43 @@ async function cmdRules(args) {
   const dry = args.values["dry-run"];
   const targetProject = args.values.project;
   const targetGlobal = args.values.global;
-  const createIfMissing = args.values.create;
+  const targetAll = args.values.all; // user override: touch every known target, even undetected harnesses
+  const onlyIds = args.values.only ? args.values.only.split(",").map((s) => s.trim()).filter(Boolean) : null;
+  const createFlag = args.values.create;
 
   console.log(paint(C.bold, "brushrouter rules — Coding Tool Guidance Injection\n"));
   console.log(dim("Injects compact, bounded rule blocks (<!-- BRUSHROUTER_START -->...<!-- BRUSHROUTER_END -->)"));
-  console.log(dim("into AGENTS.md, CLAUDE.md, .cursorrules, and .windsurfrules without context bulkup (~60 tokens).\n"));
+  console.log(dim("into AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, and other rule files without context bulkup (~60 tokens)."));
+  console.log(dim("Smart by default: only targets harnesses detected on this machine. Override with --all, --only <id>, --global, or --project.\n"));
 
   const detected = detectRuleFiles();
   let changed = 0;
   let currentCount = 0;
+  let skippedCount = 0;
 
   for (const item of detected) {
     if (targetProject && item.scope !== "project") continue;
     if (targetGlobal && item.scope !== "global") continue;
+    if (onlyIds && !onlyIds.includes(item.id)) continue;
 
-    if (!item.exists && !createIfMissing) {
+    // Smart inclusion: file already present, or its harness is installed here.
+    // --all is the user's explicit decision to include everything anyway.
+    if (!(targetAll || item.exists || item.installed)) {
+      skippedCount++;
       if (args.values.verbose) {
-        console.log(`${dim("-")} ${item.name.padEnd(35)} ${dim("not present")}`);
+        console.log(`${dim("-")} ${item.name.padEnd(35)} ${dim("harness not detected, skipping")} ${dim(`(${item.id})`)}`);
       }
       continue;
     }
 
-    const res = injectRuleToFile(item.path, { dry, create: createIfMissing });
+    // Bare --create only creates project-level files; creating a global rules
+    // file takes an explicit --global or --all beside it.
+    const create = createFlag && (item.scope === "project" || targetGlobal || targetAll);
+    const res = injectRuleToFile(item.path, { dry, create });
     switch (res.status) {
+      case "not-present":
+        console.log(`${dim("-")} ${item.name.padEnd(35)} ${dim("not present, skipping")} ${dim(`(${item.path})`)}`);
+        break;
       case "already-current":
         console.log(`${ok("=")} ${item.name.padEnd(35)} ${dim("already up to date")} ${dim(`(${item.path})`)}`);
         currentCount++;
@@ -1022,9 +1042,9 @@ async function cmdRules(args) {
     console.log(warn(`Dry run: ${changed} rule file(s) would change. Re-run without --dry-run to apply.`));
   } else if (changed > 0) {
     console.log(ok(`Updated ${changed} coding tool rule file(s). Coding agents will now automatically reach for brushrouter.`));
-  } else {
-    console.log(dim("No existing coding tool rule files detected in the project or globally."));
-    console.log(dim("Run `brushrouter rules --create` to create an AGENTS.md rule file in the current directory."));
+  } else if (skippedCount > 0) {
+    console.log(dim(`No eligible rule files in scope (${skippedCount} skipping undetected harnesses).`));
+    console.log(dim("Run with -v to see what was skipped, or --all to target every known harness."));
   }
 }
 

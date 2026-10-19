@@ -207,7 +207,7 @@ The 150-prompt corpus in `data/prompts/` is a development fixture, excluded from
 
 ## MCP server
 
-`brushrouter install` detects and wires brushrouter into your installed agents (Claude Code, Claude Desktop, Cursor, Windsurf, OpenCode, Pi, Oh-My-Pi, CommandCode, Glass, shared MCP configs). Configs are backed up first (`.bak-...`), comments and formatting preserved, and no existing servers removed. Or add it by hand:
+`brushrouter install` detects and wires brushrouter into your installed agents (Claude Code, Claude Desktop, Cursor, Windsurf, OpenCode, Pi, Oh-My-Pi, DeepSeek Harness/DSH, CommandCode, Glass, shared MCP configs). Configs are backed up first (`.bak-...`), comments and formatting preserved, and no existing servers removed. Or add it by hand:
 
 ```json
 {
@@ -217,6 +217,19 @@ The 150-prompt corpus in `data/prompts/` is a development fixture, excluded from
 }
 ```
 
+DeepSeek Harness (DSH) has no mcpServers JSON — its servers are YAML patch entries in `~/.dsh/profiles/<profile>/cordis.patch.yml` (profile defaults to `desktop`; set `BRUSHROUTER_DSH_PROFILE` to change). `brushrouter install --agent dsh` writes the marker-bounded, idempotent block for you, or by hand:
+
+```yaml
+- id: mcp-brushrouter
+  name: "@deepseek-ai/dsh-mcp-client"
+  config:
+    serverName: brushrouter
+    transport: stdio
+    command: brushrouter
+    args: ["serve"]
+    toolCallTimeoutMs: 300000
+
+```
 Exposed tools:
 
 - **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, out?, images?, async? }`. Returns the saved path plus the image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
@@ -225,12 +238,18 @@ Exposed tools:
 
 An agent's normal loop is `find_image_prompts` → fill the skeleton → `generate_image`. Two separate tools on purpose: the agent reads and changes the prompt instead of a router substituting one.
 
-The `initialize` result also carries an `instructions` string telling the model when to use brushrouter (configurable via `instructions` in config or `BRUSHROUTER_INSTRUCTIONS`; `""` disables). And for rule-file agents, `brushrouter rules` injects ~60 tokens of guidance into `AGENTS.md` / `CLAUDE.md` / `.cursorrules` / `.windsurfrules`, demarcated so it updates in place:
+The `initialize` result also carries an `instructions` string telling the model when to use brushrouter (configurable via `instructions` in config or `BRUSHROUTER_INSTRUCTIONS`; `""` disables). And for rule-file agents, `brushrouter rules` injects ~60 tokens of guidance into the rule files of 12+ harnesses — AGENTS.md (Codex, OpenCode, Zed, Pi, Oh-My-Pi, DeepSeek Harness), CLAUDE.md (Claude Code), GEMINI.md (Gemini CLI), .cursorrules / .cursor rules (Cursor), .windsurfrules (Windsurf), .github/copilot-instructions.md (Copilot), .junie/guidelines.md (Junie) — demarcated so it updates in place:
 
 ```bash
-brushrouter rules             # syncs guidance into detected rule files
+brushrouter rules             # syncs guidance where the harness is detected (smart
+                              # default: file exists OR the harness is installed)
+brushrouter rules -v          # like dry-run detail: see what was skipped and why
 brushrouter rules --dry-run   # preview changes
-brushrouter rules --create    # create a project AGENTS.md if missing
+brushrouter rules --create    # create missing *project* rule files (e.g. AGENTS.md)
+brushrouter rules --global    # restrict to global rule files (creates globals
+                              # alongside --create; bare --create never does)
+brushrouter rules --all       # target every known harness, even undetected ones
+brushrouter rules --only codex-global,project-agents  # cherry-pick by target id
 ```
 
 ```markdown
@@ -239,6 +258,8 @@ brushrouter rules --create    # create a project AGENTS.md if missing
 Use the `brushrouter` MCP server (`generate_image`, `find_image_prompts`) or CLI `brushrouter gen "<prompt>" -o <path>` for creating or editing any images, UI mockups, icons, or diagrams. Avoid manual script creation or ad-hoc web scraping for image tasks. For long generations, pass `async: true` and check `image_result`.
 <!-- BRUSHROUTER_END -->
 ```
+
+Harnesses with a rule-file layout we don't know yet: paste that block into whatever context file the harness reads (system prompt, project rules, slash-command definition) — it's plain Markdown and updates in place on the next `rules` run if the markers are kept.
 
 Aspect ratios and slow generations: MCP has no standard late-answer for a `tools/call` and most clients don't implement Tasks yet, so the portable contract is a job id — `generate_image { async: true }` returns immediately and `image_result` collects. `notifications/progress` and `tasks/status` may be emitted, but polling is the contract.
 
@@ -361,6 +382,14 @@ Zero runtime dependencies, ESM, Node 20+.
 
 MIT for the code, for the recipe library in `data/recipes/`, and for the normaliser that produces `data/styles/`. We wrote the recipes.
 
+The direct Codex backend image generation integration (`images/generations` and `images/edits` for `gpt-image-2`), subscription auth discovery patterns, and prompt-driven aspect ratio handling were learned from and inspired by [yuji-hatakeyama/opencode-gpt-imagegen](https://github.com/yuji-hatakeyama/opencode-gpt-imagegen).
+
 The 137 looks in `data/styles/` are vendored from [VigoZhao/AI-Visual-Prompt-Cookbook](https://github.com/VigoZhao/AI-Visual-Prompt-Cookbook) at a pinned commit, MIT (`Copyright (c) 2026 VigoZhao`); upstream `LICENSE` and `ATTRIBUTION.md` ship with them.
 
 The 150-prompt corpus in `data/prompts/` is a development fixture, not shipped and not covered by that licence — third-party text redistributed under its upstream terms (115 rows CC0, 35 rows CC-BY, authors credited in `data/prompts/ATTRIBUTION.md`; full terms in `data/prompts/LICENSES/`). Quote a prompt along with its `author` and `sourceUrl`.
+
+## Disclaimer
+
+This is an **unofficial, third-party** tool, not affiliated with or endorsed by OpenAI, Google, OpenRouter, fal.ai, or OpenCode.
+
+It calls the same Codex backend that OpenCode itself uses for ChatGPT subscription chat, through the image generation endpoints that the Codex CLI uses. Use must comply with OpenAI's [Terms of Use](https://openai.com/policies/row-terms-of-use/) and [Usage Policies](https://openai.com/policies/usage-policies/), as well as the terms and policies of any other supported provider.

@@ -457,6 +457,45 @@ test("redactValue fails closed past its depth limit instead of leaking", async (
   assert.doesNotThrow(() => redactValue(nest(5000)));
 });
 
+test("redactValue keeps real tool-style schemas intact within its limit", async () => {
+  const { redactValue } = await import("../src/util/redact.js");
+  // A nested inputSchema (per-item options array) sits ~9 containers deep in a
+  // tools/list response. The old depth-8 limit collapsed its leaf property
+  // schemas into the literal "***", which is not valid JSON Schema and made
+  // one provider's request validator reject every deepseek request that
+  // carried the tool.
+  const schema = {
+    name: "batch_generate_images",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompts: { type: "array", items: { type: "string" } },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              prompt: { type: "string" },
+              background: { type: "string", enum: ["opaque", "transparent"] },
+            },
+            required: ["prompt"],
+          },
+        },
+      },
+    },
+  };
+  const tools = redactValue({ result: { tools: [schema] } });
+  const leaf = tools.result.tools[0].inputSchema.properties.items.items.properties.prompt;
+  assert.equal(leaf.type, "string", "nested property schema must survive redaction");
+
+  // A secret nested inside a schema is still masked, by value; only the
+  // container-collapse behavior changed.
+  const leaked = { inputSchema: { properties: {
+    note: { type: "string", description: "call key sk-live-SCHEMALEAKTEST1234567890 to auth" } } } };
+  const out = redactValue(leaked);
+  assert.ok(!JSON.stringify(out).includes("SCHEMALEAKTEST"), "secret inside schema leaked");
+});
+
 test("redactValue passes marked opaque bytes through but redacts everything beside them", async () => {
   const { redactValue, registerSecret, OPAQUE_BYTES } = await import("../src/util/redact.js");
   registerSecret("sk-live-OPAQUETESTVALUE1234567890");

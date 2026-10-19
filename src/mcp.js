@@ -13,6 +13,15 @@ import { saveImage, detectImageMime, batchVariantPath, batchItemPath } from "./u
 import { redact, redactValue, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories } from "./library.js";
 
+const PKG_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    return pkg.version || "0.2.0";
+  } catch {
+    return "0.2.0";
+  }
+})();
+
 export const TOOL_NAME = "generate_image";
 export const PROMPT_TOOL_NAME = "find_image_prompts";
 export const JOB_TOOL_NAME = "image_result";
@@ -563,7 +572,7 @@ export async function handleRequest(msg, ctx) {
         result: {
           protocolVersion: params?.protocolVersion || "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "brushrouter", version: "0.1.0" },
+          serverInfo: { name: "brushrouter", version: PKG_VERSION },
           // Session-start guidance: tells the model when to reach for
           // brushrouter. Configurable (config `instructions`, or
           // BRUSHROUTER_INSTRUCTIONS); "" sends nothing.
