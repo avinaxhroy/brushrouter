@@ -34,6 +34,7 @@
     "data/recipes",
     "data/styles",
     "scripts/check-recipes.mjs",
+    "scripts/gptweb2api-hideconversations.patch",
     "install.sh",
     "README.md",
     "LICENSE"

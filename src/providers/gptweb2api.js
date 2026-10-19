@@ -40,6 +40,14 @@ const GOOS = { win32: "windows", darwin: "darwin", linux: "linux" }[process.plat
 const GOARCH = { x64: "amd64", arm64: "arm64", arm: "arm" }[process.arch] || process.arch;
 const EXE = process.platform === "win32" ? ".exe" : "";
 
+// Cleanup patch applied to the upstream source build: hide throwaway image
+// conversations from account history right after generation. It lives outside
+// src/, so it must stay listed in package.json "files" — a missing copy means a
+// partial checkout, and the hook silently would not run.
+export const HIDE_CONVERSATIONS_PATCH = fileURLToPath(
+  new URL("../../scripts/gptweb2api-hideconversations.patch", import.meta.url),
+);
+
 const promisifiedExec = promisify(exec);
 
 // Sidecar install root lives in the user config dir, so `npm link` checkouts
@@ -127,22 +135,25 @@ async function trySourceInstall(dir, ref, onLog) {
   }
   // Cleanup patch: hide throwaway image conversations from account history
   // right after generation (see scripts/gptweb2api-hideconversations.patch).
-  const patchPath = fileURLToPath(new URL("../../scripts/gptweb2api-hideconversations.patch", import.meta.url));
-  if (existsSync(patchPath)) {
+  if (existsSync(HIDE_CONVERSATIONS_PATCH)) {
     let applied = false;
     try {
-      await promisifiedExec(`git -C "${srcDir}" apply "${patchPath}"`);
+      await promisifiedExec(`git -C "${srcDir}" apply "${HIDE_CONVERSATIONS_PATCH}"`);
       applied = true;
       onLog?.("applied hide-conversations patch");
     } catch {}
     if (!applied) {
       try {
-        await promisifiedExec(`git -C "${srcDir}" apply --reverse --check "${patchPath}"`);
+        await promisifiedExec(`git -C "${srcDir}" apply --reverse --check "${HIDE_CONVERSATIONS_PATCH}"`);
         onLog?.("hide-conversations patch already applied (upstream took it)");
       } catch {
         onLog?.("warning: hide-conversations patch did not apply — image chats will stay in account history");
       }
     }
+  } else {
+    onLog?.(
+      "warning: hide-conversations patch is missing from this install — image chats will stay in account history",
+    );
   }
   onLog?.(`building with go (this downloads modules once) ...`);
   const binPath = join(dir, `gptweb2api${EXE}`);

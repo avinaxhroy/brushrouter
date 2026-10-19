@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-10-19
+
+- Packaging fix: `scripts/gptweb2api-hideconversations.patch` is now included in the npm tarball. It previously existed only in git checkouts, so `npm install` silently skipped the hide-conversations hook and left throwaway image chats in ChatGPT account history while git-clone installs got the cleanup.
+- Packaging guard: New `tests/packaging.test.js` resolves every package-relative path read by shipped code and fails if `package.json` `"files"` would exclude it, so a runtime-read file outside `src/` can no longer be dropped from a release unnoticed.
+- Clearer failure: The source-build vendor path now logs a warning when the hide-conversations patch is absent instead of continuing without it.
+
 ## [0.2.0] - 2026-10-19
 
 - DeepSeek Harness (DSH) support: `brushrouter install` detects and wires brushrouter into DeepSeek Harness profiles (`~/.dsh/profiles/<profile>/cordis.patch.yml`) using its YAML patch format, with `BRUSHROUTER_DSH_PROFILE` override support, idempotent marker blocks, and config backups.
