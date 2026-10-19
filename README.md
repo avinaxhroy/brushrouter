@@ -403,6 +403,6 @@ The 150-prompt corpus in `data/prompts/` is a development fixture, not shipped a
 
 ## Disclaimer
 
-This is an **unofficial, third-party** tool, not affiliated with or endorsed by OpenAI, Google, OpenRouter, fal.ai, or OpenCode.
+This is an **unofficial, third-party** tool, not affiliated with or endorsed by OpenAI, Google, OpenRouter, fal.ai, OpenCode, or any other supported provider.
 
-It calls the same Codex backend that OpenCode itself uses for ChatGPT subscription chat, through the image generation endpoints that the Codex CLI uses. Use must comply with OpenAI's [Terms of Use](https://openai.com/policies/row-terms-of-use/) and [Usage Policies](https://openai.com/policies/usage-policies/), as well as the terms and policies of any other supported provider.
+Use of this tool must comply with the terms of use, usage policies, and service agreements of whichever model providers or platforms you access through brushrouter.
