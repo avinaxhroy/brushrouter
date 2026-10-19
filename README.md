@@ -24,11 +24,26 @@ It also ships a prompt library of 27 tested recipes and 137 vendored visual styl
 
 Requires Node.js 20+.
 
+Run instantly with `npx`:
+
+```bash
+npx brushrouter setup
+```
+
+Or install via one-line script:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/avinaxhroy/brushrouter/main/install.sh | bash
 ```
 
-Or manually:
+Or globally via npm:
+
+```bash
+npm install -g brushrouter
+brushrouter setup
+```
+
+Or manually from source:
 
 ```bash
 git clone https://github.com/avinaxhroy/brushrouter.git
@@ -36,8 +51,6 @@ cd brushrouter
 npm link
 brushrouter setup
 ```
-
-Or instantly via npx: `npx brushrouter setup`.
 
 `setup` auto-detects image backends (ChatGPT desktop CLI, ChatGPT subscriptions, Google/Antigravity CLI, agent auth stores), offers one-command login if none are found, verifies `brushrouter` is on your PATH, wires every detected agent's MCP config, and offers an optional test generation. Diagnose any time:
 
