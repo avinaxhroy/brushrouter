@@ -96,6 +96,6 @@ jobs:
           git add package.json
           git commit -m "chore(release): v${V} [skip ci]" || true
           git tag "v${V}"
-          gh release create "v${V}" --title "v${V}" --notes-file release-notes.md
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin main --tags
+          gh release create "v${V}" --title "v${V}" --notes-file release-notes.md
