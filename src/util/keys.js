@@ -16,10 +16,13 @@
 // Nothing is hardcoded: stores are located from HOME/env, and any key name can
 // be overridden by environment.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { CONFIG_DIR, KEYS_PATH } from "../config.js";
+// Import the GETTERS, not the frozen constants: BRUSHROUTER_CONFIG_DIR /
+// BRUSHROUTER_KEYS_PATH may be set after module load, and a snapshot taken at
+// import time would then write a key store the rest of the process never reads.
+import { getConfigDir, getKeysPath } from "../config.js";
 import { registerSecret } from "./redact.js";
 
 // Auth stores that other agent runtimes already maintain. These are
@@ -31,7 +34,7 @@ function agentAuthFiles() {
   const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   const appData = process.env.APPDATA || "";
   return [
-    KEYS_PATH,
+    getKeysPath(),
     join(homedir(), ".codex", "auth.json"),
     join(xdgData, "opencode", "auth.json"),
     join(xdgConfig, "opencode", "auth.json"),
@@ -135,28 +138,53 @@ export function saveKey(provider, key) {
     e.code = "BAD_KEY";
     throw e;
   }
-  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  // Resolve both paths ONCE, at use time, so an env override set after import
+  // (tests, `setup`, an embedder) lands in the store this call actually writes.
+  const configDir = getConfigDir();
+  const keysPath = getKeysPath();
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
   // mkdirSync does not tighten the mode of a directory that already exists, so
   // enforce 0700 explicitly — the key store lives here.
   try {
-    chmodSync(CONFIG_DIR, 0o700);
+    chmodSync(configDir, 0o700);
   } catch {}
   let data = {};
-  if (existsSync(KEYS_PATH)) {
+  if (existsSync(keysPath)) {
     try {
-      data = JSON.parse(readFileSync(KEYS_PATH, "utf8"));
-    } catch {
-      data = {};
+      data = JSON.parse(readFileSync(keysPath, "utf8"));
+    } catch (e) {
+      // Never silently reset: `data = {}` here used to overwrite a real store
+      // with one entry, destroying every other key with no backup and no word to
+      // the user. Move the damaged file aside first, so the old contents are
+      // recoverable and `setup` can still finish.
+      const backup = `${keysPath}.corrupt-${Date.now()}`;
+      try {
+        renameSync(keysPath, backup);
+      } catch (renameErr) {
+        // Could not preserve it — refuse to write rather than lose it silently.
+        const err = new Error(
+          `cannot read ${keysPath} (${e.message}) and cannot move it aside (${renameErr.message}); ` +
+            `refusing to overwrite it. Fix or remove the file, then retry.`,
+        );
+        err.code = "KEYS_CORRUPT";
+        throw err;
+      }
+      if (!data || typeof data !== "object") data = {};
+      process.stderr.write(
+        `brushrouter: warning: ${keysPath} was not valid JSON (${e.message}); ` +
+          `moved it to ${backup} and continued with an empty key store. ` +
+          `Keys in the old file are not active — re-add them or restore that backup.\n`,
+      );
     }
   }
   const name = (STORE_NAMES[provider] || [provider])[0];
   data[name] = { key: key.trim() };
-  writeFileSync(KEYS_PATH, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(keysPath, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
   try {
-    chmodSync(KEYS_PATH, 0o600);
+    chmodSync(keysPath, 0o600);
   } catch {}
   registerSecret(key.trim());
-  return KEYS_PATH;
+  return keysPath;
 }
 
 export function hasStoredKey(provider) {

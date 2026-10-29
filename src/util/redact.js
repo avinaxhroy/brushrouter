@@ -65,6 +65,11 @@ const SHAPE_PATTERNS = [
   [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "xox***"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***"],
   [/\bAIza[A-Za-z0-9_-]{30,}\b/g, "AIza***"],
+  // AWS access key ids (AKIA + 16 upper-case alphanumerics) and their secret
+  // siblings. AWS was the one credentialed provider whose key shape we did not
+  // know, so a Custom-HTTP endpoint hit with SigV4 creds echoed in full.
+  [/\bAKIA[0-9A-Z]{16}\b/g, "AKIA***"],
+  [/\bASIA[0-9A-Z]{16}\b/g, "ASIA***"],
   // JWTs (header.payload.signature) — access/id tokens are JWTs.
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "eyJ***.***.***"],
   // Authorization headers. Only unambiguous auth schemes are matched here —
@@ -120,7 +125,27 @@ export const OPAQUE_BYTES = Symbol("brushrouter.opaqueBytes");
 
 // Deep-redact a value for machine-readable output. Keys that are *named* like
 // secrets are replaced wholesale; everything else is string-redacted.
-const SECRET_KEY_RE = /(token|secret|password|apikey|api_key|authorization|bearer|credential|private)/i;
+//
+// The alternatives carry their own boundaries instead of one leading `\b`: a key
+// may join the word to a prefix (`accessKey`, `auth_token`, `clientSecret`), so
+// only the *end* of the segment is a hard boundary. Requiring the end is what
+// keeps unrelated names intact — `maxTokens` is `token` + `s`, not a token field.
+// Suffixes are tolerated one word deep (`apiKeyId`, `webhookSecretName`) because
+// those still describe a secret, but not a plural of a counter (`maxTokens`,
+// `tokenCount`) — those hold numbers a caller needs. `cookies` is listed as a
+// whole word for the same reason rather than by allowing a bare `s`.
+const SECRET_KEY_RE =
+  /token|secret|passw(?:or)?d|api_?key|access_?key|authorization|bearer|credential|private_?key|cookie|cookies|session_?id/i;
+const SECRET_KEY_SUFFIX_RE = /^[^a-z0-9]*(?:[A-Z][a-z0-9]*)?$/;
+const NOT_A_SECRET_FIELD_RE = /(?:count|total|limit|max|len|length)$/i;
+
+function isSecretKeyName(name) {
+  const m = SECRET_KEY_RE.exec(name);
+  if (!m) return false;
+  const rest = name.slice(m.index + m[0].length);
+  if (NOT_A_SECRET_FIELD_RE.test(rest)) return false;
+  return SECRET_KEY_SUFFIX_RE.test(rest);
+}
 
 // Recursion stops here so a pathological or cyclic structure cannot blow the
 // stack. The limit must fail *closed*: the guard used to return the subtree raw,
@@ -142,7 +167,16 @@ export function redactValue(value, depth = 0) {
       out[k] = v;
       continue;
     }
-    if (SECRET_KEY_RE.test(k) && typeof v === "string" && v.length >= MIN_REGISTRY_LEN) {
+    if (isSecretKeyName(k)) {
+      // Mask the value whole, whatever its type or length. The old guard demanded
+      // a string of MIN_REGISTRY_LEN, so {password:"hunter2"}, {api_key:"abc123"}
+      // and {auth:{cookie:"sessionid=…"}} went out verbatim, and a Buffer under
+      // apiKey serialized as a byte dump — the promise above is about *names*.
+      //
+      // "***" is also the placeholder redact() produces for a registered secret,
+      // so an already-known value masks identically here; a short or unknown
+      // string, an object, an array or a Buffer is simply not allowed to print
+      // any part of itself.
       out[k] = "***";
     } else {
       out[k] = redactValue(v, depth + 1);
@@ -162,6 +196,25 @@ export function safeError(err) {
 // and that fragment is file content we never meant to print. Redaction cannot
 // help: it is not a known secret, just an unknown slice of a file. So drop
 // whatever the parser quoted back and keep the useful part.
+//
+// The scrubber cannot pair quotes: V8 echoes the payload *without* escaping it,
+// so a value that itself contains a `"` closes the naive /"[^"]*"/ match early
+// and everything after it — `"SECRET"TAIL` -> `"…"TAIL` — survived. Payloads can
+// contain quotes by definition (a truncated auth.json cuts mid-token). So the
+// first quote starts the untrusted region and *everything* from there is
+// replaced, quoted or not, which is the only reading that cannot leak a tail.
 export function safeParseMessage(err) {
-  return redact(String(err?.message || err)).replace(/"[^"]*"/g, '"…"');
+  const msg = redact(String(err?.message || err));
+  const firstQuote = msg.indexOf('"');
+  if (firstQuote >= 0) {
+    // Keep V8's fixed trailer so the message still says what went wrong; it is a
+    // literal, not payload, so it cannot carry anything out.
+    const tail = / is not valid JSON/.exec(msg)?.[0] ?? "";
+    return `${msg.slice(0, firstQuote)}"…"${tail}`;
+  }
+  // No quote to anchor on (older formats, `Unexpected end of JSON input`). Keep
+  // the position — it is a number, and it is what makes the message useful —
+  // and drop anything a future format might append after it.
+  const at = /(?:in JSON )?at position \d+/.exec(msg);
+  return at ? msg.slice(0, at.index + at[0].length) : msg;
 }

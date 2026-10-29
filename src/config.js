@@ -30,9 +30,17 @@ export function getKeysPath() {
   return process.env.BRUSHROUTER_KEYS_PATH || join(getConfigDir(), "keys.json");
 }
 
-export const CONFIG_DIR = join(homedir(), ".config", "brushrouter");
-export const USER_CONFIG_PATH = join(CONFIG_DIR, "config.json");
-export const KEYS_PATH = join(CONFIG_DIR, "keys.json");
+// LEGACY, NON-AUTHORITATIVE. Resolved ONCE, at import time, through the getters
+// above so they honour BRUSHROUTER_* that were set before the process started —
+// not a second source of truth for paths. Anything that can observe a later
+// env change (a test, an embedder, a long-lived MCP server) must call
+// getConfigDir() / getUserConfigPath() / getKeysPath() at USE time; these
+// snapshots will not move. Kept exported only because bin/brushrouter.js and
+// src/util/keys.js still import them, and ESM cannot export a getter for a
+// binding. Do not add new readers.
+export const CONFIG_DIR = getConfigDir();
+export const USER_CONFIG_PATH = getUserConfigPath();
+export const KEYS_PATH = getKeysPath();
 export const PROJECT_CONFIG_NAME = "brushrouter.config.json";
 
 export const DEFAULT_CONFIG = {
@@ -209,33 +217,84 @@ function readJson(path) {
 // Project-config trust boundary.
 //
 // `./brushrouter.config.json` travels with a checkout, so it is DATA, not a
-// trust boundary: it can be authored by someone else. These keys are the ones
-// that let the author run a program or point a credentialed request at their
-// own server. Without this list, cloning a repo and running `brushrouter
-// doctor` executed that repo's chosen binary (providers.gemini.cli went through
-// a shell), and a redirected `baseUrl` handed the user's OpenRouter/fal key to
-// whoever wrote the file. Set these in the USER config, the environment, or a
-// CLI flag instead — none of those can arrive with a repository.
+// trust boundary: it can be authored by someone else.
+//
+// THE RULE: a project config may change BEHAVIOUR, never CAPABILITY. It may say
+// which model to ask for, in what order, with what timeout; it may never say
+// which program to run, where to send the user's credentials, or who to talk to.
+// So this is an ALLOW-list, not a deny-list: a deny-list is hand-maintained and
+// has to be re-audited against every new config leaf (that is exactly how `bin`
+// — a real, spawned executable via providers.gptweb2api.js — slipped through).
+// With an allow-list, a new leaf is untrusted until someone deliberately adds
+// it here.
+//
+// Consequences of the rule: `baseUrl`, `url`, `cli`, `command`, `args`, `driver`,
+// `authFile`, `profile`, `bin`, `apiKey`, `keyHeader`, `keyPrefix` and
+// `headers`/`body` templates that interpolate those are NOT here. Set them in
+// the USER config, the environment, or a CLI flag — none of those can arrive
+// with a repository. Models and provider order (`priority`/`order`) are here,
+// because selecting a model is behaviour.
 // ---------------------------------------------------------------------------
-const PROJECT_UNTRUSTED_KEYS = new Set(["baseUrl", "url", "cli", "command", "args", "driver", "authFile", "profile"]);
+const PROJECT_TRUSTED_LEAVES = new Set([
+  // Behaviour: which model, how much, how long, how many at once.
+  "model",
+  "models",
+  "resolution",
+  "size",
+  "quality",
+  "background",
+  "aspect",
+  "count",
+  "timeoutMs",
+  "idleMs",
+  "concurrency",
+  // Non-credentialed routing/plumbing knobs: whether a route is offered and
+  // where in the response the image is. NOT here: `body`/`headers` (request
+  // content is the user's call, set them in the user config), `cookie`,
+  // `apiKey`, `keyHeader`, `keyPrefix`, `bin`, `cli`, `authFile`, `url`,
+  // `baseUrl`, `command`, `args`, `driver`, `profile`.
+  "enabled",
+  "response",
+  "method",
+  "projectId",
+]);
+
+// Top-level leaves a project may set. Kept deliberately tiny: `priority` is the
+// documented "this project prefers these providers" knob, `instructions` is
+// per-project MCP guidance. Everything else (nothing today) must be argued for
+// the same way the provider leaves were.
+const PROJECT_TRUSTED_TOP = new Set(["priority", "order", "instructions"]);
 
 function stripUntrusted(project) {
-  if (!project?.providers || typeof project.providers !== "object") return { project, dropped: [] };
+  if (!project || typeof project !== "object" || Array.isArray(project)) return { project, dropped: [] };
   const dropped = [];
+  const trusted = {};
+  for (const [k, v] of Object.entries(project)) {
+    if (k === "providers") continue; // walked below, per leaf
+    if (PROJECT_TRUSTED_TOP.has(k) && Object.hasOwn(project, k)) trusted[k] = v;
+    else dropped.push(k);
+  }
+  if (!project.providers || typeof project.providers !== "object" || Array.isArray(project.providers)) {
+    return { project: trusted, dropped };
+  }
   const providers = {};
   for (const [name, pcfg] of Object.entries(project.providers)) {
-    if (!pcfg || typeof pcfg !== "object") {
-      providers[name] = pcfg;
+    // A non-object provider entry, or an unknown provider name, is not a leaf
+    // we can check — drop it rather than hand deepMerge something arbitrary.
+    if (!DEFAULT_CONFIG.providers[name] || !pcfg || typeof pcfg !== "object" || Array.isArray(pcfg)) {
+      dropped.push(`providers.${name}`);
       continue;
     }
     const kept = {};
     for (const [k, v] of Object.entries(pcfg)) {
-      if (PROJECT_UNTRUSTED_KEYS.has(k)) dropped.push(`providers.${name}.${k}`);
-      else kept[k] = v;
+      // Object.hasOwn, not `in`: an inherited `__proto__`/`constructor` key must
+      // not be mistaken for an allowed leaf.
+      if (PROJECT_TRUSTED_LEAVES.has(k) && Object.hasOwn(pcfg, k)) kept[k] = v;
+      else dropped.push(`providers.${name}.${k}`);
     }
     providers[name] = kept;
   }
-  return { project: { ...project, providers }, dropped };
+  return { project: { ...trusted, providers }, dropped };
 }
 
 // Say so, once: silently ignoring a setting makes a config look applied when it
@@ -245,8 +304,9 @@ function warnUntrusted(dropped) {
   if (warnedUntrusted || !dropped.length) return;
   warnedUntrusted = true;
   process.stderr.write(
-    `brushrouter: ignoring ${dropped.join(", ")} from ${PROJECT_CONFIG_NAME} — a project config may not name a program ` +
-      `or a credentialed endpoint. Set it in ${USER_CONFIG_PATH} or the environment instead.\n`,
+    `brushrouter: ignoring ${dropped.join(", ")} from ${PROJECT_CONFIG_NAME} — a project config may choose a model ` +
+      `or provider order, but not a program, a credential, or an endpoint. Set it in ${getUserConfigPath()} or the ` +
+      `environment instead.\n`,
   );
 }
 

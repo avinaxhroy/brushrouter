@@ -173,7 +173,13 @@ Default auto-routing order:
 codex-cli → codex → gemini → openrouter → fal → gptweb2api → custom-http
 ```
 
-Three routes are off by default: `openrouter` (spends money), `gptweb2api` (needs `vendor`), `custom-http` (needs an endpoint). Enable with `brushrouter routes enable openrouter`. The `priority` list is authoritative — anything not listed is never auto-selected, though `--provider` still works.
+Three routes are off by default: `openrouter` (spends money), `gptweb2api` (needs `vendor`), `custom-http` (needs an endpoint). The `priority` list is authoritative — anything not listed is never auto-selected.
+
+A route that is off is off for **every** path, including an explicit `--provider`: naming one is refused with a `PROVIDER_DISABLED` error that says how to turn it on. That matters most for the metered routes — `enabled: false` is the only thing between an agent holding a key and your credits, so it is not a preference a caller can talk its way past. Opt in once, deliberately:
+
+```bash
+brushrouter routes enable openrouter
+```
 
 OpenRouter runs two generation surfaces: multimodal chat models on `/chat/completions`, image-only models on `/images`. A "no endpoints found for output modalities" rejection is auto-retried on `/images`; auth, region, and credit errors are surfaced as they came.
 

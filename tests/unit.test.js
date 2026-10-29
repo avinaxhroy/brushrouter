@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, chmodSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -112,15 +112,62 @@ test("every provider id in priority exists in the registry", () => {
 });
 
 // openrouter spends per-request money from a key, so it stays out of the default
-// auto-routing walk. It must remain forceable with --provider, which is what
-// `enabled: false` means (see attemptOrder in src/router.js).
-test("openrouter is off by default but still forceable", async () => {
+// auto-routing walk. `enabled: false` is a capability switch, not a preference:
+// naming a disabled route explicitly is refused, because any agent can add a
+// --provider flag and otherwise bill credits the user never opted into.
+test("openrouter is off by default and rejects an explicit --provider", async () => {
   assert.equal(DEFAULT_CONFIG.providers.openrouter.enabled, false, "openrouter was re-enabled by default");
 
   const cfg = loadConfig({ cwd: mkdtempSync(join(tmpdir(), "br-order-")), overrides: { priority: DEFAULT_CONFIG.priority } });
   const auto = await planAttemptOrder(cfg, {});
   assert.ok(!auto.includes("openrouter"), `auto-routing reached openrouter: ${auto.join(" -> ")}`);
-  assert.deepEqual(await planAttemptOrder(cfg, { provider: "openrouter" }), ["openrouter"]);
+
+  await assert.rejects(
+    () => planAttemptOrder(cfg, { provider: "openrouter" }),
+    (e) => e.code === "PROVIDER_DISABLED" && /routes enable openrouter/.test(e.message),
+    "an explicit request for a disabled route must be refused",
+  );
+  // --fallback must not re-admit it through the "rest of the chain" path either.
+  await assert.rejects(
+    () => planAttemptOrder(cfg, { provider: "openrouter", fallback: true }),
+    (e) => e.code === "PROVIDER_DISABLED",
+  );
+
+  // Opting in explicitly is what unlocks it, and nothing else.
+  const enabledCfg = loadConfig({
+    cwd: mkdtempSync(join(tmpdir(), "br-order-")),
+    overrides: { priority: DEFAULT_CONFIG.priority, providers: { openrouter: { enabled: true } } },
+  });
+  assert.deepEqual(await planAttemptOrder(enabledCfg, { provider: "openrouter" }), ["openrouter"]);
+});
+
+// The gate has to hold at every entry point, not just the ordered-plan one: a
+// batch names one provider and fans out N billed requests from it.
+test("a batch naming a disabled route is refused before any item runs", async () => {
+  // Dynamic import, matching the other batch tests: they reload the module so a
+  // provider stub installed by an earlier test cannot leak into this one.
+  const { batchGenerate: bg, PROVIDERS: provs } = await import("../src/router.js");
+  let ran = 0;
+  const calls = [];
+  const cfg = loadConfig({
+    cwd: mkdtempSync(join(tmpdir(), "br-batch-gate-")),
+    overrides: { priority: DEFAULT_CONFIG.priority, providers: { openrouter: { enabled: false } } },
+  });
+  const orig = provs.openrouter.generate;
+  provs.openrouter.generate = async () => {
+    ran++;
+    return { buffer: Buffer.from("89504e470d0a1a0a", "hex"), meta: {} };
+  };
+  try {
+    await assert.rejects(
+      () => bg({ items: ["a", "b", "c"], provider: "openrouter", cwd: tmpdir(), onItemStart: (i) => calls.push(i) }, cfg),
+      (e) => e.code === "PROVIDER_DISABLED",
+    );
+    assert.equal(ran, 0, "a disabled route must not generate");
+    assert.equal(calls.length, 0, "no item may start");
+  } finally {
+    provs.openrouter.generate = orig;
+  }
 });
 
 test("every provider exposes the required interface", () => {
@@ -146,7 +193,10 @@ test("MCP delivers a generate_image result larger than the stdout pipe buffer", 
   const { join } = await import("node:path");
   const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
 
-  const image = Buffer.alloc(3 * 1024 * 1024, 0x89); // ~4 MB once base64-encoded
+  // Real PNG magic + filler, not just filler: the provider now refuses a
+  // payload that is not actually an image, and a fixture of pure 0x89 was only
+  // ever accepted because junk was written to disk unchecked. Same 3 MB size.
+  const image = Buffer.concat([PNG, Buffer.alloc(3 * 1024 * 1024 - PNG.length, 0x89)]); // ~4 MB once base64-encoded
   const server = createServer((_req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ data: { b64: image.toString("base64") } }));
@@ -1457,7 +1507,7 @@ test("gptweb2api: concurrent cold generates spawn exactly one sidecar", async ()
     "http.createServer((req, res) => {",
     "  if (req.url === '/healthz') { res.end('ok'); return; }",
     "  req.on('data', () => {});",
-    "  req.on('end', () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ b64_json: Buffer.from('x').toString('base64') }] })); });",
+    "  req.on('end', () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ b64_json: Buffer.from('iVBORw0KGgo=', 'base64').toString('base64') }] })); });",
     "}).listen(port, '127.0.0.1');",
     "",
   ].join("\n"), "utf8");
@@ -1530,4 +1580,1720 @@ test("CLI prompts --prompt-only and --raw output clean filled prompt text", asyn
     { encoding: "utf8" },
   );
   assert.equal(rawOut, out);
+});
+
+test("gemini run() declares stdout and survives a child that writes output", async () => {
+  // Regression: `stdout` was never declared in run(), so the first data chunk
+  // threw a ReferenceError from inside the handler and killed the process
+  // before generate() could settle.
+  const { geminiProvider } = await import("../src/providers/gemini.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-gemini-run-"));
+  const cli = join(dir, "fake-gemini-cli.js");
+  const uncaught = [];
+  const onUncaught = (e) => uncaught.push(e);
+  process.on("uncaughtException", onUncaught);
+  try {
+    writeFileSync(
+      cli,
+      `#!${process.execPath}\nconsole.log("generating image -> /nonexistent/${"x"}.png");\nconsole.error("no image produced");\nprocess.exit(3);\n`,
+    );
+    chmodSync(cli, 0o755);
+    // The child produces no image, so generate() rejects — what matters is that
+    // it rejects with a real cli error instead of crashing on a ReferenceError.
+    await assert.rejects(
+      () => geminiProvider.generate({ prompt: "a red fox" }, { cli, timeoutMs: 30000 }),
+      (err) => {
+        assert.ok(!/is not defined/.test(err.message), `unexpected ReferenceError: ${err.message}`);
+        assert.match(err.message, /produced no image/i);
+        return true;
+      },
+    );
+    assert.equal(uncaught.length, 0, `uncaught exception escaped: ${uncaught[0]}`);
+  } finally {
+    process.off("uncaughtException", onUncaught);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("batchGenerate settles with per-item failures when every provider stays rate limited", async () => {
+  // Regression: the cooldown retry timer was unref'd, so when nothing else held
+  // the event loop open Node exited (code 13) with the batch promise unsettled.
+  const { batchGenerate, PROVIDERS } = await import("../src/router.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-rl-"));
+
+  let calls = 0;
+  PROVIDERS["mock-rl"] = {
+    id: "mock-rl",
+    supportsImages: true,
+    async probe() {
+      return { available: true };
+    },
+    async generate() {
+      calls++;
+      const err = new Error("429 too many requests");
+      err.code = "RATE_LIMIT";
+      throw err;
+    },
+  };
+
+  try {
+    const cfg = {
+      priority: ["mock-rl"],
+      providers: { "mock-rl": { enabled: true } },
+    };
+    const result = await batchGenerate(
+      {
+        items: [{ prompt: "a" }, { prompt: "b" }],
+        outDir: dir,
+        cwd: dir,
+        provider: "mock-rl",
+        cooldownMs: 40,
+      },
+      cfg,
+    );
+
+    assert.equal(result.total, 2);
+    assert.equal(result.completed, 0);
+    assert.equal(result.failed, 2, "every item must be reported as failed, not lost");
+    assert.equal(result.completed + result.failed, result.total);
+    assert.equal(calls, 2);
+    for (const r of result.results) {
+      assert.ok(r, "no hole in results");
+      assert.equal(r.ok, false);
+      assert.equal(r.code, "RATE_LIMIT");
+    }
+  } finally {
+    delete PROVIDERS["mock-rl"];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a throwing onItemComplete cannot corrupt batch accounting or drop items", async () => {
+  // Regression: onItemComplete ran inside the success `try`, so its throw fell
+  // into the catch, counted the item as failed too, and left a queued item
+  // undispatched (provider called twice for three prompts).
+  const { batchGenerate, PROVIDERS } = await import("../src/router.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-cb-"));
+
+  const executed = [];
+  PROVIDERS["mock-cb"] = {
+    id: "mock-cb",
+    async probe() {
+      return { available: true };
+    },
+    async generate({ prompt }) {
+      executed.push(prompt);
+      return { buffer: PNG, meta: { model: "mock" } };
+    },
+  };
+
+  try {
+    const cfg = {
+      priority: ["mock-cb"],
+      providers: { "mock-cb": { enabled: true } },
+    };
+    const progress = [];
+    const failures = [];
+    const result = await batchGenerate(
+      {
+        items: [{ prompt: "a" }, { prompt: "b" }, { prompt: "c" }],
+        outDir: dir,
+        cwd: dir,
+        provider: "mock-cb",
+        onProgress: () => {
+          throw new Error("progress boom");
+        },
+        onItemComplete: () => {
+          throw new Error("complete boom");
+        },
+        onItemFail: (f) => {
+          failures.push(f);
+          throw new Error("fail boom");
+        },
+      },
+      cfg,
+    );
+    void progress;
+
+    assert.equal(result.total, 3);
+    assert.equal(executed.length, 3, "every prompt must reach the provider");
+    assert.deepEqual(executed, ["a", "b", "c"]);
+    assert.equal(result.completed, 3);
+    assert.equal(result.failed, 0);
+    assert.equal(result.completed + result.failed, result.total);
+    assert.equal(failures.length, 0);
+    for (const r of result.results) {
+      assert.ok(r, "no hole in results");
+      assert.equal(r.ok, true);
+      assert.ok(existsSync(r.savedPath));
+    }
+  } finally {
+    delete PROVIDERS["mock-cb"];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSIONS: redaction, key-store recovery, and discovery caching.
+// ---------------------------------------------------------------------------
+
+test("redactValue masks a secret-named field whatever its type or length", async () => {
+  // Regression: the guard also required `typeof v === "string"` and
+  // `v.length >= MIN_REGISTRY_LEN`, so short passwords and non-strings leaked and
+  // the doc comment's "replaced wholesale" promise was false.
+  const { redactValue, redact, registerSecret } = await import("../src/util/redact.js");
+
+  for (const [label, input, pick] of [
+    ["short password", { password: "hunter2" }, (o) => o.password],
+    ["short api_key", { api_key: "abc123" }, (o) => o.api_key],
+    ["nested cookie", { auth: { cookie: "sessionid=abcdefghijklmnop123456" } }, (o) => o.auth.cookie],
+    ["accessKey", { accessKey: "AKIAIOSFODNN7EXAMPLE" }, (o) => o.accessKey],
+    ["passwd", { passwd: "p" }, (o) => o.passwd],
+    ["authorization", { authorization: "Basic abc" }, (o) => o.authorization],
+    ["privateKey", { privateKey: "-----BEGIN" }, (o) => o.privateKey],
+    ["sessionid", { sessionid: "s" }, (o) => o.sessionid],
+    ["Buffer value", { apiKey: Buffer.from("opaquecredentialvalue123") }, (o) => o.apiKey],
+    ["object value", { credential: { user: "u", pass: "p" } }, (o) => o.credential],
+  ]) {
+    const out = redactValue(input);
+    const got = pick(out);
+    assert.equal(got, "***", `${label} was not masked: ${JSON.stringify(out)}`);
+    assert.ok(!JSON.stringify(out).includes("hunter2"), `${label} leaked its body`);
+  }
+
+  // A registered secret is still replaced by the same placeholder it gets
+  // anywhere else, so nothing downstream can tell the two paths apart.
+  registerSecret("knownsecretvalue123456");
+  assert.equal(redactValue({ token: "knownsecretvalue123456" }).token, "***");
+  assert.equal(redact("prefix knownsecretvalue123456 suffix"), "prefix *** suffix");
+
+  // A field whose name merely contains a secret-ish word must survive: these are
+  // counters and schema keywords, and masking them would corrupt tool schemas.
+  const safe = { maxTokens: 4096, tokenCount: 7, tokens: ["a"], prompt: "hi" };
+  assert.deepEqual(redactValue(safe), safe);
+  const schema = { inputSchema: { properties: { maxTokens: { type: "integer" } } } };
+  assert.equal(redactValue(schema).inputSchema.properties.maxTokens.type, "integer");
+});
+
+test("redaction knows the AWS access key id shape", async () => {
+  // Regression: AKIA… matched no shape pattern, so a SigV4 key echoed back by a
+  // custom endpoint reached the model intact.
+  const { redact, redactValue } = await import("../src/util/redact.js");
+  const akia = "AKIAIOSFODNN7EXAMPLE";
+  assert.ok(!redact(`creds ${akia} used`).includes("IOSFODNN7EXAMPLE"), "AWS key id leaked");
+  // And it is caught even when it sits under an innocent key name.
+  assert.ok(!JSON.stringify(redactValue({ note: akia })).includes("IOSFODNN7EXAMPLE"));
+});
+
+test("safeParseMessage cannot be broken out of with a quote in the payload", async () => {
+  // Regression: the scrubber paired quotes with /"[^"]*"/, but V8 echoes the
+  // payload without escaping it, so a `"` inside the payload ended the match and
+  // the tail survived. Anything a truncated file contains must not survive.
+  const { safeParseMessage } = await import("../src/util/redact.js");
+
+  const breakout = 'Unexpected token x, "SECRET"TAILSECRET" is not valid JSON';
+  const out = safeParseMessage(new SyntaxError(breakout));
+  assert.ok(!out.includes("SECRET"), `payload survived: ${out}`);
+  assert.ok(!out.includes("TAIL"), `tail after the first quote survived: ${out}`);
+
+  // Every message that carries a quote is truncated at the first one, so no
+  // payload fragment can appear no matter where the split falls.
+  const payloads = [
+    '"A"B"',
+    '"ONE""TWO"',
+    'unterminated "PAYLOADTAIL',
+    '"',
+    'x "MULTI\nLINE"TAIL',
+  ];
+  for (const p of payloads) {
+    const msg = safeParseMessage(new SyntaxError(`Unexpected token 'x', ${p} is not valid JSON`));
+    assert.ok(msg.indexOf("PAYLOAD") === -1 && msg.indexOf("TAIL") === -1, `leaked from ${JSON.stringify(p)}: ${msg}`);
+    assert.ok(msg.length <= 200, "message must stay short");
+  }
+
+  // Known-secret redaction still runs first, and a message with no quote at all
+  // is preserved (the useful part of a real error).
+  assert.ok(!safeParseMessage(new SyntaxError("Unexpected end of JSON input")).includes("SECRET"));
+  assert.equal(safeParseMessage(new Error("Unexpected end of JSON input")), "Unexpected end of JSON input");
+  assert.match(safeParseMessage(new Error("Unexpected end of JSON input")), /Unexpected end of JSON input/);
+});
+
+test("a corrupt keys.json is backed up, not silently overwritten", async () => {
+  // Regression: a JSON parse failure was caught with `data = {}` and the store
+  // was then rewritten unconditionally, so one truncated file destroyed every
+  // stored key with no backup and no warning.
+  const dir = mkdtempSync(join(tmpdir(), "br-keys-corrupt-"));
+  try {
+    const keysPath = join(dir, "keys.json");
+    // Truncated just after a complete entry: exactly the hand-edit failure mode.
+    writeFileSync(
+      keysPath,
+      '{"openrouter":{"key":"sk-or-v1-existingkey1234567890abcd"}, "fal"',
+      { mode: 0o600 },
+    );
+    const damaged = readFileSync(keysPath, "utf8");
+
+    // Run the save in a child with its own CONFIG_DIR so the module-level KEYS_PATH
+    // is the temp store, and capture the warning on stderr.
+    const { execFileSync } = await import("node:child_process");
+    const script = join(dir, "save.mjs");
+    writeFileSync(
+      script,
+      `import { saveKey } from ${JSON.stringify(join(process.cwd(), "src", "util", "keys.js"))};
+       console.log(saveKey("fal", "fal-test-key-abcdefghijklmnop"));\n`,
+    );
+    const stdout = execFileSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { ...process.env, BRUSHROUTER_CONFIG_DIR: dir },
+    });
+    assert.match(stdout, /keys\.json/);
+
+    // The new key is written and the store is valid JSON again...
+    const after = JSON.parse(readFileSync(keysPath, "utf8"));
+    assert.equal(after.fal.key, "fal-test-key-abcdefghijklmnop");
+
+    // ...and the damaged bytes are preserved beside it, byte for byte.
+    const { readdirSync } = await import("node:fs");
+    const backups = [];
+    for (const f of readdirSync(dir)) if (f.startsWith("keys.json.corrupt-")) backups.push(f);
+    assert.equal(backups.length, 1, `expected one backup, saw: ${backups.join(", ")}`);
+    assert.equal(readFileSync(join(dir, backups[0]), "utf8"), damaged, "backup must preserve the file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a missing which() result is not cached, and resetDiscoverCache clears it", async () => {
+  // Regression: whichSync cached nulls for the life of the process, so `setup`
+  // (isOnPath -> npm link -> isOnPath) reported a just-installed binary missing.
+  const { isOnPath, resetDiscoverCache } = await import("../src/util/discover.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-path-cache-"));
+  const binName = `bntest-${process.pid}-cache`;
+  const saved = process.env.PATH;
+  try {
+    resetDiscoverCache();
+    process.env.PATH = dir;
+    assert.equal(isOnPath(binName), null, "fixture bin must not exist yet");
+
+    // Install it at the same PATH location: a cached miss would still say null.
+    writeFileSync(join(dir, binName), "#!/bin/sh\n", { mode: 0o755 });
+    assert.equal(isOnPath(binName), join(dir, binName), "a new binary must be found without a reset");
+
+    // A hit is still cached, and resetDiscoverCache() remains an escape hatch
+    // for the case where the file changes without the PATH changing.
+    rmSync(join(dir, binName));
+    assert.equal(isOnPath(binName), join(dir, binName), "a hit keeps being served from cache");
+    resetDiscoverCache();
+    assert.equal(isOnPath(binName), null, "reset must drop the positive entry too");
+  } finally {
+    process.env.PATH = saved;
+    resetDiscoverCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findCodexCli's memo key covers the environment it actually reads", async () => {
+  // Regression: the key held only (explicit, BRUSHROUTER_CODEX_CLI,
+  // BRUSHROUTER_APP_DIRS) while the search also follows PATH, APPDATA and cwd, so
+  // a mutation of any of those kept serving the pre-change answer.
+  const { findCodexCli, resetDiscoverCache } = await import("../src/util/discover.js");
+  resetDiscoverCache();
+  const before = findCodexCli();
+  const dir = mkdtempSync(join(tmpdir(), "br-codex-key-"));
+  const savedPath = process.env.PATH;
+  try {
+    // Pointing PATH at an empty dir must not be answered from the previous key.
+    process.env.PATH = dir;
+    const after = findCodexCli();
+    if (before && before.path && !before.path.startsWith(dir)) {
+      assert.notEqual(after?.path, before.path, "PATH change was ignored by the memo key");
+    }
+    assert.doesNotThrow(() => findCodexCli({ explicit: join(dir, "nope") }));
+  } finally {
+    process.env.PATH = savedPath;
+    resetDiscoverCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bug-fix regressions: project-config trust, env-aware paths, OAuth callback
+// ---------------------------------------------------------------------------
+
+test("a project config cannot choose an executable via providers.*.bin", () => {
+  // BUG: `bin` was honoured (src/config.js -> providers.gptweb2api bin -> spawn)
+  // but absent from the project-config deny-list, so a checked-in
+  // brushrouter.config.json executed its own binary. The trust boundary is now
+  // an allow-list, so any leaf that names a program/path/credential is dropped.
+  const dir = mkdtempSync(join(tmpdir(), "br-project-bin-"));
+  try {
+    writeFileSync(
+      join(dir, "brushrouter.config.json"),
+      JSON.stringify({
+        priority: ["gptweb2api"],
+        providers: {
+          gptweb2api: { enabled: true, bin: "/tmp/evil-gateway", authFile: "/tmp/evil-auth", model: "m" },
+        },
+      }),
+    );
+    const cfg = loadConfig({ cwd: dir });
+    assert.equal(cfg.providers.gptweb2api.bin, null, "project config chose an executable");
+    assert.equal(cfg.providers.gptweb2api.authFile, null, "project config chose a credential file");
+    // Behaviour is still project-settable: enabling a route, its order, its model.
+    assert.equal(cfg.providers.gptweb2api.enabled, true);
+    assert.equal(cfg.providers.gptweb2api.model, "m");
+    assert.deepEqual(cfg.priority, ["gptweb2api"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("project-config allow-list is not bypassable via __proto__, nesting or arrays", () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-project-proto-"));
+  try {
+    // `__proto__` in JSON is a plain own key, and Object.entries walks it; it
+    // must not smuggle an untrusted leaf through. A nested object can't stand in
+    // for a scalar leaf either, and an array leaf is not a checked key at all.
+    writeFileSync(
+      join(dir, "brushrouter.config.json"),
+      `{"providers":{"gptweb2api":{"__proto__":{"bin":"/tmp/evil"},"constructor":{"bin":"/tmp/evil"},` +
+        `"enabled":[true],"models":{"bin":"/tmp/evil"}}}}`,
+    );
+    const cfg = loadConfig({ cwd: dir });
+    assert.equal(cfg.providers.gptweb2api.bin, null, "a prototype key smuggled an executable through");
+    assert.equal(Object.hasOwn(cfg.providers.gptweb2api, "constructor"), false);
+    // Non-scalar junk is refused rather than deep-merged into the config.
+    assert.notEqual(cfg.providers.gptweb2api.enabled?.bin, "/tmp/evil");
+    assert.equal(typeof cfg.providers.gptweb2api.models, "object");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config path getters honour the BRUSHROUTER_* overrides", async () => {
+  // BUG: loadConfig() read the env-aware getter while `init` / saveKey() used
+  // frozen constants built from homedir(), so the two disagreed.
+  const { getConfigDir, getKeysPath, getUserConfigPath } = await import("../src/config.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-paths-"));
+  const saved = {
+    dir: process.env.BRUSHROUTER_CONFIG_DIR,
+    keys: process.env.BRUSHROUTER_KEYS_PATH,
+    user: process.env.BRUSHROUTER_USER_CONFIG,
+  };
+  try {
+    process.env.BRUSHROUTER_CONFIG_DIR = dir;
+    process.env.BRUSHROUTER_KEYS_PATH = join(dir, "k.json");
+    process.env.BRUSHROUTER_USER_CONFIG = join(dir, "c.json");
+    assert.equal(getConfigDir(), dir);
+    assert.equal(getKeysPath(), join(dir, "k.json"));
+    assert.equal(getUserConfigPath(), join(dir, "c.json"));
+    // The exported constants resolve THROUGH the getters rather than a second
+    // homedir() computation, so they can never name a different directory. They
+    // are import-time snapshots (documented as legacy/non-authoritative), so the
+    // derivation is proved on a fresh module instance loaded with this env.
+    const fresh = await import(`../src/config.js?snapshot=${Date.now()}`);
+    assert.equal(fresh.CONFIG_DIR, fresh.getConfigDir());
+    assert.equal(fresh.KEYS_PATH, fresh.getKeysPath());
+    assert.equal(fresh.USER_CONFIG_PATH, fresh.getUserConfigPath());
+    assert.equal(fresh.CONFIG_DIR, dir);
+    assert.equal(fresh.KEYS_PATH, join(dir, "k.json"));
+    assert.equal(fresh.USER_CONFIG_PATH, join(dir, "c.json"));
+  } finally {
+    for (const [k, v] of [
+      ["BRUSHROUTER_CONFIG_DIR", saved.dir],
+      ["BRUSHROUTER_KEYS_PATH", saved.keys],
+      ["BRUSHROUTER_USER_CONFIG", saved.user],
+    ]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runLogin writes auth.json 0600 in a 0700 dir even when both already existed looser", async () => {
+  // BUG: mkdir's mode only applies at creation and writeFile's mode only at
+  // creation, so an existing 0755 dir / 0644 auth.json kept its permissions
+  // while the CLI printed "(mode 0600)". Mirrors src/util/keys.js.
+  const { runLogin } = await import("../src/oauth.js");
+  const { statSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "br-oauth-perm-"));
+  const authPath = join(dir, "auth.json");
+  chmodSync(dir, 0o755);
+  writeFileSync(authPath, "{}");
+  chmodSync(authPath, 0o644);
+
+  const claim = { "https://api.openai.com/auth": { chatgpt_account_id: "a-1", chatgpt_plan_type: "plus" } };
+  const idToken = `x.${Buffer.from(JSON.stringify(claim)).toString("base64url")}.y`;
+  // Stand in for the two network hops: the token endpoint (fetch) and the
+  // browser (open) — the callback itself is the real localhost server.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) =>
+    String(url).includes("oauth/token")
+      ? Promise.resolve(
+          new Response(JSON.stringify({ access_token: "acc", refresh_token: "ref", id_token: idToken }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        )
+      : realFetch(url, init);
+  const hit = async (qs) => {
+    for (let i = 0; i < 60; i++) {
+      try {
+        return await realFetch(`http://127.0.0.1:1455/auth/callback?${qs}`, {
+          headers: { connection: "close" },
+          signal: AbortSignal.timeout(4000),
+        });
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    throw new Error("OAuth callback server never came up");
+  };
+  try {
+    const out = await runLogin({
+      configDir: dir,
+      log: () => {},
+      open: async (u) => {
+        setTimeout(() => {
+          hit(`code=C&state=${encodeURIComponent(new URL(u).searchParams.get("state"))}`).catch(() => {});
+        }, 0);
+      },
+    });
+    assert.equal(out.path, authPath);
+    assert.equal(statSync(dir).mode & 0o777, 0o700, "auth dir was left world-traversable");
+    assert.equal(statSync(authPath).mode & 0o777, 0o600, "auth.json was left world-readable");
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("OAuth callback rejects on ?error= instead of resolving a null code", async () => {
+  // BUG: it resolved with { code: null }, and the caller then POSTed
+  // grant_type=authorization_code&code=null and showed an opaque 400.
+  const { listenForCallback } = await import("../src/oauth.js");
+  const settled = listenForCallback("STATE-1").then(
+    (v) => ({ value: v }),
+    (e) => ({ error: e.message }),
+  );
+  const resp = await fetchCallback("error=access_denied&state=STATE-1");
+  const body = await resp.text();
+  const r = await settled;
+  assert.equal(r.value, undefined, "an ?error= callback must not resolve");
+  assert.match(r.error, /sign-in failed: access_denied/);
+  assert.doesNotMatch(body, /complete/i, "a failed sign-in rendered the success page");
+});
+
+test("OAuth callback never renders success for a bad state and frees the port", async () => {
+  // BUG: the success HTML was written before the state comparison, so a forged
+  // callback with a wrong state still said "sign-in complete".
+  const { listenForCallback } = await import("../src/oauth.js");
+  const settled = listenForCallback("EXPECTED").then(
+    (v) => ({ value: v }),
+    (e) => ({ error: e.message }),
+  );
+  const resp = await fetchCallback("code=abc&state=WRONG");
+  const body = await resp.text();
+  const r = await settled;
+  assert.equal(r.value, undefined);
+  assert.match(r.error, /state mismatch/);
+  assert.doesNotMatch(body, /complete/i, "a bad-state callback rendered the success page");
+  // finish() closes the listener; a bind must succeed immediately afterwards.
+  const net = await import("node:net");
+  await new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once("error", reject);
+    s.listen(1455, "127.0.0.1", () => s.close(resolve));
+  });
+});
+
+test("OAuth callback still resolves the code on a good state", async () => {
+  const { listenForCallback } = await import("../src/oauth.js");
+  const settled = listenForCallback("GOOD-STATE").then(
+    (v) => ({ value: v }),
+    (e) => ({ error: e.message }),
+  );
+  const resp = await fetchCallback("code=xyz&state=GOOD-STATE");
+  const body = await resp.text();
+  const r = await settled;
+  assert.equal(r.error, undefined);
+  assert.equal(r.value.code, "xyz");
+  assert.match(body, /complete/i);
+});
+
+// The callback server starts asynchronously; retry briefly so the test is not
+// racing server.listen().
+async function fetchCallback(qs, tries = 60) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fetch(`http://127.0.0.1:1455/auth/callback?${qs}`, {
+        headers: { connection: "close" },
+        signal: AbortSignal.timeout(4000),
+      });
+    } catch {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  throw new Error("OAuth callback server never came up");
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC framing. The envelope is protocol, not payload: an id or a
+// progressToken that comes back altered makes the response unmatchable, so these
+// assert the round-trip through the real `serve` process.
+// ---------------------------------------------------------------------------
+
+// Drives `brushrouter serve` over stdio with the given newline-delimited lines
+// and resolves every parsed stdout line once the child exits. `cwd` matters: the
+// project config is read relative to the process's working directory, so a test
+// that seeds one must spawn there or the config is silently ignored.
+async function runServe(lines, env = {}, { cwd } = {}) {
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  const child = spawn(process.execPath, [bin, "serve"], { cwd, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (err += d));
+  for (const line of lines) child.stdin.write(line + "\n");
+  child.stdin.end();
+  const code = await new Promise((r) => child.on("close", r));
+  return { code, err, out, msgs: out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) };
+}
+
+test("MCP echoes request ids and progressTokens verbatim, redacting only the payload", async () => {
+  // A redacted id can never match its request, so the client hangs forever.
+  // 'sk-' shaped on purpose: redactValue() rewrites it, and the envelope used to
+  // run through redactValue() wholesale.
+  const id = "sk-abcdefghijklmnop12345";
+  const { msgs } = await runServe([
+    JSON.stringify({ jsonrpc: "2.0", id, method: "ping" }),
+    // A second secret-shaped id, this time alongside a payload that DOES echo
+    // the argument back: image_result names the jobId it could not find, so the
+    // response must show the id verbatim and the message redacted in the very
+    // same frame.
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "image_result", arguments: { jobId: "sk-abcdefghijklmnop12345" } } }),
+  ]);
+  const ping = msgs.find((m) => m.id === id);
+  assert.ok(ping, `id was rewritten; got ids ${JSON.stringify(msgs.map((m) => m.id))}`);
+  assert.deepEqual(ping.result, {});
+
+  // The payload half is still redacted — this is a backstop, not a bypass.
+  const call = msgs.find((m) => m.id === 2);
+  const text = call.result.content[0].text;
+  assert.match(text, /unknown jobId/, `unexpected reply: ${text}`);
+  assert.ok(!text.includes("sk-abcdefghijklmnop12345"), `secret leaked through the payload: ${text}`);
+  assert.match(text, /sk-\*\*\*/, `payload was not redacted: ${text}`);
+});
+
+test("MCP progressToken survives verbatim in progress notifications", async () => {
+  const { createServer } = await import("node:http");
+  const token = "sk-progress-abcdefghijklmnop";
+  const server = createServer((_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [{ url: `data:image/png;base64,${PNG.toString("base64")}` }] }));
+    }, 150);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const dir = mkdtempSync(join(tmpdir(), "br-token-"));
+  writeFileSync(
+    join(dir, "brushrouter.config.json"),
+    JSON.stringify({ priority: ["custom-http"], providers: { "custom-http": { enabled: true } } }),
+  );
+  try {
+    const { msgs } = await runServe(
+      [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "generate_image", arguments: { prompt: "x", provider: "custom-http", async: true, out: join(dir, "t.png") }, _meta: { progressToken: token } },
+        }),
+      ],
+      { BRUSHROUTER_CUSTOM_URL: `http://127.0.0.1:${server.address().port}/g` },
+      // The project config is resolved from cwd, so seeding it here only works
+      // if the child actually runs in this directory.
+      { cwd: dir },
+    );
+    const progress = msgs.filter((m) => m.method === "notifications/progress");
+    assert.ok(progress.length > 0, `no progress notification was emitted; frames: ${JSON.stringify(msgs.map((m) => m.method || m.id))}`);
+    for (const n of progress) assert.equal(n.params.progressToken, token, "progressToken was rewritten");
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP parse errors do not echo the client's input back", async () => {
+  // V8 quotes the offending slice: 'Unexpected token S, "SECRETSETTING" is not...'
+  const { msgs } = await runServe(["SECRETSETTING"]);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].error.code, -32700);
+  assert.ok(!msgs[0].error.message.includes("SECRETSETTING"), `raw input echoed: ${msgs[0].error.message}`);
+  assert.match(msgs[0].error.message, /Parse error/);
+});
+
+test("MCP notifications never get a response, but still run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-notify-"));
+  const out = join(dir, "notified.png");
+  const { createServer } = await import("node:http");
+  // A `data:` URL at the default `data.0.url` response path is the one shape
+  // custom-http consumes with no extra config, so generation really succeeds.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ url: `data:image/png;base64,${PNG.toString("base64")}` }] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const { msgs } = await runServe(
+      [
+        // Notification-form ping: no id, so no reply.
+        JSON.stringify({ jsonrpc: "2.0", method: "ping" }),
+        // Notification-form tools/call: must run (the file appears) and still
+        // emit nothing. An id-less frame here was invalid JSON-RPC.
+        JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: "generate_image", arguments: { prompt: "n", provider: "custom-http", out } } }),
+        // A real request afterwards proves the process is still healthy.
+        JSON.stringify({ jsonrpc: "2.0", id: 9, method: "ping" }),
+      ],
+      // custom-http ships disabled (it needs an endpoint), so the route must be
+      // opted into as well as pointed at — `enabled: false` is a capability
+      // switch, and naming the route explicitly no longer bypasses it.
+      { BRUSHROUTER_CUSTOM_URL: `http://127.0.0.1:${server.address().port}/g`, BRUSHROUTER_ENABLE: "custom-http" },
+      // cwd must be the seeded dir: the project config is resolved from it, and
+      // without it custom-http is never enabled and the tool cannot run.
+      { cwd: dir },
+    );
+    const framesWithoutId = msgs.filter((m) => !("id" in m) && m.method !== "notifications/progress" && m.method !== "notifications/tasks/status");
+    assert.deepEqual(framesWithoutId, [], `notification got a response: ${JSON.stringify(framesWithoutId)}`);
+    assert.ok(msgs.some((m) => m.id === 9), "the following request went unanswered");
+    // The tool did actually execute: no response, but the image landed.
+    assert.ok(existsSync(out), `notification-form tools/call did not run (dir: ${JSON.stringify(readdirSync(dir))})`);
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP answers a batch array with one response per request", async () => {
+  const { msgs } = await runServe([
+    JSON.stringify([
+      { jsonrpc: "2.0", id: 1, method: "ping" },
+      { jsonrpc: "2.0", method: "notifications/initialized" }, // notification: dropped
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+    ]),
+    "[]",
+  ]);
+  const batchReply = msgs.find((m) => Array.isArray(m));
+  assert.ok(batchReply, `batch was rejected; got ${JSON.stringify(msgs)}`);
+  assert.deepEqual(batchReply.map((m) => m.id), [1, 2], "wrong per-element responses");
+  assert.ok(batchReply[1].result.tools.length > 0, "tools/list in a batch returned no tools");
+  // An empty batch is invalid on its own, not an answerable list.
+  assert.equal(msgs.filter((m) => !Array.isArray(m)).pop()?.error?.code, -32600);
+});
+
+test("MCP rejects batch items without a prompt instead of generating a blank image", async () => {
+  const { handleRequest } = await import("../src/mcp.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-validate-"));
+  writeFileSync(
+    join(dir, "brushrouter.config.json"),
+    JSON.stringify({ priority: ["mock-norm"], providers: { "mock-norm": { enabled: true } } }),
+  );
+  const { PROVIDERS } = await import("../src/router.js");
+  const prompts = [];
+  PROVIDERS["mock-norm"] = {
+    id: "mock-norm",
+    supportsImages: true,
+    async probe() {
+      return { available: true };
+    },
+    async generate({ prompt }) {
+      prompts.push(prompt);
+      return { buffer: PNG, meta: { model: "m" } };
+    },
+  };
+  const call = (id, args) =>
+    handleRequest({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "batch_generate_images", arguments: args } }, { cwd: dir });
+  try {
+    for (const items of [[{ size: "1024x1024" }], [{}], [{ prompt: "   " }], [42]]) {
+      const r = await call(1, { items, outDir: join(dir, "out") });
+      assert.equal(r.result.isError, true, `accepted a promptless item: ${JSON.stringify(items)}`);
+      assert.match(r.result.content[0].text, /items\[0\]/, `error did not name the index: ${r.result.content[0].text}`);
+    }
+    assert.deepEqual(prompts, [], "a promptless item reached a provider");
+
+    // A bare string is a prompt, not an object to spread character by character.
+    const ok = await call(2, { items: ["a red fox"], outDir: join(dir, "out2") });
+    assert.equal(ok.result.isError, false, ok.result.content[0].text);
+    assert.deepEqual(prompts, ["a red fox"]);
+    assert.match(ok.result.content[0].text, /01-a-red-fox\.png/);
+  } finally {
+    delete PROVIDERS["mock-norm"];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A live `serve` child for tests that must observe timing (a job finishing
+// after its TTL) rather than run a fixed list of lines. `until(pred)` resolves
+// the first frame matching pred, including frames that already arrived.
+async function serveSession({ env = {}, cwd } = {}) {
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  const child = spawn(process.execPath, [bin, "serve"], { cwd, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...env } });
+  const frames = [];
+  let buf = "";
+  let wake = null;
+  child.stdout.on("data", (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line) continue;
+      try {
+        frames.push(JSON.parse(line));
+      } catch {
+        // A non-JSON line is a bug elsewhere; keep the raw text visible.
+        frames.push({ raw: line });
+      }
+      wake?.();
+    }
+  });
+  child.stderr.on("data", () => {});
+  const closed = new Promise((r) => child.on("close", r));
+  const until = (pred, ms = 8000) =>
+    new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => {
+        wake = null;
+        reject(new Error(`timed out waiting for a frame matching ${pred}; got ${JSON.stringify(frames)}`));
+      }, ms);
+      const check = () => {
+        const hit = frames.find(pred);
+        if (hit) {
+          clearTimeout(deadline);
+          wake = null;
+          resolve(hit);
+          return true;
+        }
+        return false;
+      };
+      if (check()) return;
+      wake = check;
+    });
+  const send = (obj) => child.stdin.write(JSON.stringify(obj) + "\n");
+  const close = async () => {
+    child.stdin.end();
+    // Never leave the child (or a hung render) holding the suite open.
+    const timer = setTimeout(() => child.kill("SIGKILL"), 3000);
+    await closed;
+    clearTimeout(timer);
+  };
+  return { child, frames, send, until, close };
+}
+
+test("a job slower than the TTL is still collectable when it completes", async () => {
+  // The retention clock must start at completion. Measured from creation, any
+  // render longer than the TTL was pruned by the .finally() that ran the moment
+  // it finished: the image was on disk but image_result said "unknown jobId".
+  const { createServer } = await import("node:http");
+  // Answer at 3x the TTL below, and use the one response shape custom-http
+  // consumes with no extra config: a data: URL at data.0.url.
+  const server = createServer((_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [{ url: `data:image/png;base64,${PNG.toString("base64")}` }] }));
+    }, 600);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const dir = mkdtempSync(join(tmpdir(), "br-slowjob-"));
+  writeFileSync(
+    join(dir, "brushrouter.config.json"),
+    JSON.stringify({ priority: ["custom-http"], providers: { "custom-http": { enabled: true } } }),
+  );
+  const out = join(dir, "slow.png");
+  let session;
+  try {
+    session = await serveSession({
+      cwd: dir,
+      env: { BRUSHROUTER_CUSTOM_URL: `http://127.0.0.1:${server.address().port}/g`, BRUSHROUTER_JOB_TTL_MS: "200" },
+    });
+    session.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "generate_image", arguments: { prompt: "x", provider: "custom-http", async: true, out } } });
+    const started = await session.until((f) => f.id === 1);
+    const jobId = /job (img_[a-z0-9_]+)/.exec(started.result?.content?.[0]?.text || "")?.[1];
+    assert.ok(jobId, `async generate returned no jobId: ${started.result?.content?.[0]?.text}`);
+
+    // Wait for the job to actually finish, then poll immediately: the completion
+    // notification proves the promise settled, so the clock has started.
+    await session.until((f) => f.method === "notifications/tasks/status" && f.params?.status === "completed");
+    session.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "image_result", arguments: { jobId } } });
+    const result = await session.until((f) => f.id === 2);
+    const text = result.result?.content?.[0]?.text || "";
+    assert.equal(result.result?.isError, false, `job was pruned after completing: ${text}`);
+    assert.ok(result.result.content.some((b) => b.type === "image"), `no image block returned: ${text}`);
+    assert.ok(existsSync(out), "the completed job's file is missing");
+  } finally {
+    await session?.close();
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fetchWithTimeout keeps its deadline until the body is consumed", async () => {
+  // fetch() resolves when HEADERS arrive. Clearing the timer there bounded only
+  // the header wait, so a server that sends 200 then stalls held the caller in
+  // res.text() forever.
+  const { createServer } = await import("node:http");
+  const { fetchWithTimeout } = await import("../src/util/common.js");
+  const server = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    if (req.url === "/stall") {
+      res.write("PARTIAL"); // headers + a chunk, then never end
+      return;
+    }
+    res.end("done");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const startedAt = Date.now();
+    const res = await fetchWithTimeout(`${base}/stall`, {}, 600);
+    assert.equal(res.status, 200);
+    assert.ok(Date.now() - startedAt < 600, "the header wait should not consume the whole deadline");
+
+    await assert.rejects(
+      () => res.text(),
+      (e) => {
+        assert.equal(e.code, "TIMEOUT", `expected a clear timeout, got ${e.name}: ${e.message}`);
+        assert.match(e.message, /timed out/);
+        return true;
+      },
+    );
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= 500 && elapsed < 2500, `body read was not bounded by the deadline (${elapsed}ms)`);
+
+    // A normal body is untouched and must not leave a timer holding the process.
+    const okRes = await fetchWithTimeout(`${base}/ok`, {}, 5000);
+    assert.equal(await okRes.text(), "done");
+
+    // stream readers (readBodyCapped) are bounded too.
+    const { readBodyCapped } = await import("../src/util/common.js");
+    const stall = await fetchWithTimeout(`${base}/stall`, {}, 400);
+    await assert.rejects(() => readBodyCapped(stall), /timed out/);
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CLI regressions (bin/brushrouter.js). These spawn the real CLI with a temp
+// HOME so nothing touches the developer's own config, keys or rules.
+// ---------------------------------------------------------------------------
+
+async function cliHarness() {
+  const { fileURLToPath } = await import("node:url");
+  const { spawnSync } = await import("node:child_process");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  // A fresh HOME + config/keys per call: BRUSHROUTER_* is the source of truth,
+  // and every run must touch nothing outside its own sandbox.
+  const makeHome = () => {
+    const home = mkdtempSync(join(tmpdir(), "br-cli-home-"));
+    return {
+      home,
+      cfgDir: join(home, "cfg"),
+      userConfig: join(home, "cfg", "config.json"),
+      keys: join(home, "cfg", "keys.json"),
+    };
+  };
+  const run = (argv, { home, stdin, cwd } = {}) => {
+    const env = home || makeHome();
+    const r = spawnSync(process.execPath, [bin, ...argv], {
+      encoding: "utf8",
+      cwd: cwd || tmpdir(),
+      input: stdin,
+      env: {
+        ...process.env,
+        HOME: env.home,
+        BRUSHROUTER_CONFIG_DIR: env.cfgDir,
+        BRUSHROUTER_USER_CONFIG: env.userConfig,
+        BRUSHROUTER_KEYS_PATH: env.keys,
+        // Keep provider probes cheap and deterministic: no real CLI on PATH.
+        PATH: "/usr/bin:/bin",
+      },
+      timeout: 60000,
+    });
+    return { ...r, h: env };
+  };
+  return { bin, makeHome, run };
+}
+
+// JSON printed and then process.exit(1) lost most of a piped payload: the CLI
+// must exit through exitAfterFlush() so a large `--json` document survives a
+// pipe. 700 items makes the payload big enough to cross the pipe buffer.
+test("CLI batch --json through a real pipe emits parseable JSON", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { run, makeHome } = await cliHarness();
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-json-"));
+  const items = Array.from({ length: 700 }, (_, i) => ({
+    prompt: `a detailed test prompt number ${i} with enough words to make the JSON payload large`,
+  }));
+  const input = join(dir, "items.json");
+  writeFileSync(input, JSON.stringify(items));
+  // spawnSync captures the child's stdout through a pipe, which is exactly the
+  // case that used to truncate at the pipe buffer boundary.
+  const r = run(["batch", input, "--dry-run", "--json"], { home: makeHome() });
+  assert.equal(r.status, 0, `batch --dry-run --json should exit 0, got ${r.status}: ${r.stderr}`);
+  const parsed = JSON.parse(r.stdout);
+  assert.equal(parsed.totalItems, 700);
+  assert.equal(parsed.items.length, 700);
+  assert.ok(r.stdout.length > 150000, `expected a large payload, got ${r.stdout.length} bytes`);
+});
+
+// Regression: `setup --dry-run` ran a real OAuth login, saved keys and flipped
+// route flags. A dry run must not create or change a single file.
+test("CLI setup --dry-run writes nothing", async () => {
+  const { readdirSync } = await import("node:fs");
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const cwd = mkdtempSync(join(tmpdir(), "br-dry-cwd-"));
+  const before = (() => {
+    try {
+      return readdirSync(home.home, { recursive: true }).sort();
+    } catch {
+      return [];
+    }
+  })();
+  const r = run(["setup", "--dry-run"], { home, cwd, stdin: "" });
+  assert.equal(r.status, 0, `setup --dry-run should exit 0, got ${r.status}: ${r.stderr}`);
+  const after = (() => {
+    try {
+      return readdirSync(home.home, { recursive: true }).sort();
+    } catch {
+      return [];
+    }
+  })();
+  // Nothing at all: not the config dir, not config.json, not keys.json, not
+  // auth.json. (Other agents' probes may populate HOME on a real machine, so
+  // compare before/after rather than asserting emptiness.)
+  assert.deepEqual(after, before, `setup --dry-run created files: ${after.filter((f) => !before.includes(f)).join(", ")}`);
+  assert.ok(!existsSync(home.cfgDir), "setup --dry-run created the config directory");
+  assert.ok(!existsSync(home.userConfig), "setup --dry-run wrote config.json");
+  assert.ok(!existsSync(home.keys), "setup --dry-run wrote keys.json");
+  assert.ok(!existsSync(join(cwd, "brushrouter-test.png")), "setup --dry-run ran the smoke test");
+});
+
+// The real hazard is the interactive half: Phase 2 is only reached with a TTY.
+// Fake one, pick "sign in with ChatGPT", and assert the OAuth login is
+// described rather than performed.
+test("CLI setup --dry-run does not run the interactive login", async () => {
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  const { makeHome } = await cliHarness();
+  const home = makeHome();
+  const dir = mkdtempSync(join(tmpdir(), "br-dry-tty-"));
+  const shim = join(dir, "runner.mjs");
+  writeFileSync(
+    shim,
+    `const fake = (s) => {
+  Object.defineProperty(s, "isTTY", { value: true, configurable: true });
+  if (!s.setRawMode) s.setRawMode = () => {};
+  s.isRaw = false; s.columns = 120; s.rows = 40;
+};
+fake(process.stdin); fake(process.stdout); fake(process.stderr);
+process.argv = [process.argv[0], ${JSON.stringify(bin)}, "setup", "--dry-run"];
+await import(${JSON.stringify(bin)});
+`,
+  );
+  const child = spawn(process.execPath, [shim], {
+    cwd: dir,
+    env: {
+      ...process.env,
+      HOME: home.home,
+      BRUSHROUTER_CONFIG_DIR: home.cfgDir,
+      BRUSHROUTER_USER_CONFIG: home.userConfig,
+      BRUSHROUTER_KEYS_PATH: home.keys,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (out += d));
+  // Answer every prompt: pick "Sign in with ChatGPT" (the mutating branch), then
+  // decline MCP wiring, rules injection and the smoke test so setup can finish.
+  const answers = [];
+  const plan = [
+    [/Select \[1-4\]/, "1\n"],
+    [/Wire brushrouter MCP into/, "n\n"],
+    [/Inject clean brushrouter guidance/, "n\n"],
+    [/Generate a quick test image/, "n\n"],
+  ];
+  const iv = setInterval(() => {
+    for (let i = answers.length; i < plan.length; i++) {
+      if (plan[i][0].test(out)) {
+        child.stdin.write(plan[i][1]);
+        answers.push(i);
+        break;
+      }
+    }
+  }, 100);
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve("timeout");
+    }, 20000);
+    child.on("exit", (c) => {
+      clearTimeout(timer);
+      resolve(c);
+    });
+  });
+  clearInterval(iv);
+  assert.notEqual(code, "timeout", "setup --dry-run hung at the provider prompt");
+  assert.match(out, /Dry run: would sign in to ChatGPT/i, `the login was not dry-guarded:\n${out.slice(-600)}`);
+  assert.ok(!existsSync(join(home.cfgDir, "auth.json")), "a dry run wrote auth.json");
+  assert.ok(!existsSync(home.userConfig), "a dry run wrote config.json");
+  assert.ok(!/Opening browser for ChatGPT OAuth sign-in/i.test(out), "a dry run actually opened the OAuth flow");
+});
+
+// Regression: init used the frozen CONFIG_DIR/USER_CONFIG_PATH constants, so
+// BRUSHROUTER_USER_CONFIG was ignored and loadConfig never saw the file.
+test("CLI init honours BRUSHROUTER_USER_CONFIG", async () => {
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const override = join(home.home, "elsewhere", "nested", "cfg.json");
+  const r = await spawnInit(home, override);
+  assert.equal(r.status, 0, `init should exit 0, got ${r.status}: ${r.stderr}`);
+  assert.ok(existsSync(override), `init did not write the override path ${override}`);
+  assert.match(r.stdout, /cfg\.json/);
+  // The default location must stay untouched.
+  assert.ok(!existsSync(join(home.home, ".config", "brushrouter", "config.json")));
+  // The written file must be the config shape loadConfig expects, not an empty
+  // or partial document — writing somewhere unreadable was the bug.
+  const saved = JSON.parse(readFileSync(override, "utf8"));
+  const { DEFAULT_CONFIG } = await import("../src/config.js");
+  assert.deepEqual(Object.keys(saved).sort(), Object.keys(DEFAULT_CONFIG).sort());
+  assert.deepEqual(saved.priority, DEFAULT_CONFIG.priority);
+  // And a second init must refuse to clobber it.
+  const again = await spawnInit(home, override);
+  assert.equal(again.status, 1, "init should refuse to overwrite an existing config");
+  assert.match(again.stderr, /already exists/);
+  void run;
+});
+
+async function spawnInit(home, override) {
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  return spawnSync(process.execPath, [bin, "init"], {
+    encoding: "utf8",
+    cwd: tmpdir(),
+    env: {
+      ...process.env,
+      HOME: home.home,
+      BRUSHROUTER_CONFIG_DIR: home.cfgDir,
+      BRUSHROUTER_USER_CONFIG: override,
+      BRUSHROUTER_KEYS_PATH: home.keys,
+    },
+    timeout: 30000,
+  });
+}
+
+// Regression: a leading flag swallowed the command, so `--json providers` printed
+// help and exited 0 — a no-op that looked like success.
+test("CLI accepts flags before the command", async () => {
+  const { run, makeHome } = await cliHarness();
+  const leading = run(["--json", "providers"], { home: makeHome() });
+  assert.equal(leading.status, 0, `--json providers should exit 0: ${leading.stderr}`);
+  // `providers --json` is the reference behaviour.
+  const trailing = run(["providers", "--json"], { home: makeHome() });
+  assert.equal(trailing.status, 0);
+  assert.ok(leading.stdout.trim().startsWith("["), `expected JSON, got: ${leading.stdout.slice(0, 120)}`);
+  const a = JSON.parse(leading.stdout);
+  const b = JSON.parse(trailing.stdout);
+  assert.deepEqual(
+    a.map((p) => p.id),
+    b.map((p) => p.id),
+    "--json providers must equal providers --json",
+  );
+  // And it must not be the help text.
+  assert.ok(!/USAGE/.test(leading.stdout), "--json providers printed help instead of running the command");
+});
+
+// Regression: ERR_PARSE_ARGS_UNKNOWN_OPTION escaped as a raw stack trace.
+test("CLI reports an unknown flag without a stack trace", async () => {
+  const { run, makeHome } = await cliHarness();
+  for (const argv of [
+    ["providers", "--bogus"],
+    ["--bogus", "providers"],
+    ["gen", "x", "--nope"],
+    ["batch", "a", "--nope"],
+    ["rules", "--nope"],
+  ]) {
+    const r = run(argv, { home: makeHome() });
+    assert.equal(r.status, 2, `${argv.join(" ")} should exit 2, got ${r.status}`);
+    assert.match(r.stderr, /Unknown option/i, `${argv.join(" ")}: ${r.stderr}`);
+    assert.match(r.stderr, /--help/, `${argv.join(" ")} should hint at --help`);
+    assert.ok(!/\n\s+at /.test(r.stderr), `${argv.join(" ")} leaked a stack trace:\n${r.stderr}`);
+    assert.ok(!/ERR_PARSE_ARGS_UNKNOWN_OPTION/.test(r.stdout + r.stderr), "leaked the Node error code");
+  }
+});
+
+// Regression: `rules --only <typo>` printed the full list and exited 0.
+test("CLI rules --only rejects an unknown harness id", async () => {
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const cwd = mkdtempSync(join(tmpdir(), "br-rules-typo-"));
+  const r = run(["rules", "--only", "project-agent"], { home, cwd });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}`);
+  assert.match(r.stderr, /unknown harness id/i);
+  assert.match(r.stderr, /project-agent/);
+  // The message must name real ids so the typo is fixable.
+  assert.match(r.stderr, /valid ids:/);
+  assert.match(r.stderr, /project-agents/);
+  // No rule file may have been created or changed.
+  assert.ok(!existsSync(join(cwd, "AGENTS.md")), "rules --only wrote AGENTS.md despite the typo");
+});
+
+// Regression: a malformed batch entry was silently turned into a prompt (raw
+// JSON text sent to the model) and a malformed array lost every entry.
+test("CLI batch rejects malformed JSON instead of prompting with it", async () => {
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-bad-"));
+
+  const badArray = join(dir, "bad-array.json");
+  writeFileSync(badArray, '[{"prompt": "ok"}, {"no_prompt": 1}]');
+  const r1 = run(["batch", badArray, "--dry-run"], { home });
+  assert.notEqual(r1.status, 0, "a batch item without a prompt must not be accepted");
+  assert.match(r1.stderr, /batch item 1/i, `expected the offending index: ${r1.stderr}`);
+
+  const badJson = join(dir, "bad.json");
+  writeFileSync(badJson, '[{"prompt": "a"}, oops]');
+  const r2 = run(["batch", badJson, "--dry-run"], { home });
+  assert.notEqual(r2.status, 0);
+  assert.match(r2.stderr, /not valid JSON/i);
+
+  // A line that looks like JSON must never be forwarded as a prompt.
+  const badLine = join(dir, "bad.jsonl");
+  writeFileSync(badLine, '{"prompt": "fine"}\n{oops}\n');
+  const r3 = run(["batch", badLine, "--dry-run"], { home });
+  assert.notEqual(r3.status, 0, "a malformed JSON line must fail the batch");
+  assert.match(r3.stderr, /line 2/i);
+  assert.ok(!/oops/.test(r3.stdout), "the malformed line was dispatched as a prompt");
+});
+
+// Regression: `update` printed an unsubstituted OWNER placeholder and exited 0
+// when the install failed.
+test("CLI update never prints an OWNER placeholder and exits non-zero on failure", async () => {
+  const { run, makeHome } = await cliHarness();
+  // --dry-run prints the intended action without network access.
+  const dry = run(["update", "--dry-run"], { home: makeHome() });
+  assert.equal(dry.status, 0);
+  assert.ok(!/OWNER/.test(dry.stdout + dry.stderr), `OWNER placeholder leaked:\n${dry.stdout}`);
+
+  // The npm branch is only taken by a non-git install, so run a copy of the
+  // package with no .git. Point npm at a registry that refuses connections and
+  // at a throwaway cache/prefix so the real global install is never touched.
+  const { spawnSync } = await import("node:child_process");
+  const { cpSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const pkgDir = mkdtempSync(join(tmpdir(), "br-update-copy-"));
+  cpSync(join(root, "package.json"), join(pkgDir, "package.json"));
+  cpSync(join(root, "bin"), join(pkgDir, "bin"), { recursive: true });
+  cpSync(join(root, "src"), join(pkgDir, "src"), { recursive: true });
+  const home = makeHome();
+  const cacheDir = mkdtempSync(join(tmpdir(), "br-npm-cache-"));
+  const r = spawnSync(process.execPath, [join(pkgDir, "bin", "brushrouter.js"), "update"], {
+    encoding: "utf8",
+    cwd: tmpdir(),
+    timeout: 120000,
+    env: {
+      ...process.env,
+      HOME: home.home,
+      BRUSHROUTER_CONFIG_DIR: home.cfgDir,
+      BRUSHROUTER_USER_CONFIG: home.userConfig,
+      BRUSHROUTER_KEYS_PATH: home.keys,
+      npm_config_registry: "http://127.0.0.1:1/",
+      npm_config_cache: cacheDir,
+      npm_config_prefix: join(home.home, "npm-prefix"),
+      // Fail fast: without these npm retries the dead registry for ~60 s.
+      npm_config_fetch_retries: "0",
+      npm_config_fetch_retry_maxtimeout: "1000",
+      npm_config_fetch_timeout: "5000",
+      npm_config_audit: "false",
+      npm_config_fund: "false",
+    },
+  });
+  assert.notEqual(r.status, 0, `update must fail when npm install fails, got ${r.status}`);
+  assert.match(r.stdout + r.stderr, /npm install failed/i);
+  // The recovery hint must carry the real repo, derived from package.json.
+  assert.match(
+    r.stdout + r.stderr,
+    /raw\.githubusercontent\.com\/[A-Za-z0-9._-]+\/brushrouter/,
+    "install URL is not the real repo",
+  );
+  assert.ok(!/OWNER/.test(r.stdout + r.stderr), "OWNER placeholder leaked");
+});
+
+// Regression: two positional prompts became one glued prompt; -o <dir> was
+// accepted as a file target.
+test("CLI gen rejects two prompts and a directory -o", async () => {
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const cwd = mkdtempSync(join(tmpdir(), "br-gen-args-"));
+
+  const two = run(["gen", "a red fox", "a blue jay"], { home, cwd });
+  assert.equal(two.status, 2, `two prompts should exit 2, got ${two.status}`);
+  assert.match(two.stderr, /one prompt/i);
+  assert.match(two.stderr, /batch/, "the error should point at the batch command");
+
+  const dirOut = mkdtempSync(join(tmpdir(), "br-gen-dir-"));
+  const dasDir = run(["gen", "a red fox", "-o", dirOut], { home, cwd });
+  assert.equal(dasDir.status, 2, `-o <dir> should exit 2, got ${dasDir.status}`);
+  assert.match(dasDir.stderr, /directory/i);
+  assert.match(dasDir.stderr, /batch/, "the error should point at the batch command");
+});
+
+// Regression: a non-numeric --concurrency was silently ignored and reported null.
+test("CLI batch validates --concurrency", async () => {
+  const { run, makeHome } = await cliHarness();
+  const h = makeHome();
+  for (const bad of ["abc", "0", "2.5"]) {
+    const r = run(["batch", "a prompt", "--dry-run", "--concurrency", bad], { home: h });
+    assert.equal(r.status, 2, `--concurrency ${bad} should exit 2, got ${r.status}`);
+    assert.match(r.stderr, /concurrency/i, `message should name the flag: ${r.stderr}`);
+    assert.match(r.stderr, /positive integer/i);
+  }
+  // A negative value is rejected by the option parser before validation runs.
+  // Still a clean exit 2 that names the flag — that is the contract that matters.
+  const neg = run(["batch", "a prompt", "--dry-run", "--concurrency", "-3"], { home: h });
+  assert.equal(neg.status, 2, `--concurrency -3 should exit 2, got ${neg.status}`);
+  assert.match(neg.stderr, /concurrency/i, `message should name the flag: ${neg.stderr}`);
+  assert.ok(!/\n\s+at /.test(neg.stderr), "negative concurrency leaked a stack trace");
+  // A valid value still works and is reported as given.
+  const good = run(["batch", "a prompt", "--dry-run", "--json", "--concurrency", "3"], { home: makeHome() });
+  assert.equal(good.status, 0, good.stderr);
+  assert.equal(JSON.parse(good.stdout).concurrency, 3);
+});
+
+// Regression: `setup` printed "brushrouter is ready!" and then kept the event
+// loop alive forever because the prompt helper left a readline interface attached
+// to stdin. The non-interactive path covers the same leak shape: with stdin
+// closed and no TTY, setup must terminate on its own.
+test("CLI setup terminates instead of hanging on an open stdin", async () => {
+  const { run, makeHome } = await cliHarness();
+  const home = makeHome();
+  const cwd = mkdtempSync(join(tmpdir(), "br-setup-exit-"));
+  const started = Date.now();
+  const r = run(["setup", "--dry-run"], { home, cwd, stdin: "" });
+  const elapsed = Date.now() - started;
+  assert.equal(r.status, 0, `setup should exit 0, got ${r.status}: ${r.stderr}`);
+  assert.match(r.stdout, /brushrouter is ready/, "setup did not reach its final screen");
+  // spawnSync itself would time out on a leak; assert it finished well inside
+  // the timeout so a regression fails with a clear message rather than a hang.
+  assert.ok(elapsed < 30000, `setup took ${elapsed}ms — it is holding the event loop open`);
+});
+
+test("a job whose image file disappeared reports an error, not success", async () => {
+  // A poll used to answer "Image generated successfully." with zero image blocks
+  // once the payload was evicted AND the file was deleted. Eviction is forced
+  // with a 1-byte retention budget so rebuildContent() is what answers.
+  const { createServer } = await import("node:http");
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ url: `data:image/png;base64,${PNG.toString("base64")}` }] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const dir = mkdtempSync(join(tmpdir(), "br-missing-"));
+  writeFileSync(
+    join(dir, "brushrouter.config.json"),
+    JSON.stringify({ priority: ["custom-http"], providers: { "custom-http": { enabled: true } } }),
+  );
+  const out = join(dir, "gone.png");
+  let session;
+  try {
+    session = await serveSession({
+      cwd: dir,
+      env: { BRUSHROUTER_CUSTOM_URL: `http://127.0.0.1:${server.address().port}/g`, BRUSHROUTER_JOB_MAX_BYTES: "1" },
+    });
+    session.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "generate_image", arguments: { prompt: "x", provider: "custom-http", async: true, out } } });
+    const started = await session.until((f) => f.id === 1);
+    const jobId = /job (img_[a-z0-9_]+)/.exec(started.result?.content?.[0]?.text || "")?.[1];
+    assert.ok(jobId, started.result?.content?.[0]?.text);
+    await session.until((f) => f.method === "notifications/tasks/status" && f.params?.status === "completed");
+    assert.ok(existsSync(out), "the job never saved its image");
+    // Delete the file behind the job's back: the bytes are now unreachable.
+    rmSync(out);
+    session.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "image_result", arguments: { jobId } } });
+    const poll = await session.until((f) => f.id === 2);
+    assert.equal(poll.result.isError, true, `a missing image was reported as success: ${JSON.stringify(poll.result.content)}`);
+    assert.ok(!poll.result.content.some((b) => b.type === "image"), "a phantom image block was returned");
+    assert.match(poll.result.content[0].text, /gone\.png/, "the error must name the missing path");
+  } finally {
+    await session?.close();
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the request cap counts bytes, not UTF-16 units", async () => {
+  // A 3-byte character counts as 1 in String.length, so the old check admitted
+  // multi-byte input at up to 3x the intended memory: 3M "\u20ac" is 3M UTF-16
+  // units but 9MB of UTF-8, i.e. over an 8MB byte cap and under a length cap.
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  const child = spawn(process.execPath, [bin, "serve"], { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", () => {});
+  // One unfinished line (no newline) past the byte cap: the server abandons it
+  // and answers once, without buffering the whole thing.
+  child.stdin.write("\u20ac".repeat(3_000_000));
+  const frames = () =>
+    out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .flatMap((l) => {
+        try {
+          return [JSON.parse(l)];
+        } catch {
+          return [];
+        }
+      });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && !frames().some((f) => f.error)) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const err = frames().find((f) => f.error);
+  child.stdin.end();
+  await new Promise((r) => child.on("close", r));
+  assert.ok(err, `an oversized multi-byte line was admitted instead of refused`);
+  assert.match(err.error.message, /input limit/i);
+});
+
+test("count generates N variations at distinct paths, all returned as images", async () => {
+  const { handleRequest } = await import("../src/mcp.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-count-"));
+  const { PROVIDERS } = await import("../src/router.js");
+  let seen = 0;
+  PROVIDERS["mock-count"] = {
+    id: "mock-count",
+    supportsImages: true,
+    async probe() {
+      return { available: true };
+    },
+    async generate() {
+      seen++;
+      return { buffer: PNG, meta: { model: "m" } };
+    },
+  };
+  writeFileSync(join(dir, "brushrouter.config.json"), JSON.stringify({ priority: ["mock-count"], providers: { "mock-count": { enabled: true } } }));
+  try {
+    const res = await handleRequest(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "generate_image", arguments: { prompt: "x", provider: "mock-count", count: 3, out: join(dir, "c.png") } },
+      },
+      { cwd: dir },
+    );
+    assert.equal(seen, 3, `count:3 made ${seen} provider calls`);
+    const images = res.result.content.filter((b) => b.type === "image");
+    assert.equal(images.length, 3, `count:3 returned ${images.length} image blocks`);
+    const paths = res.result.content[0].text.match(/c-\d+\.png/g) || [];
+    assert.equal(paths.length, 3, `summary did not list 3 distinct paths: ${res.result.content[0].text}`);
+    for (const p of paths) assert.ok(existsSync(join(dir, p)), `${p} was not saved`);
+  } finally {
+    delete PROVIDERS["mock-count"];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Regression: Ctrl-C at a hidden/password prompt used to kill the process while
+// the tty was still in raw mode, leaving the user's terminal without echo. The
+// prompt must restore the terminal before exiting, and must not let the caller
+// start its next prompt first.
+test("CLI Ctrl-C at a hidden prompt restores the terminal", async () => {
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
+  const { makeHome } = await cliHarness();
+  const home = makeHome();
+  const dir = mkdtempSync(join(tmpdir(), "br-b8-"));
+  // Fake a TTY and record every setRawMode transition, then run `setup`, pick
+  // the "paste an OpenRouter key" option, and send Ctrl-C at the hidden prompt.
+  const shim = join(dir, "runner.mjs");
+  writeFileSync(
+    shim,
+    `const fake = (s) => {
+  Object.defineProperty(s, "isTTY", { value: true, configurable: true });
+  if (!s.setRawMode) s.setRawMode = () => {};
+  s.isRaw = false; s.columns = 120; s.rows = 40;
+};
+fake(process.stdin); fake(process.stdout); fake(process.stderr);
+const setRaw = process.stdin.setRawMode.bind(process.stdin);
+const modes = [];
+process.stdin.setRawMode = (v) => { modes.push(v); return setRaw(v); };
+process.argv = [process.argv[0], ${JSON.stringify(bin)}, "setup"];
+process.on("exit", (c) => process.stderr.write("\\nMODES:" + JSON.stringify(modes) + " CODE:" + c + "\\n"));
+await import(${JSON.stringify(bin)});
+`,
+  );
+  const child = spawn(process.execPath, [shim], {
+    env: {
+      ...process.env,
+      HOME: home.home,
+      BRUSHROUTER_CONFIG_DIR: home.cfgDir,
+      BRUSHROUTER_USER_CONFIG: home.userConfig,
+      BRUSHROUTER_KEYS_PATH: home.keys,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (out += d));
+  const sent = new Set();
+  const iv = setInterval(() => {
+    if (/Select \[1-4\]/.test(out) && !sent.has("pick")) {
+      child.stdin.write("2\n"); // "Add an OpenRouter API key" -> hidden prompt
+      sent.add("pick");
+    } else if (/Paste your OpenRouter key/i.test(out) && !sent.has("ctrl-c")) {
+      child.stdin.write("\u0003");
+      sent.add("ctrl-c");
+    }
+  }, 100);
+  const result = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({ code: null, out, timedOut: true });
+    }, 15000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, out, timedOut: false });
+    });
+  });
+  clearInterval(iv);
+  assert.ok(!result.timedOut, "Ctrl-C at a hidden prompt did not terminate the process");
+  assert.equal(result.code, 130, `expected exit 130, got ${result.code}`);
+  assert.match(result.out, /Paste your OpenRouter key/i, "never reached the hidden prompt");
+  const modes = JSON.parse(/MODES:(\[[^\]]*\])/.exec(result.out)?.[1] || "[]");
+  assert.ok(modes.includes(true), "the prompt never entered raw mode");
+  assert.equal(modes[modes.length - 1], false, `terminal left in raw mode: ${JSON.stringify(modes)}`);
+});
+
+// ---------------------------------------------------------------------------
+// custom-http request building: URL templates are percent-encoded, JSON bodies
+// are JSON-escaped, and neither the image guard nor the response parser may
+// lie about what it did.
+// ---------------------------------------------------------------------------
+
+// A stub that records every request and answers with a real PNG, so a test can
+// assert on the exact URL the provider built.
+async function customHttpStub(handler) {
+  const { createServer } = await import("node:http");
+  const seen = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen.push({ url: req.url, body, headers: req.headers });
+      if (handler) handler(req, res, seen.length);
+      else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ b64_json: PNG.toString("base64") }] }));
+      }
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { server, seen, base: `http://127.0.0.1:${server.address().port}` };
+}
+
+function customPreset(base, over = {}) {
+  return {
+    id: "custom-http",
+    name: "custom-http",
+    url: `${base}/gen?prompt={prompt}&size={size}`,
+    method: "POST",
+    requiresKey: false,
+    headers: {},
+    body: '{"prompt": "{prompt}", "size": "{size}"}',
+    responsePath: "json:data.0.b64_json",
+    defaultModel: "test-model",
+    ...over,
+  };
+}
+
+test("URL template substitutions are percent-encoded, not JSON-escaped", async () => {
+  const { httpImageGenerate } = await import("../src/providers/http.js");
+  // Every character here is legal inside a JSON string — which is exactly why
+  // the JSON escaper left them alone — but each one changes a URL's structure.
+  // "#" truncated the request at the fragment, "?" and "&" rewrote the query,
+  // and "/" could escape the path segment.
+  const prompt = "a red #ff0000 door? x=1&y=2 /path escape 100% ok";
+  const { server, seen, base } = await customHttpStub();
+  try {
+    await httpImageGenerate({ prompt, size: "512x512" }, {}, customPreset(base));
+    const { url } = seen[0];
+
+    assert.ok(!url.includes("#"), `prompt leaked a fragment into the URL: ${url}`);
+    // The structural parts the template itself declares must be intact.
+    const parsed = new URL(url, "http://stub");
+    assert.equal(parsed.pathname, "/gen");
+    assert.equal(parsed.searchParams.get("size"), "512x512", "the size parameter was corrupted");
+    // ...and the prompt must round-trip byte-for-byte through the query value.
+    assert.equal(parsed.searchParams.get("prompt"), prompt, "prompt did not round-trip through the query");
+    // No stray parameters injected by & or ? in the prompt.
+    assert.deepEqual([...parsed.searchParams.keys()].sort(), ["prompt", "size"]);
+
+    // The JSON body keeps JSON escaping — a URL-safe escape would be wrong there
+    // (it would leave the prompt percent-encoded inside the JSON string).
+    assert.equal(JSON.parse(seen[0].body).prompt, prompt, "body substitutions must stay JSON-escaped");
+  } finally {
+    server.close();
+  }
+});
+
+test("a provider that cannot carry reference images fails loudly instead of dropping them", async () => {
+  const { httpImageGenerate } = await import("../src/providers/http.js");
+  const { server, seen, base } = await customHttpStub();
+  try {
+    // Template has no {image} slot, so there is nowhere for the reference to go.
+    await assert.rejects(
+      () => httpImageGenerate({ prompt: "x", images: [join(tmpdir(), "does-not-matter.png")] }, {}, customPreset(base)),
+      (e) => {
+        assert.equal(e.code, "UNSUPPORTED");
+        assert.match(e.message, /cannot carry reference images \(1 supplied\)/);
+        return true;
+      },
+      "images were silently dropped",
+    );
+    // Explicit opt-out is also honoured.
+    await assert.rejects(
+      () => httpImageGenerate({ prompt: "x", images: [join(tmpdir(), "a.png")] }, {}, customPreset(base, { supportsRefImages: false, body: '{"prompt":"{prompt}","image":"{image}"}' })),
+      (e) => {
+        assert.equal(e.code, "UNSUPPORTED");
+        assert.match(e.message, /does not support reference images/);
+        return true;
+      },
+    );
+    // Nothing was sent: the request never went out with the images silently gone.
+    assert.equal(seen.length, 0, "a request was sent despite the unsupported images");
+  } finally {
+    server.close();
+  }
+});
+
+test("custom-http imagesUsed reports what was sent, not what was asked for", async () => {
+  const { httpImageGenerate } = await import("../src/providers/http.js");
+  const { server, base } = await customHttpStub();
+  try {
+    const withoutImages = await httpImageGenerate({ prompt: "x" }, {}, customPreset(base));
+    assert.equal(withoutImages.meta.imagesUsed, false, "claimed images were used when none were supplied");
+  } finally {
+    server.close();
+  }
+});
+
+test("a response payload that is not an image is rejected, not saved", async () => {
+  const { httpImageGenerate } = await import("../src/providers/http.js");
+  const { server, base } = await customHttpStub((_req, res) => {
+    // An error message echoed inside a 200 body: base64 still decodes to
+    // *something*, which used to be written as a .png.
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ b64_json: Buffer.from("model overloaded, try again").toString("base64") }] }));
+  });
+  try {
+    await assert.rejects(
+      () => httpImageGenerate({ prompt: "x" }, {}, customPreset(base)),
+      (e) => {
+        assert.equal(e.code, "BAD_IMAGE_PAYLOAD");
+        // The message must name the payload so the caller can fix its response path.
+        assert.match(e.message, /not PNG\/JPEG\/WebP\/GIF/);
+        // The decoded preview is base64 in the message (that is what the body
+        // held), so decode it to confirm the offending text was named.
+        const preview = /: (\S+)$/.exec(e.message)?.[1] || "";
+        assert.match(Buffer.from(preview, "base64").toString(), /model overloaded/, "the offending payload was not named");
+        return true;
+      },
+      "junk was accepted as an image",
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("a real image payload still passes the validation", async () => {
+  const { httpImageGenerate } = await import("../src/providers/http.js");
+  const { server, base } = await customHttpStub();
+  try {
+    const r = await httpImageGenerate({ prompt: "x" }, {}, customPreset(base));
+    assert.equal(detectImageMime(r.buffer), "image/png");
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// findRecipes pagination and limit validation.
+// ---------------------------------------------------------------------------
+
+test("findRecipes rejects a negative or non-integer limit instead of clamping", async () => {
+  const { findRecipes } = await import("../src/library.js");
+  // Reproduced: -3 returned 1 row and NaN returned 4, both silently.
+  for (const bad of [-3, -1, 1.5, NaN, "abc", Infinity]) {
+    assert.throws(
+      () => findRecipes({ query: "product", limit: bad }),
+      /limit must/,
+      `limit ${String(bad)} was accepted`,
+    );
+  }
+  assert.throws(() => findRecipes({ query: "product", limit: 4, offset: -1 }), /offset must be/);
+  assert.throws(() => findRecipes({ query: "product", limit: 4, offset: 1.5 }), /offset must be/);
+  // The error names the value the caller passed, not JSON's "null" for NaN.
+  assert.throws(() => findRecipes({ query: "product", limit: NaN }), /got NaN/);
+});
+
+test("findRecipes keeps the documented 10-row page cap and 0-means-one", async () => {
+  const { findRecipes, MAX_LIMIT } = await import("../src/library.js");
+  // Both are established behaviour the CLI and tests/recipes.test.js rely on.
+  assert.equal(MAX_LIMIT, 10);
+  assert.equal(findRecipes({ limit: 0 }).rows.length, 1, "limit 0 must still return one row");
+  assert.equal(findRecipes({ limit: 100 }).rows.length, 10, "the page cap must still hold");
+});
+
+test("findRecipes exposes offset so rows past the page cap are reachable", async () => {
+  const { findRecipes, MAX_LIMIT } = await import("../src/library.js");
+  const page1 = findRecipes({ limit: MAX_LIMIT, offset: 0 });
+  assert.ok(page1.total > MAX_LIMIT, `need more than one page to test paging (total ${page1.total})`);
+  // `total` means MATCHING rows, not the page length — the old rows.length made
+  // "there are 30" indistinguishable from "there are 10".
+  assert.equal(page1.total, page1.available);
+  assert.ok(page1.total > page1.rows.length, "total must not be the page length");
+  assert.equal(page1.hasMore, true);
+
+  const page2 = findRecipes({ limit: MAX_LIMIT, offset: MAX_LIMIT });
+  assert.equal(page2.offset, MAX_LIMIT);
+  assert.equal(page2.rows.length, Math.min(MAX_LIMIT, page1.total - MAX_LIMIT));
+  // The two pages must not overlap: that is the whole point of offset.
+  const ids1 = new Set(page1.rows.map((r) => r.id));
+  assert.equal(page2.rows.filter((r) => ids1.has(r.id)).length, 0, "offset returned rows already seen");
+
+  // The last page is reachable and knows it is the last.
+  const last = findRecipes({ limit: MAX_LIMIT, offset: page1.total - 1 });
+  assert.equal(last.rows.length, 1);
+  assert.equal(last.hasMore, false);
+
+  // An offset past the end is an empty page, not a "nothing matched" lie.
+  const past = findRecipes({ limit: MAX_LIMIT, offset: page1.total + 10 });
+  assert.deepEqual(past.rows, []);
+  assert.equal(past.matched, true);
+  assert.equal(past.total, page1.total);
 });

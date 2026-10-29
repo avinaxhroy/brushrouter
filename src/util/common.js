@@ -161,42 +161,113 @@ export function assertImageFile(filePath, cwd = process.cwd()) {
   }
 }
 
+// Set on a response returned by fetchWithTimeout(): clears the abort timer.
+// A caller that consumes the stream directly (readBodyCapped below, or an SSE
+// reader) must call it when the body settles, or the deadline stays armed.
+export const RESPONSE_SETTLED = Symbol("brushrouter.responseSettled");
+
 // Read a response body as bytes, refusing payloads bigger than `max`. Every
 // byte download (image file, raw body) goes through this: a hostile or
 // misconfigured endpoint can otherwise stream unbounded data into memory.
 export async function readBodyCapped(res, max = 64 * 1024 * 1024) {
-  if (!res.body) return Buffer.from(await res.arrayBuffer());
-  const reader = res.body.getReader();
-  const chunks = [];
-  let size = 0;
+  const settle = res[RESPONSE_SETTLED];
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > max) throw new Error(`response body exceeds the ${Math.round(max / 1048576)}MB download limit`);
-      chunks.push(value);
-    }
-  } finally {
+    if (!res.body) return Buffer.from(await res.arrayBuffer());
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
     try {
-      await reader.cancel();
-    } catch {}
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > max) throw new Error(`response body exceeds the ${Math.round(max / 1048576)}MB download limit`);
+        chunks.push(value);
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {}
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    // The body is done, so the fetch timeout no longer applies to it. Without
+    // this the timer would stay armed and fire at a completed response.
+    settle?.();
   }
-  return Buffer.concat(chunks);
 }
 
+// A timeout that covers the WHOLE exchange, body included.
+//
+// `fetch()` resolves as soon as the response HEADERS arrive. Clearing the abort
+// timer in a `finally` around it therefore bounded only the wait for headers: a
+// server that sends 200 and then stalls forever held the caller in `res.text()`
+// with no deadline at all. The deadline is now attached to the response and
+// cleared when the body settles (or the fetch rejects), so it holds until the
+// last byte.
+//
+// The abort fires with an Error whose message names the timeout, so an aborted
+// body read surfaces as a clear timeout rather than a bare AbortError.
 export async function fetchWithTimeout(url, opts = {}, timeoutMs = 180000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+  // Sub-second deadlines (tests, probes) would otherwise format as "after 0s".
+  const timeoutError = new Error(
+    timeoutMs >= 1000 ? `request timed out after ${Math.round(timeoutMs / 1000)}s` : `request timed out after ${Math.round(timeoutMs)}ms`,
+  );
+  timeoutError.name = "TimeoutError";
+  timeoutError.code = "TIMEOUT";
+  // The timer must not keep a finished server alive: unref() means it can only
+  // fire while something else (the request) is still holding the loop open.
+  const timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
   timer.unref?.();
   const signal = opts.signal
     ? (typeof AbortSignal.any === "function" ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal)
     : controller.signal;
+  let res;
   try {
-    return await fetch(url, { ...opts, signal });
-  } finally {
+    res = await fetch(url, { ...opts, signal });
+  } catch (e) {
     clearTimeout(timer);
+    // Surface our own timeout as a timeout even if the runtime wraps it.
+    if (controller.signal.aborted && controller.signal.reason === timeoutError) throw timeoutError;
+    throw e;
   }
+  // A 204/304 has no body stream to wait on, and a caller that never reads the
+  // body must not leak the timer for the full timeout — clear it as soon as the
+  // stream is distinguishable. Everything else keeps the deadline until the
+  // body settles.
+  if (!res.body) {
+    clearTimeout(timer);
+    return res;
+  }
+  const settle = () => clearTimeout(timer);
+  // A caller that reads the stream itself (readBodyCapped, an SSE loop) gets the
+  // same escape hatch: the deadline must be released when the body settles, or
+  // it would fire at a response that already finished.
+  res[RESPONSE_SETTLED] = settle;
+  // Only the body-consuming accessors need wrapping: `res.ok`/`status`/`headers`
+  // are already available, and json()/text()/arrayBuffer() are the three ways a
+  // body is read in this codebase (readBodyCapped uses res.body directly and
+  // benefits from the abort through the same signal).
+  for (const method of ["text", "json", "arrayBuffer", "blob"]) {
+    const original = res[method];
+    if (typeof original !== "function") continue;
+    Object.defineProperty(res, method, {
+      configurable: true,
+      writable: true,
+      value: async function (...args) {
+        try {
+          return await original.apply(this, args);
+        } catch (e) {
+          if (controller.signal.aborted && controller.signal.reason === timeoutError) throw timeoutError;
+          throw e;
+        } finally {
+          settle();
+        }
+      },
+    });
+  }
+  return res;
 }
 
 // Minimal SSE `data:` line reader (no dependencies).

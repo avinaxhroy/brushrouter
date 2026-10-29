@@ -27,22 +27,41 @@ function run(cmd, args, { timeoutMs = 180000, cwd, env, shell = false } = {}) {
       env: { ...process.env, ...env },
       shell: shell || isWindowsCmd,
     });
+    // stdout was never declared here, so the first chunk threw a ReferenceError
+    // from inside the "data" handler (ESM is strict mode) and took the whole
+    // process down before the promise could settle.
+    let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
+    // Settle exactly once. A failed spawn emits `error` AND, on some platforms,
+    // a later `close`; without this guard the second settle wins the race and
+    // hides the real error behind a bogus exit code. Whichever path fires first
+    // also clears the timer, and any exit path leaves no child behind.
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    timer = setTimeout(() => {
       try {
         child.kill("SIGKILL");
       } catch {}
-      resolve({ code: 124, stdout, stderr: stderr + "\ntimed out" });
+      finish({ code: 124, stdout, stderr: stderr + "\ntimed out" });
     }, timeoutMs);
     child.stdout.on("data", (d) => (stdout = appendTailed(stdout, d)));
     child.stderr.on("data", (d) => (stderr = appendTailed(stderr, d)));
+    // Required: an unhandled "error" event (ENOENT/EACCES on spawn) crashes the
+    // process instead of rejecting this promise.
     child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ code: 127, stdout, stderr: stderr + `\n${e.message}` });
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      finish({ code: 127, stdout, stderr: stderr + `\n${e.message}` });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      finish({ code, stdout, stderr });
     });
   });
 }

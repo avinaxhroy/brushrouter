@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
 import { saveImage, detectImageMime, batchVariantPath, batchItemPath } from "./util/common.js";
-import { redact, redactValue, OPAQUE_BYTES } from "./util/redact.js";
+import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories } from "./library.js";
 
 const PKG_VERSION = (() => {
@@ -73,11 +73,11 @@ const TOOL_SCHEMA = {
       count: {
         type: "integer",
         description:
-          "Number of image variations to generate (default: 1). If count > 1, variations are generated in parallel across ready backends.",
+          "Number of image variations to generate (default: 1, max 8). Each variation is saved to its own file (out.png -> out-1.png, out-2.png, ...) and returned as a separate image block, with a text summary listing every saved path. Variations are generated in parallel up to `concurrency`.",
       },
       concurrency: {
         type: "integer",
-        description: "Optional maximum concurrency across providers.",
+        description: "Optional maximum concurrency across providers when count > 1. Defaults to count.",
       },
     },
     required: ["prompt"],
@@ -187,6 +187,17 @@ function positiveEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 const JOB_TTL_MS = positiveEnv("BRUSHROUTER_JOB_TTL_MS", 3600_000);
+// Ceiling for a job that never reaches a terminal state. The TTL above is
+// measured from *completion*, so a provider whose promise never settles (a
+// socket that opens and then stalls, a CLI that never exits) would pin its job
+// record — and its place in the Map — for the life of the process. Six hours is
+// far beyond any real render: the slowest provider call is capped at ~5 minutes
+// and a multi-provider fallback chain or a long batch still finishes well
+// inside an hour, so nothing legitimate is ever cut short. An expired job is
+// marked failed with the reason below rather than silently dropped, so a poll
+// says what happened instead of "unknown jobId". Overridable like the other
+// retention knobs (a test uses a few hundred ms to observe the sweep).
+const MAX_WORKING_JOB_MS = positiveEnv("BRUSHROUTER_JOB_MAX_WORKING_MS", 6 * 3600_000);
 // A completed job's image is already on disk, so its base64 payload is a cache,
 // not the source of truth. Keeping every payload for the full TTL made a long
 // agent session grow by one base64 image per generation with no limit. The
@@ -197,10 +208,33 @@ const MAX_RETAINED_BYTES = positiveEnv("BRUSHROUTER_JOB_MAX_BYTES", 32 * 1024 * 
 // the wire, and the async job can rebuild its payload after eviction.
 const SAVED_PATH = Symbol("brushrouter.savedPath");
 
+// "6h" / "300ms" — the working-job bound is env-overridable, including in tests
+// that use a few hundred milliseconds, so the message must not assume hours.
+function formatDuration(ms) {
+  if (ms >= 3600_000) return `${Math.round(ms / 3600_000)}h`;
+  if (ms >= 1000) return `${Math.round(ms / 1000)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
 function pruneJobs() {
   const now = Date.now();
   for (const [id, j] of jobs) {
-    if (j.status !== "working" && now - j.createdAt > JOB_TTL_MS) jobs.delete(id);
+    // Age from completion, not creation: a render that took longer than the TTL
+    // used to be deleted in the .finally() that ran the instant it finished, so
+    // the image was on disk but image_result reported "unknown jobId".
+    const endedAt = j.completedAt ?? j.createdAt;
+    if (j.status !== "working") {
+      if (now - endedAt > JOB_TTL_MS) jobs.delete(id);
+      continue;
+    }
+    // A working job has no completion to measure from, so bound it by absolute
+    // age and fail it explicitly — a hung provider must not pin memory forever.
+    if (now - j.createdAt > MAX_WORKING_JOB_MS) {
+      j.status = "failed";
+      j.completedAt = now;
+      j.error = j.error || `job did not finish within ${formatDuration(MAX_WORKING_JOB_MS)} and was pruned`;
+      j.content = null;
+    }
   }
   for (const j of evictPayloads([...jobs.values()])) j.content = null;
 }
@@ -221,6 +255,39 @@ export function evictPayloads(entries, maxBytes = MAX_RETAINED_BYTES) {
   return evict;
 }
 
+// `count` was advertised in the schema but never read, so `count:5` produced one
+// image and reported success. It is implemented here rather than removed: the
+// schema is the contract an agent plans against, and "how many variations" is a
+// real thing providers can do. The cap keeps one call from fanning out into an
+// unbounded number of paid generations.
+const MAX_COUNT = 8;
+
+// Positive integer or an error. A nonsensical value must not silently become
+// one variation — that is the same lie as ignoring the parameter.
+function positiveInt(value, name, { max } = {}) {
+  if (value === undefined || value === null) return 1;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be a positive integer (got ${JSON.stringify(value)})`);
+  }
+  if (max && n > max) throw new Error(`${name} must be at most ${max} (got ${n})`);
+  return n;
+}
+
+// Run `fn` over `items` with at most `limit` in flight, preserving result order.
+async function mapLimited(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 // Runs the generation and returns the exact tools/call content the agent would
 // have received from a blocking call. Shared by the sync and async paths so the
 // two can never drift.
@@ -228,27 +295,66 @@ async function runGenerate(args, ctx, onProgress) {
   const { cwd = process.cwd() } = ctx;
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
-  const result = await generate({ ...args, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
-  const saved = saveImage(out, result.buffer, cwd);
-  // SECURITY: every string handed back to the calling model passes through the
-  // redactor, so a credential can never ride along inside a provider's message.
-  const text = redact(
-    [
-      `Image generated successfully.`,
-      `provider: ${result.provider}${result.meta?.model ? ` (${result.meta.model})` : ""}`,
-      `saved: ${saved.savedPath}`,
-      result.attempts?.length ? `attempts: ${result.attempts.map((a) => `${a.provider}=${a.outcome}`).join(", ")}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  );
-  const block = imageBlock(result);
-  result.buffer = null;
+  const count = positiveInt(args.count, "count", { max: MAX_COUNT });
+  const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
+  if (count === 1) {
+    const result = await generate({ ...args, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
+    const saved = saveImage(out, result.buffer, cwd);
+    // SECURITY: every string handed back to the calling model passes through the
+    // redactor, so a credential can never ride along inside a provider's message.
+    const text = redact(
+      [
+        `Image generated successfully.`,
+        `provider: ${result.provider}${result.meta?.model ? ` (${result.meta.model})` : ""}`,
+        `saved: ${saved.savedPath}`,
+        result.attempts?.length ? `attempts: ${result.attempts.map((a) => `${a.provider}=${a.outcome}`).join(", ")}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    const block = imageBlock(result);
+    result.buffer = null;
+    const content = {
+      content: [{ type: "text", text }, block],
+      isError: false,
+    };
+    content[SAVED_PATH] = saved.savedPath;
+    return content;
+  }
+
+  // Several variations: each needs its own file. batchVariantPath suffixes the
+  // index before the extension (fox.png -> fox-1.png), and saveImage still
+  // refuses to overwrite, so two callers cannot collide.
+  const targets = Array.from({ length: count }, (_, i) => batchVariantPath(out, i + 1, count));
+  const settled = await mapLimited(targets, concurrency, async (target, i) => {
+    onProgress?.(`variation ${i + 1}/${count}...`, Math.round(((i + 1) / count) * 90));
+    try {
+      const result = await generate(
+        { ...args, out: target, count: undefined, cwd, fallback: args.fallback === true },
+        cfg,
+      );
+      const saved = saveImage(target, result.buffer, cwd);
+      const block = imageBlock(result);
+      result.buffer = null;
+      return { ok: true, savedPath: saved.savedPath, provider: result.provider, model: result.meta?.model, block };
+    } catch (e) {
+      return { ok: false, error: redact(String(e?.message || e)) };
+    }
+  });
+
+  const good = settled.filter((r) => r.ok);
+  const textLines = [
+    `Generated ${good.length}/${count} image variation(s).`,
+    ...settled.map((r, i) =>
+      r.ok ? `✓ [${i + 1}] ${r.provider}${r.model ? ` (${r.model})` : ""} -> ${r.savedPath}` : `✗ [${i + 1}] failed: ${r.error}`,
+    ),
+  ];
   const content = {
-    content: [{ type: "text", text }, block],
-    isError: false,
+    content: [{ type: "text", text: redact(textLines.join("\n")) }, ...good.map((r) => r.block)],
+    // Zero images means the call failed; a partial set is still a usable answer.
+    isError: good.length === 0,
   };
-  content[SAVED_PATH] = saved.savedPath;
+  content[SAVED_PATH] = good.map((r) => r.savedPath).join("; ");
   return content;
 }
 
@@ -279,6 +385,22 @@ async function runBatchGenerate(args, ctx, onProgress) {
     throw new Error("batch_generate_images requires 'prompts' or 'items' array");
   }
 
+  // The schema declares `prompt` required, but MCP clients are not obliged to
+  // validate against it. Sending an empty prompt to a provider costs a real
+  // request and reports "✓" for a blank image, so reject it here and name the
+  // offending index. A bare string entry is a prompt, not an object to spread —
+  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
+  rawItems = rawItems.map((item, idx) => {
+    const normalised = typeof item === "string" ? { prompt: item } : item;
+    if (!normalised || typeof normalised !== "object" || Array.isArray(normalised)) {
+      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
+    }
+    if (typeof normalised.prompt !== "string" || normalised.prompt.trim() === "") {
+      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
+    }
+    return normalised;
+  });
+
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, args.outDir || `brushrouter-batch-${timestamp}`);
   mkdirSync(outDir, { recursive: true });
@@ -294,7 +416,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
       items,
       outDir,
       cwd,
-      concurrency: args.concurrency ? Number(args.concurrency) : undefined,
+      concurrency: args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency"),
       provider: args.provider,
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
@@ -361,12 +483,19 @@ function startJob(argsIn, ctx, runner = runGenerate) {
       job.bytes = content.content.filter((c) => c.type === "image").reduce((sum, img) => sum + (img.data?.length || 0), 0);
       job.summary = content.content.find((c) => c.type === "text")?.text;
       job.mimeType = content.content.find((c) => c.type === "image")?.mimeType;
+      // The retention clock starts when the job finishes, not when it was
+      // created: JOB_TTL_MS is how long a *collected* result stays pollable.
+      job.completedAt = Date.now();
     })
     .catch((e) => {
       job.status = "failed";
       job.error = redact(String(e?.message || e));
+      job.completedAt = Date.now();
     })
     .finally(() => {
+      // A job whose promise settles late still needs a completion stamp for the
+      // prune above; .then()/.catch() set it first, so this only fills gaps.
+      job.completedAt = job.completedAt || Date.now();
       job.updatedAt = Date.now();
       pruneJobs();
       // Best-effort wake-up. The spec says requestors MUST NOT rely on this and
@@ -382,23 +511,54 @@ function startJob(argsIn, ctx, runner = runGenerate) {
 
 // The payload was evicted to bound memory. The image we wrote is the source of
 // truth, so re-read it rather than dropping the result the agent asked for.
+// The rebuilt payload is cached back onto the job: every poll used to re-read
+// and re-base64 the whole file, which for a multi-megabyte image is far more
+// expensive than the eviction it was recovering from.
 function rebuildContent(job) {
+  let paths = [];
   try {
-    const paths = (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
+    paths = (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
     const blocks = [];
+    const missing = [];
     for (const p of paths) {
-      if (existsSync(p)) {
-        const buf = readFileSync(p);
-        const block = {
-          type: "image",
-          data: buf.toString("base64"),
-          mimeType: detectImageMime(buf) || "image/png",
-        };
-        block[OPAQUE_BYTES] = true;
-        blocks.push(block);
+      if (!existsSync(p)) {
+        missing.push(p);
+        continue;
       }
+      const buf = readFileSync(p);
+      const block = {
+        type: "image",
+        data: buf.toString("base64"),
+        mimeType: detectImageMime(buf) || "image/png",
+      };
+      block[OPAQUE_BYTES] = true;
+      blocks.push(block);
     }
-    return { content: [{ type: "text", text: job.summary }, ...blocks], isError: false };
+    // A success report with zero image blocks is a lie: the agent gets
+    // "Image generated successfully." and no image, and cannot tell that the
+    // payload was lost. The common cause is the file being deleted or the job
+    // outliving its output, so name the path(s) that went missing.
+    if (blocks.length === 0) {
+      const where = missing.length ? ` (missing: ${missing.join(", ")})` : paths.length ? "" : " (no saved path was recorded)";
+      const content = {
+        content: [
+          {
+            type: "text",
+            text: `Image job ${job.id} completed, but its image is no longer available${where}. Re-run the generation to write it again.`,
+          },
+        ],
+        isError: true,
+      };
+      job.content = content;
+      return content;
+    }
+    const content = {
+      content: [{ type: "text", text: job.summary || `Image job ${job.id} completed.` }, ...blocks],
+      isError: false,
+    };
+    job.content = content;
+    job.bytes = blocks.reduce((sum, img) => sum + (img.data?.length || 0), 0);
+    return content;
   } catch (e) {
     return {
       content: [{ type: "text", text: `Image job ${job.id} completed, but its saved image(s) could not be re-read (${e?.code || e?.message || e}).` }],
@@ -465,7 +625,8 @@ function promptToolSchema() {
         input: { type: "string", enum: ["text", "image"], description: "What the user brings. 'text' (default) = an idea only, everything applies. 'image' = they already have a reference photo, so return only entries that can use one." },
         shape: { type: "string", enum: ["single", "grid", "sheet", "document"], description: "What you want back: one image, one image of several panels, a reference sheet, or a designed page." },
         mode: { type: "string", enum: ["categories", "related", "one"], description: "categories = the map of what exists; related = one best match + similar (default); one = exactly one." },
-        limit: { type: "number", description: "How many to return in `related` mode, including the best match. Default 4, max 10." },
+        limit: { type: "integer", minimum: 0, maximum: 10, description: "Rows in `related` mode, including the best match. Default 4, max 10. 0 means one row. Values above 10 are clamped; negative or non-integer values are rejected." },
+        offset: { type: "integer", minimum: 0, description: "Rows to skip before the page, so results past the 10-row page cap are reachable. Default 0. Check `hasMore` in the response to tell whether another page exists." },
         full: { type: "boolean", description: "Return the finished prompt skeleton instead of a preview. Use it once you have picked an id." },
         id: { type: "string", description: "Fetch one exact entry by its id (returned on every result). Overrides query/mode." },
         format: { type: "string", enum: ["text", "json"], description: "Output format: 'text' (default human/terminal preview) or 'json' (structured JSON with publicRecipe objects, slotOptions, and clean prompt fields for programmatic agent access)." },
@@ -490,6 +651,7 @@ export async function handlePromptToolCall(args = {}) {
     shape: args.shape,
     mode: args.mode || "related",
     limit: args.limit,
+    offset: args.offset,
     id: args.id,
     seed: Number(args.seed) || 0,
   });
@@ -506,6 +668,9 @@ export async function handlePromptToolCall(args = {}) {
           matched: result.matched,
           total: result.total,
           available: result.available,
+          limit: result.limit,
+          offset: result.offset,
+          hasMore: result.hasMore,
           recipes: result.rows.map((r) => publicRecipe(r, { full: args.full === true, values, input: result.input })),
         };
     return {
@@ -561,6 +726,18 @@ export async function handleToolCall(name, args, ctx = {}) {
 }
 
 export async function handleRequest(msg, ctx) {
+  // JSON-RPC 2.0: a message with no `id` is a notification, and a notification
+  // MUST NOT get a response — the client has nothing to match one against.
+  // (`id: null` is a request, a discouraged one the spec still answers.)
+  // The check belongs here, not in the `default:` branch: a notification-form
+  // tools/call used to run the tool AND emit an id-less frame, which is invalid
+  // JSON-RPC. The work still runs for notifications that have side effects.
+  const isNotification = msg.id === undefined;
+  const response = await dispatchRequest(msg, ctx);
+  return isNotification ? null : response;
+}
+
+async function dispatchRequest(msg, ctx) {
   const { id, method, params } = msg;
   pruneJobs();
   switch (method) {
@@ -602,7 +779,8 @@ export async function handleRequest(msg, ctx) {
     case "ping":
       return { jsonrpc: "2.0", id, result: {} };
     default:
-      if (id == null) return null;
+      // A request (id present) for an unknown method gets the standard error; a
+      // notification was already short-circuited to null by handleRequest.
       return { jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } };
   }
 }
@@ -610,7 +788,10 @@ export async function handleRequest(msg, ctx) {
 export function serveMcp({ cwd = process.cwd() } = {}) {
   let buf = "";
   // Cap the buffered request line: inputs are paths and prompts, not image bytes.
+  // The cap is in BYTES; String.length would let multi-byte input through at up
+  // to 3x the intended memory.
   const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+  const byteLength = (s) => Buffer.byteLength(s, "utf8");
   let pending = 0;
   let stdinEnded = false;
 
@@ -630,9 +811,40 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
     if (err.code === "EPIPE") process.exit(0);
   });
 
+  // Redact only the payload, never the envelope. JSON-RPC requires the client's
+  // `id` echoed byte-for-byte or the response can never be matched to its
+  // request, and a progressToken must likewise round-trip verbatim. The
+  // producers of `result` already redact their own text (runGenerate,
+  // handleToolCall), so this is a backstop for fields assembled elsewhere, not a
+  // rewriter of the protocol frame.
+  const redactPayload = (obj) => {
+    // A batch reply is an array of responses: redact each element, or the whole
+    // batch bypasses the backstop and returns payloads verbatim.
+    if (Array.isArray(obj)) return obj.map(redactPayload);
+    if (!obj || typeof obj !== "object") return obj;
+    const out = { ...obj };
+    if ("result" in out) out.result = redactValue(out.result);
+    if (out.error && typeof out.error === "object") {
+      const err = { ...out.error };
+      if (typeof err.message === "string") err.message = redact(err.message);
+      out.error = err;
+    }
+    // Notifications carry no result/error, but their message fields are
+    // human-readable text built at the call site. Redact those two, and leave
+    // progressToken and every structural field untouched.
+    if (out.params && typeof out.params === "object" && !Array.isArray(out.params)) {
+      const params = { ...out.params };
+      for (const k of ["message", "statusMessage"]) {
+        if (typeof params[k] === "string") params[k] = redact(params[k]);
+      }
+      out.params = params;
+    }
+    return out;
+  };
+
   const send = (obj) => {
     try {
-      process.stdout.write(JSON.stringify(redactValue(obj)) + "\n");
+      process.stdout.write(JSON.stringify(redactPayload(obj)) + "\n");
     } catch (err) {
       if (err.code === "EPIPE") process.exit(0);
       throw err;
@@ -647,33 +859,68 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
     }
   };
 
+  // One request object -> at most one response object. Batching is handled by
+  // the caller (a JSON-RPC batch is an array of these, answered with an array).
+  const respondTo = async (msg) => {
+    pending++;
+    try {
+      // `notify` lets an async job push notifications (progress, task status)
+      // out-of-band; the JSON-RPC response itself is sent below.
+      return await handleRequest(msg, { cwd, notify });
+    } catch (e) {
+      // Only a request gets an error reply; a notification has no id to answer.
+      if (msg?.id === undefined) return null;
+      return { jsonrpc: "2.0", id: msg?.id ?? null, error: { code: -32603, message: redact(String(e?.message || e)) } };
+    } finally {
+      pending--;
+      maybeExit();
+    }
+  };
+
   const handleLine = async (line) => {
     if (!line) return;
     let msg;
     try {
       msg = JSON.parse(line);
     } catch (e) {
-      send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: ${e.message}` } });
+      // V8 quotes the offending slice of input back at us — `Unexpected token
+      // 'S', "SECRETSETTING" is not valid JSON` — which is the caller's raw
+      // bytes echoed to its own output/log. safeParseMessage() drops the quoted
+      // fragment and keeps the useful part.
+      send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: ${safeParseMessage(e)}` } });
       return;
     }
-    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+    // JSON-RPC 2.0 batch: an array of requests, answered with an array holding
+    // one response per non-notification element (order not significant). An
+    // empty array is itself invalid, so it gets a -32600. A batch of nothing but
+    // notifications gets no reply at all.
+    if (Array.isArray(msg)) {
+      const isRequest = (m) => m != null && typeof m === "object" && !Array.isArray(m);
+      if (msg.length === 0 || !msg.some(isRequest)) {
+        // Not a batch of Requests at all (an array of strings, numbers, nested
+        // arrays...). Answering it once is clearer to the client than a pile of
+        // per-element -32600s, and the spec only defines a batch as an array of
+        // Request objects.
+        send({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: expected a JSON object or an array of request objects" } });
+        return;
+      }
+      const results = await Promise.all(
+        msg.map((m) =>
+          isRequest(m)
+            ? respondTo(m)
+            : { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: expected a JSON object" } },
+        ),
+      );
+      const replies = results.filter(Boolean);
+      if (replies.length > 0) send(replies);
+      return;
+    }
+    if (!msg || typeof msg !== "object") {
       send({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: expected a JSON object" } });
       return;
     }
-    pending++;
-    try {
-      // `notify` lets an async job push notifications (progress, task status)
-      // out-of-band; the JSON-RPC response itself is sent below.
-      const res = await handleRequest(msg, { cwd, notify });
-      if (res) send(res);
-    } catch (e) {
-      if (msg?.id != null) {
-        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: redact(String(e?.message || e)) } });
-      }
-    } finally {
-      pending--;
-      maybeExit();
-    }
+    const res = await respondTo(msg);
+    if (res) send(res);
   };
 
   process.stdin.setEncoding("utf8");
@@ -693,7 +940,9 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
       buf = buf.slice(nlIdx + 1);
       discarding = false;
     }
-    if (buf.length > MAX_REQUEST_BYTES && !buf.includes("\n")) {
+    // Measure BYTES, not UTF-16 code units: String.length counts a 3-byte
+    // character as 1, so a multi-byte line was admitted at up to ~3x the cap.
+    if (byteLength(buf) > MAX_REQUEST_BYTES && !buf.includes("\n")) {
       // A request line has grown past the cap unfinished. Requests carry paths
       // and prompts, never byte payloads, so this cannot be an actionable
       // request: drop it and answer the client once.
@@ -706,7 +955,7 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx).trim();
       buf = idx + 1 < buf.length ? buf.slice(idx + 1) : "";
-      if (line.length > MAX_REQUEST_BYTES) {
+      if (byteLength(line) > MAX_REQUEST_BYTES) {
         oversizeError();
         continue;
       }

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.5] - 2026-10-29
+
+- **Breaking — disabled routes:** `enabled: false` now also refuses an explicit `--provider` and `batch --provider`, with a `PROVIDER_DISABLED` error; `--fallback` cannot bypass it.
+- **Breaking — project config:** `brushrouter.config.json` is filtered by an allow-list (model, priority, size, timeout, concurrency). Endpoints, binaries, credentials, headers and bodies are dropped with a warning.
+- **MCP `count`:** implemented (max 8) — each variation gets its own file (`out-1.png`…), partial failures are reported, and `isError` is true only when none succeeded.
+- **MCP paging:** `find_image_prompts` gains `offset`/`hasMore`; `limit` is validated, and `total` now counts matches instead of the page length.
+- **MCP jobs:** retention is measured from completion, a job that never settles fails after 6 h, an evicted payload is re-cached, and a missing image reports an error instead of a success with no image.
+- **JSON-RPC:** batch arrays are answered per element, and notifications no longer receive a response.
+- **CLI:** `gen` rejects multiple bare prompts and a directory passed to `-o`; `batch` rejects malformed JSON instead of sending it as a prompt.
+- **CLI:** a leading flag no longer swallows the command (`--json providers` now runs), and piped output is flushed before every exit.
+- **`setup`:** `--dry-run` stops at the plan (no login, keys, route flips or `npm link`), and the command exits after its last prompt instead of hanging.
+- **Config paths:** `init`, `doctor` and key storage resolve `BRUSHROUTER_*` at use time, not to the import-time default the loader never read.
+- **Routing:** a 404 from a wrong `baseUrl` is reported as `BAD_URL` instead of being retried as a modality signal across every model.
+- **Providers:** image bytes are validated before saving, URL templates are percent-encoded (`#`/`&` in a prompt used to truncate or inject), and reference images fail loudly rather than silently vanish.
+- **Timeouts:** `fetchWithTimeout` now covers the body, so a 200 followed by a stall no longer hangs.
+- **Security:** OAuth rejects `?error=` and a bad state before rendering success and forces `auth.json` and its directory to 0600/0700; redaction covers AWS key shapes and secret-named fields of any length or type; JSON-RPC `id` and `progressToken` round-trip verbatim.
+- **Fixes:** Gemini CLI `stdout` `ReferenceError`, unhandled `error` events on spawned children, a batch retry timer that let Node exit mid-run, a corrupt key store being overwritten, and `update` exiting 0 on failure.
+
 ## [0.2.1] - 2026-10-19
 
 - Packaging fix: `scripts/gptweb2api-hideconversations.patch` is now included in the npm tarball. It previously existed only in git checkouts, so `npm install` silently skipped the hide-conversations hook and left throwaway image chats in ChatGPT account history while git-clone installs got the cleanup.

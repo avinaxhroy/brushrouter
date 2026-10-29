@@ -59,6 +59,15 @@ export const INPUTS = ["text", "image"];
 /** The two kinds of prompt asset. */
 export const KINDS = ["job", "look"];
 
+/**
+ * Hard cap on one page of results.
+ *
+ * The cap protects the caller's context (a recipe preview is a paragraph, and an
+ * agent that asks for "all" would blow its window), not the search itself. Rows
+ * past it are reachable with `offset`.
+ */
+export const MAX_LIMIT = 10;
+
 // Words that carry no signal when scoring a query. Small list on purpose —
 // the alias map does the heavy lifting, this only stops "a"/"the"/"of" from
 // matching everything.
@@ -636,11 +645,20 @@ function normalize(q) {
  * @param {string?} opts.shape    Restrict to single | grid | sheet | document.
  * @param {string}  opts.mode     categories | related | one.
  * @param {number}  opts.limit    Rows in "related" mode, including the best match.
+ *                                Must be a non-negative integer; capped at 10.
+ *                                0 is accepted (it still returns one row, kept for
+ *                                backwards compatibility with the CLI's
+ *                                `values.limit ? ... : undefined` handling).
+ * @param {number}  opts.offset   Rows to skip before the page, so rows past the
+ *                                10-row page cap are reachable. Must be >= 0.
  * @param {number}  opts.seed     Changes the pick when the query is vague or empty.
  * @param {string?} opts.id       Fetch one exact entry; overrides query/mode.
  * @returns {{mode:string, query:string|null, category:string|null, kind:string|null,
  *            input:string, shape:string|null, total:number, available:number,
- *            matched:boolean, rows:object[]}}
+ *            matched:boolean, limit:number, offset:number, rows:object[]}}
+ *          `total` is the number of MATCHING rows (not the page length) and
+ *          `available` is the same count, kept for callers that predate `total`
+ *          meaning that. Rows 11..N are reached with `offset`.
  */
 export function findRecipes({
   query = null,
@@ -650,6 +668,7 @@ export function findRecipes({
   shape = null,
   mode = "related",
   limit = 4,
+  offset = 0,
   seed = 0,
   id = null,
 } = {}) {
@@ -664,6 +683,29 @@ export function findRecipes({
   if (shape && !lib.shapes[shape]) {
     throw new Error(`unknown shape "${shape}" (use: ${Object.keys(lib.shapes).join(" | ")})`);
   }
+  // `limit` was silently coerced: -3 and 0 both became 1 row, and a non-numeric
+  // value became 4. A caller asking for -3 rows gets a page of 1 and no way to
+  // tell, which reads as "there is only one match". Reject nonsense instead;
+  // a value above the page cap is clamped (documented behaviour, and the cap is
+  // what keeps an agent from drowning its own context).
+  // JSON.stringify(NaN) is "null", which hides the real value from the caller —
+  // show what they actually passed.
+  const asked = (v) => (typeof v === "number" && Number.isNaN(v) ? "NaN" : JSON.stringify(v));
+  const limitNum = Number(limit);
+  if (!Number.isFinite(limitNum) || !Number.isInteger(limitNum)) {
+    throw new Error(`limit must be a whole number between 0 and ${MAX_LIMIT} (got ${asked(limit)})`);
+  }
+  if (limitNum < 0) {
+    throw new Error(`limit must not be negative (got ${limitNum}); use limit: 0 for the single best match`);
+  }
+  const pageLimit = Math.min(MAX_LIMIT, limitNum);
+  const offsetNum = Number(offset);
+  if (!Number.isFinite(offsetNum) || !Number.isInteger(offsetNum) || offsetNum < 0) {
+    throw new Error(`offset must be a whole number >= 0 (got ${asked(offset)})`);
+  }
+  // The cap is a page-size cap, not a result cap: rows past it are reached with
+  // `offset`, so a caller that needs row 11 can still get it.
+
   if (id) {
     return {
       mode: "one",
@@ -675,6 +717,9 @@ export function findRecipes({
       total: 1,
       available: 1,
       matched: true,
+      limit: 1,
+      offset: 0,
+      hasMore: false,
       rows: [getRecipe(id)],
     };
   }
@@ -692,7 +737,7 @@ export function findRecipes({
   }
   if (mode === "categories") {
     const n = (lib.categoryIds[kind || "all"] || []).length;
-    return { mode, query, category, kind, input, shape, total: n, available: n, matched: true, rows: [] };
+    return { mode, query, category, kind, input, shape, total: n, available: n, matched: true, limit: null, offset: 0, rows: [] };
   }
 
   const normalizedQuery = normalize(query || "");
@@ -756,15 +801,18 @@ export function findRecipes({
     }
 
     if (scored.length === 0) {
-      return { mode, query, category, kind, input, shape, total: 0, available: 0, matched: false, rows: [] };
+      return { mode, query, category, kind, input, shape, total: 0, available: 0, matched: false, limit: limitNum, offset: offsetNum, rows: [] };
     }
 
     scored.sort((a, b) => b.score - a.score || a.nudge - b.nudge || (a.row.id < b.row.id ? -1 : (a.row.id > b.row.id ? 1 : 0)));
   }
 
-  const requestedLimit = Number(limit);
-  const capped = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, Math.trunc(requestedLimit))) : 4;
-  const rows = mode === "one" ? scored.slice(0, 1) : scored.slice(0, capped);
+  // `mode: "one"` means exactly one row and ignores limit/offset — that is the
+  // contract the mode exists for (pin the single best match).
+  // 0 is documented as "the single best match" for backwards compatibility, so
+  // it must keep returning one row rather than an empty page.
+  const pageSize = mode === "one" ? 1 : Math.max(1, pageLimit);
+  const rows = scored.slice(offsetNum, offsetNum + pageSize);
   return {
     mode,
     query,
@@ -772,10 +820,19 @@ export function findRecipes({
     kind,
     input,
     shape,
-    total: rows.length,
+    // `total` is the number of MATCHING rows, not the page length: a caller that
+    // sees total 27 and 10 rows knows it can page, which `rows.length` hid.
+    // `available` carries the same number for older callers.
+    total: scored.length,
     available: scored.length,
     matched: true,
-    limit: capped,
+    limit: pageSize,
+    offset: offsetNum,
+    // Explicit, so a client does not have to infer from offsets whether more
+    // rows exist.
+    // `hasMore` says whether the NEXT page holds anything. "one" mode is a pin,
+    // not a page, so it never has more.
+    hasMore: mode !== "one" && offsetNum + rows.length < scored.length,
     rows: rows.map((s) => s.row),
   };
 }
@@ -1026,11 +1083,15 @@ export function renderResult(result, { full = false, values = {}, input = null }
   const effInput = input || result.input || "text";
   if (result.mode === "categories") return renderCategories(result.kind || null);
   if (!result.rows.length) {
-    // `rows` can be empty while the query DID match — e.g. limit=0, or a
-    // non-numeric --limit that parsed to NaN. Saying "nothing matched" there is
-    // a lie the caller cannot detect, so branch on the match, not the page.
+    // `rows` can be empty while the query DID match — e.g. an offset past the
+    // last row. Saying "nothing matched" there is a lie the caller cannot
+    // detect, so branch on the match, not the page.
     const lines = result.matched
-      ? [`Matched ${result.available}, but nothing was returned (limit ${result.limit}).`]
+      ? [
+          result.offset
+            ? `No rows at offset ${result.offset}: ${result.total} matched, so the last page ends at ${result.total}.`
+            : `Matched ${result.total}, but nothing was returned (limit ${result.limit}).`,
+        ]
       : [`Nothing matched "${result.query}".`];
     if (result.category) lines.push(`(filtered to category "${result.category}")`);
     if (result.kind) lines.push(`(filtered to kind "${result.kind}")`);

@@ -215,10 +215,14 @@ export function shutdownSidecar() {
   stopSidecar();
 }
 
-async function healthWait(port, { timeoutMs = 10000, child } = {}) {
+async function healthWait(port, { timeoutMs = 10000, child, spawnErr } = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = "";
   while (Date.now() < deadline) {
+    // A spawn failure is terminal: polling /healthz for the full timeout would
+    // just delay an error we already know the reason for.
+    const se = spawnErr?.();
+    if (se) throw new Error(`failed to start sidecar: ${se.message}`);
     if (child && child.exitCode !== null) throw new Error(lastErr || "sidecar exited during startup");
     try {
       const res = await fetch(`http://127.0.0.1:${port}/healthz`);
@@ -296,6 +300,16 @@ async function startSidecar(cfg, cred, onLog) {
     windowsHide: true,
   });
   let stderrTail = "";
+  // Required: a failed spawn (ENOENT/EACCES on the vendored binary, or the file
+  // vanishing between the existsSync check above and this call) emits "error" on
+  // the child. With no listener, Node treats it as an unhandled error event and
+  // crashes the whole process — the same failure mode as the gemini run() bug.
+  // Keep it out of stderrTail-only reporting: record it so healthWait can fail
+  // fast with the real reason instead of polling /healthz for 10s.
+  let spawnErr = null;
+  child.on("error", (e) => {
+    spawnErr = e;
+  });
   child.stderr.on("data", (d) => {
     stderrTail = (stderrTail + d.toString()).split("\n").slice(-6).join("\n");
   });
@@ -310,10 +324,11 @@ async function startSidecar(cfg, cred, onLog) {
 
   onLog?.(`starting gptweb2api sidecar on 127.0.0.1:${port} (${cred.kind} auth, plan ${cred.plan || "unknown"})`);
   try {
-    await healthWait(port, { child });
+    await healthWait(port, { child, spawnErr: () => spawnErr });
   } catch (e) {
     try { child.kill("SIGKILL"); } catch {}
-    throw new Error(`${e.message}${stderrTail ? ` — ${stderrTail}` : ""}`);
+    const reason = spawnErr ? `failed to start sidecar: ${spawnErr.message}` : e.message;
+    throw new Error(`${reason}${stderrTail ? ` — ${stderrTail}` : ""}`);
   }
   live = {
     child,

@@ -4,7 +4,7 @@
 // pull the image out of the response. A tiny response-path resolver keeps this
 // generic, so the same code also serves the user's "custom HTTP API" provider.
 
-import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl } from "../util/common.js";
+import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl, detectImageMime } from "../util/common.js";
 import { discoverKey } from "../util/keys.js";
 import { registerSecret } from "../util/redact.js";
 import { readFileSync } from "node:fs";
@@ -23,14 +23,44 @@ export function resolvePath(obj, path) {
     .reduce((acc, key) => (acc == null ? acc : acc[key]), obj);
 }
 
+// Body templates are JSON, so a raw prompt with quotes/backslashes/newlines
+// would corrupt the document. Escape, then drop the wrapping quotes.
 function applyTemplate(tpl, vars) {
   return String(tpl).replace(/\{(\w+)\}/g, (_, k) => {
     if (vars[k] == null) return "";
-    const v = String(vars[k]);
-    // Templates are JSON bodies, so a raw prompt with quotes/backslashes/newlines
-    // would corrupt the request. Escape, then drop the wrapping quotes.
-    return JSON.stringify(v).slice(1, -1);
+    return JSON.stringify(String(vars[k])).slice(1, -1);
   });
+}
+
+// URL templates are a different language with a different escaping rule. The
+// JSON escaper leaves `#`, `?` and `&` alone because they are legal inside a
+// JSON string — but in a URL they are structural. A prompt containing "#ff0000"
+// used to truncate the request at the fragment, and "a&b" injected a query
+// parameter. Percent-encoding is the only correct escape here, so the two
+// contexts get two helpers instead of one shared one.
+function applyUrlTemplate(tpl, vars) {
+  return String(tpl).replace(/\{(\w+)\}/g, (_, k) => {
+    if (vars[k] == null) return "";
+    return encodeURIComponent(String(vars[k]));
+  });
+}
+
+// A provider must return actual image bytes, not "the string that happened to
+// sit at the response path". The two escapes below put a payload on disk, so a
+// truncated b64, an error message echoed in a 200 body, or an HTML error page
+// behind a download URL used to become a corrupt .png that nothing validated.
+function assertImageBytes(buffer, { provider, value, locator }) {
+  const mime = detectImageMime(buffer);
+  if (mime) return mime;
+  // Name the payload: the caller needs to see WHAT the endpoint returned to fix
+  // the response path, and a bare "not an image" hides that.
+  const preview = String(value ?? "").slice(0, 120).replace(/\s+/g, " ");
+  const e = new Error(
+    `${provider} returned no usable image at "${locator}" — the payload is not PNG/JPEG/WebP/GIF ` +
+      `(${buffer.length} byte(s) decoded): ${preview}${String(value ?? "").length > 120 ? "..." : ""}`,
+  );
+  e.code = "BAD_IMAGE_PAYLOAD";
+  throw e;
 }
 
 async function fetchImageToBuffer(url, headers) {
@@ -60,8 +90,34 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
   // nothing to the server). Only read the files when the template or a body
   // builder will actually consume them.
   const template = cfg?.body || body;
-  const needsImages = images.length > 0 && Boolean(preset.buildBody || /\{image\}/.test(template));
-  const imageUrls = needsImages ? images.map((p) => readImageAsDataUrl(p, cwd)) : [];
+  const consumesImages = Boolean(preset.buildBody || /\{image\}/.test(template));
+  // The capability is declared, not inferred: `supportsRefImages` defaults to
+  // false, so a preset must opt in. Inferring it from the template alone left
+  // the "cannot accept references" branch unreachable (nothing ever set the old
+  // `withRefImages` flag) and dropped the images silently while the result still
+  // claimed imagesUsed: true.
+  if (images.length && preset.supportsRefImages === false) {
+    // Fail loudly. Silently generating a text-only image while the caller
+    // believes its reference was used is the worst outcome: the user pays for a
+    // generation that cannot contain what they asked for.
+    const e = new Error(
+      `${preset.name} does not support reference images (${images.length} supplied) — use a provider that accepts images.`,
+    );
+    e.code = "UNSUPPORTED";
+    throw e;
+  }
+  if (images.length && !consumesImages) {
+    // Capable in principle (e.g. custom-http) but this deployment's template has
+    // no `{image}` slot and no buildBody, so there is nowhere to put them.
+    const e = new Error(
+      `${preset.name} cannot carry reference images (${images.length} supplied): ` +
+        `its request template has no {image} placeholder and it does not build a body. ` +
+        `Add "{image}" to the configured body, or drop the images.`,
+    );
+    e.code = "UNSUPPORTED";
+    throw e;
+  }
+  const imageUrls = images.length > 0 ? images.map((p) => readImageAsDataUrl(p, cwd)) : [];
 
   const vars = {
     prompt,
@@ -82,7 +138,8 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
     : applyTemplate(template, vars);
   onProgress?.(`generating via ${preset.name}...`, 25);
   const res = await fetchWithTimeout(
-    applyTemplate(cfg?.url || url, vars),
+    // URL context: percent-encode. Body context above: JSON-escape.
+    applyUrlTemplate(cfg?.url || url, vars),
     { method: cfg?.method || method || "POST", headers: finalHeaders, body: finalBody },
     Number(cfg?.timeoutMs) || 180000,
   );
@@ -90,11 +147,19 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
     const detail = await res.text().catch(() => "");
     const e = new Error(`${preset.name} request failed: ${res.status} ${detail.slice(0, 400)}`);
     if (res.status === 401 || res.status === 403) e.code = "NO_AUTH";
+    // A 404 here is the endpoint not existing — almost always a typo'd
+    // baseUrl/url. Label it so the caller fixes config instead of hunting a
+    // model problem, and so the router does not retry it as a modality signal.
+    if (res.status === 404 && !isChatModalityError(detail)) e.code = "BAD_URL";
     throw e;
   }
   const responseMode = cfg?.response || responsePath;
   if (responseMode === "raw") {
-    return { buffer: await readBodyCapped(res), meta: { provider: preset.id, model } };
+    const raw = await readBodyCapped(res);
+    // "raw" means "the body IS the image" — validate it rather than writing
+    // whatever came back to disk as a .png.
+    assertImageBytes(raw, { provider: preset.name, value: raw.subarray(0, 120).toString("latin1"), locator: "raw body" });
+    return { buffer: raw, meta: { provider: preset.id, model, imagesUsed: imageUrls.length > 0 } };
   }
   const json = await res.json();
   const locator = responseMode.startsWith("json:") ? responseMode.slice(5) : responseMode;
@@ -115,12 +180,11 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
     // assume base64 payload
     buffer = Buffer.from(value, "base64");
   }
-  if (preset.withRefImages && images.length && !imageUrls.length) {
-    // Reached only if a preset declares image support but neither a `{image}`
-    // template nor a buildBody consumed it — that preset is misconfigured.
-    throw new Error(`${preset.name} declares reference-image support but nothing consumed the images`);
-  }
-  return { buffer, meta: { provider: preset.id, model, sourceUrl } };
+  // Validated before it is returned, so no caller can save junk: a b64 string
+  // that is really an error message decodes to bytes that are not any image
+  // format, and the file would be written as a valid-looking .png.
+  assertImageBytes(buffer, { provider: preset.name, value, locator });
+  return { buffer, meta: { provider: preset.id, model, imagesUsed: imageUrls.length > 0, sourceUrl } };
 }
 
 // OpenRouter exposes TWO generation surfaces, and the right one depends on the
@@ -149,8 +213,32 @@ function sizeToAspectRatio(size) {
   return `${w / d}:${h / d}`;
 }
 
+// True only for "this model cannot be served over chat/completions, try
+// /images instead". A bare status code is NOT a signal: /404/ is also the
+// status of any wrong-host request, so matching it alone made a typo'd baseUrl
+// look like a modality switch and sent the router retrying every model, the
+// caller ending up with "all providers failed" instead of "your URL is wrong".
+// Match the response BODY's modality wording (or a 404 that explicitly says the
+// route/model does not exist), never the status alone.
 function isChatModalityError(message) {
-  return /No endpoints found that support the requested output modalities|output modalities|not a valid model|404/i.test(String(message));
+  const s = String(message);
+  return (
+    /No endpoints found that support the requested output modalities/i.test(s) ||
+    /requested output modalities/i.test(s) ||
+    // Some deployments word it as the model not being a chat model.
+    /(not a (valid )?chat model|does not support chat|chat modality)/i.test(s) ||
+    // A 404 that names the route/model is a real routing signal; a bare status
+    // is not, so the status must be joined by explanatory text.
+    /(no endpoints found|model not found|not a valid model)/i.test(s)
+  );
+}
+
+// A 404 with no modality wording means the URL (or the endpoint path) is wrong.
+// Reported as a config error so the caller fixes the baseUrl instead of paying
+// for a retry across every model.
+function isUrlConfigError(message) {
+  const s = String(message);
+  return /request failed: 404/.test(s) && !isChatModalityError(s);
 }
 
 // Shared helper: POST /images and pull b64_json|url out of data[0].
@@ -201,7 +289,10 @@ export async function openrouterImagesGenerate({ prompt, size, quality, images =
     sourceUrl = value;
     buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" });
   } else buffer = Buffer.from(value, "base64");
-  return { buffer, meta: { provider: "openrouter", model, endpoint: "/images", sourceUrl } };
+  assertImageBytes(buffer, { provider: "OpenRouter /images", value, locator: "data[0]" });
+  // imagesUsed reports what was actually sent (input_references went out above),
+  // not what the caller asked for.
+  return { buffer, meta: { provider: "openrouter", model, endpoint: "/images", imagesUsed: images.length > 0, sourceUrl } };
 }
 
 // Live model catalogue for `brushrouter models` — the image-capable models the
@@ -286,6 +377,7 @@ export const openrouterProvider = {
     }
     // Precedence: per-call model > configured model > built-in fallback list.
     const pinned = requestedModel || cfg?.model;
+    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
     const candidates = pinned
       ? [pinned]
       : [...new Set([...(cfg?.models || []), ...openrouterProvider.defaultModels].filter(Boolean))];
@@ -300,6 +392,17 @@ export const openrouterProvider = {
         try {
           return await generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, cfg, model, found.key);
         } catch (e) {
+          // A wrong host/path is not a modality signal: report it as config and
+          // stop, or every remaining model pays for the same 404.
+          if (isUrlConfigError(e.message)) {
+            const cfgErr = new Error(
+              `OpenRouter endpoint not found (404) — check providers.openrouter.baseUrl ` +
+                `(currently "${base}"). Provider said: ${e.message}`,
+            );
+            cfgErr.code = "BAD_URL";
+            cfgErr.cause = e;
+            throw cfgErr;
+          }
           // Image-only models are rejected by chat/completions; retry /images.
           if (!isChatModalityError(e.message)) throw e;
           onProgress?.(`${model} is not a chat model; retrying via /images...`, 25);
@@ -310,6 +413,8 @@ export const openrouterProvider = {
         // When the user pinned a model, that failure is final — do not silently
         // substitute a different model behind their back.
         if (pinned) throw e;
+        // A config error applies to every candidate, so retrying is pure waste.
+        if (e.code === "BAD_URL") throw e;
         if (!isChatModalityError(e.message) && !/not available|No endpoints found/i.test(e.message)) throw e;
         onProgress?.(`model ${model} unavailable, trying next...`, 25);
       }
@@ -330,6 +435,8 @@ function generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, 
     keyPrefix: "Bearer ",
     headers: { "HTTP-Referer": "https://github.com/brushrouter", "X-Title": "brushrouter" },
     model,
+    // Chat path can carry references as multimodal parts → declared capable.
+    supportsRefImages: true,
     // Reference images have to travel as multimodal content parts; a flat
     // string template cannot express an array, so this provider builds the body.
     buildBody: ({ prompt, imageUrls }) => ({
@@ -376,6 +483,8 @@ export const falProvider = {
       keyPrefix: "Key ",
       headers: {},
       model,
+      // Text-to-image only: the vendor route takes a prompt, no image inputs.
+      supportsRefImages: false,
       body: JSON.stringify({ prompt: "{prompt}", image_size: n ? { width: Number(n[1]), height: Number(n[2]) } : "square_hd", num_images: 1 }),
       responsePath: "json:images.0.url",
       defaultModel: model,
@@ -410,6 +519,10 @@ export const customHttpProvider = {
       responsePath: cfg?.response || "json:data.0.url",
       model: requestedModel,
       defaultModel: cfg?.model || "custom-model",
+      // Capability is declared by the deployment, not guessed: a custom-http
+      // body only carries references when the user's template has {image}.
+      // The guard in httpImageGenerate then fails loudly instead of dropping.
+      supportsRefImages: cfg?.supportsRefImages !== false,
     });
   },
 };

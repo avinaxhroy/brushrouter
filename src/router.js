@@ -16,6 +16,17 @@ import { gptweb2apiProvider } from "./providers/gptweb2api.js";
 import { geminiProvider } from "./providers/gemini.js";
 import { openrouterProvider, falProvider, customHttpProvider } from "./providers/http.js";
 
+// Invoke a caller-supplied callback (progress, item completion, cooldown, ...).
+// These are UI hooks: one that throws must never escape into routing code, or
+// it would corrupt batch accounting and abort a dispatch loop that still has
+// queued work.
+function notify(fn, ...args) {
+  if (typeof fn !== "function") return;
+  try {
+    fn(...args);
+  } catch {}
+}
+
 export const PROVIDERS = {
   "codex-cli": codexCliProvider,
   codex: codexProvider,
@@ -63,12 +74,41 @@ export async function planAttemptOrder(cfg, { provider, fallback, images = [] } 
   return attemptOrder(cfg, { provider, fallback, images });
 }
 
+// Turn "that route is switched off" into a rejection the caller can act on.
+//
+// `enabled: false` is a CAPABILITY switch, not a preference: it keeps routes
+// that bill per request (openrouter, fal) out of reach until the user actively
+// turns one on — the only thing standing between an agent and someone's
+// credits. The gate must hold for an explicitly named provider too, not just
+// auto-routing, or any agent holding a key can force the paid route. The way
+// through is a second, explicit, persisted decision
+// (`brushrouter routes enable openrouter`), not a CLI flag an agent can add.
+function disabledProviderError(id) {
+  const e = new Error(
+    `route "${id}" is disabled — it is switched off so nothing bills you without a ` +
+      `deliberate opt-in. Run \`brushrouter routes enable ${id}\` to allow it, or omit ` +
+      `--provider and let auto-routing pick a route that is enabled.`,
+  );
+  e.code = "PROVIDER_DISABLED";
+  e.provider = id;
+  return e;
+}
+
+// Shared gate so every entry point (generate, batch, dry-run planning) agrees.
+function assertProviderEnabled(cfg, id) {
+  if (id && providerConfig(cfg, id).enabled === false) throw disabledProviderError(id);
+  return id;
+}
+
 // Build the ordered attempt list for a request.
 async function attemptOrder(cfg, { provider, fallback, images }) {
   const all = listProviderIds();
   const allSet = new Set(all);
   if (provider) {
     if (!PROVIDERS[provider]) throw new Error(`unknown provider "${provider}" (known: ${all.join(", ")})`);
+    // Checked before the fallback branch so `--provider X --fallback` cannot
+    // reach a disabled X through the "rest of the chain" path either.
+    assertProviderEnabled(cfg, provider);
     if (!fallback) return [provider];
     const rest = cfg.priority.filter((p) => p !== provider && allSet.has(p) && providerConfig(cfg, p).enabled !== false);
     return [provider, ...rest];
@@ -111,11 +151,11 @@ export async function generate({ prompt, size, quality, background, images, out,
       const status = await p.probe(pcfg).catch((e) => ({ available: false, detail: e.message }));
       if (!status.available) {
         attempts.push({ provider: id, outcome: "skipped", reason: status.detail });
-        onProgress?.(`skipping ${id}: ${status.detail}`, 5);
+        notify(onProgress, `skipping ${id}: ${status.detail}`, 5);
         continue;
       }
     }
-    onProgress?.(`using ${id}...`, 10);
+    notify(onProgress, `using ${id}...`, 10);
     // codex takes background as an API field; every other route can only put it
     // in the prompt, so say it there rather than drop the request.
     const promptForProvider =
@@ -140,7 +180,7 @@ export async function generate({ prompt, size, quality, background, images, out,
     } catch (e) {
       lastErr = e;
       attempts.push({ provider: id, outcome: "failed", reason: e.message, code: e.code });
-      onProgress?.(`${id} failed: ${e.message}`, 10);
+      notify(onProgress, `${id} failed: ${e.message}`, 10);
       if (provider && !fallback) break; // explicit request, no fallback asked for
     }
   }
@@ -196,6 +236,9 @@ export async function batchGenerate(
   let allowedProviders = [];
   if (provider) {
     if (!PROVIDERS[provider]) throw new Error(`unknown provider "${provider}" (known: ${listProviderIds().join(", ")})`);
+    // Same gate as attemptOrder: a batch naming a disabled route would otherwise
+    // fan out N billed requests in parallel, which is the worst version of this.
+    assertProviderEnabled(cfg, provider);
     allowedProviders = [provider];
     if (fallback) {
       const allSet = new Set(listProviderIds());
@@ -314,11 +357,15 @@ export async function batchGenerate(
         }
         if (nextExpiry < Infinity) {
           clearTimeout(retryTimer);
+          // NOT unref'd: this timer represents live work (items still queued
+          // behind a cooldown). Unref'ing it let Node exit with code 13 while
+          // the batch promise was still unsettled whenever the retry was the
+          // only thing left on the event loop, so the caller got neither
+          // images nor an error.
           retryTimer = setTimeout(() => {
             retryTimer = null;
             dispatch();
           }, Math.max(50, nextExpiry));
-          retryTimer.unref?.();
         } else {
           const item = pendingQueue.shift();
           const failure = {
@@ -332,14 +379,14 @@ export async function batchGenerate(
           results[item.index] = failure;
           doneCount++;
           failedCount++;
-          onItemFail?.(failure);
+          notify(onItemFail, failure);
           dispatch();
         }
       }
     }
 
     async function executeItem(item, pId) {
-      onItemStart?.({ item, index: item.index, provider: pId });
+      notify(onItemStart, { item, index: item.index, provider: pId });
       const p = PROVIDERS[pId];
       const pcfg = providerConfig(cfg, pId);
 
@@ -354,7 +401,7 @@ export async function batchGenerate(
             out: item.out,
             cwd,
             model: item.model,
-            onProgress: (msg) => onProgress?.(`[${item.index + 1}/${queue.length}] ${pId}: ${msg}`),
+            onProgress: (msg) => notify(onProgress, `[${item.index + 1}/${queue.length}] ${pId}: ${msg}`),
           },
           pcfg,
         );
@@ -386,10 +433,13 @@ export async function batchGenerate(
         if (!retainBuffers) {
           res.buffer = null;
         }
+        // Accounting happens BEFORE the notification, and notify() swallows any
+        // callback error, so a throwing onItemComplete can no longer fall into
+        // the catch below and count the same item as failed too.
         results[item.index] = success;
         doneCount++;
         completedCount++;
-        onItemComplete?.(success);
+        notify(onItemComplete, success);
       } catch (err) {
         item.attempts.push({ provider: pId, outcome: "failed", reason: err.message, code: err.code });
         item.failedProviders.add(pId);
@@ -397,7 +447,7 @@ export async function batchGenerate(
         if (isRateLimitError(err)) {
           const cd = Date.now() + cooldownMs;
           cooldownUntil.set(pId, cd);
-          onProviderCooldown?.({ provider: pId, reason: err.message, cooldownUntil: cd });
+          notify(onProviderCooldown, { provider: pId, reason: err.message, cooldownUntil: cd });
         }
 
         const hasCandidate = allowedProviders.some(
@@ -406,7 +456,7 @@ export async function batchGenerate(
 
         if (hasCandidate && (!provider || fallback)) {
           pendingQueue.unshift(item);
-          onProgress?.(`[${item.index + 1}/${queue.length}] ${pId} failed (${err.message}) -> requeuing`);
+          notify(onProgress, `[${item.index + 1}/${queue.length}] ${pId} failed (${err.message}) -> requeuing`);
         } else {
           const failure = {
             ok: false,
@@ -419,7 +469,7 @@ export async function batchGenerate(
           results[item.index] = failure;
           doneCount++;
           failedCount++;
-          onItemFail?.(failure);
+          notify(onItemFail, failure);
         }
       } finally {
         activeCount.set(pId, activeCount.get(pId) - 1);

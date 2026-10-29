@@ -17,17 +17,17 @@
 //   brushrouter doctor --json
 
 import { parseArgs } from "node:util";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync } from "node:fs";
-import { resolve, join, dirname } from "node:path";
+import { createInterface } from "node:readline";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, statSync, writeSync } from "node:fs";
+import { resolve, join, dirname, extname, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { loadConfig, CONFIG_DIR, USER_CONFIG_PATH, DEFAULT_CONFIG } from "../src/config.js";
+import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, DEFAULT_CONFIG } from "../src/config.js";
 import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
 import { saveImage, detectImageMime, assertImageFile, batchItemPath, pngSize } from "../src/util/common.js";
 import { redact, redactValue, registerSecret } from "../src/util/redact.js";
 import { discoverKey, saveKey, describeKey } from "../src/util/keys.js";
-import { KEYS_PATH } from "../src/config.js";
 import { findCodexCli, findGoogleClis, isOnPath } from "../src/util/discover.js";
 import { findRecipes, renderResult, listCategories, publicRecipe, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
 import { getKnownAgentConfigs, detectInstalledAgents, getBrushrouterMcpEntry, installMcpToAgent } from "../src/util/mcp-install.js";
@@ -47,6 +47,22 @@ const PKG = (() => {
   }
 })();
 
+// The install one-liner must point at the real repo. This used to be a literal
+// `OWNER` placeholder that shipped in the message users copy — derive it from
+// package.json's repository URL so there is exactly one place to get it wrong.
+// Handles https://host/owner/repo(.git) and git@host:owner/repo(.git).
+function repoSshSlug() {
+  const url = PKG.repository?.url || "";
+  const m = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/.exec(url);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+function installScriptUrl() {
+  const slug = repoSshSlug();
+  return slug
+    ? `https://raw.githubusercontent.com/${slug}/main/install.sh`
+    : "the install.sh from the repository this package came from";
+}
+
 const C = {
   reset: "\x1b[0m",
   dim: "\x1b[2m",
@@ -63,52 +79,150 @@ const bad = (s) => paint(C.red, s);
 const warn = (s) => paint(C.yellow, s);
 const dim = (s) => paint(C.dim, s);
 
-function parse(argv) {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    options: {
-      provider: { type: "string", short: "p" },
-      model: { type: "string", short: "m" },
-      fallback: { type: "boolean", short: "f", default: false },
-      out: { type: "string", short: "o" },
-      size: { type: "string", short: "s" },
-      quality: { type: "string", short: "q" },
-      background: { type: "string" },
-      images: { type: "string", multiple: true },
-      json: { type: "boolean", default: false },
-      "dry-run": { type: "boolean", default: false },
-      force: { type: "boolean", default: false },
-      yes: { type: "boolean", short: "y", default: false },
-      help: { type: "boolean", short: "h", default: false },
-      verbose: { type: "boolean", short: "v", default: false },
-      category: { type: "string", short: "c" },
-      kind: { type: "string" },
-      mode: { type: "string" },
-      limit: { type: "string", short: "n" },
-      full: { type: "boolean", default: false },
-      "prompt-only": { type: "boolean", default: false },
-      raw: { type: "boolean", default: false },
-      id: { type: "string" },
-      seed: { type: "string" },
-      input: { type: "string" },
-      shape: { type: "string" },
-      set: { type: "string", multiple: true },
-      prompt: { type: "string", multiple: true },
-      concurrency: { type: "string" },
-      "skip-mcp": { type: "boolean", default: false },
-      "skip-test": { type: "boolean", default: false },
-      agent: { type: "string" },
-      all: { type: "boolean", default: false },
-      rules: { type: "boolean", default: false },
-      project: { type: "boolean", default: false },
-      global: { type: "boolean", default: false },
-      create: { type: "boolean", default: false },
-      only: { type: "string" },
-      version: { type: "boolean", short: "V", default: false },
-    },
+// ---------------------------------------------------------------------------
+// Exiting safely.
+//
+// `process.exit()` discards whatever is still queued in a pipe: Node's stdout
+// to a pipe is ASYNCHRONOUS, so a `console.log()` followed immediately by
+// `process.exit()` can lose most of the payload. Reproduce by piping a
+// 700-item `batch --json` into another process: it arrives cut at 131072 bytes
+// (`Unterminated string in JSON`), while the same command redirected to a file
+// writes all 150477 bytes. Exit-code-only calls (usage errors, no output) keep
+// using `process.exit`.
+//
+// The contract: `await exitAfterFlush(n)` waits until every pending write to
+// stdout/stderr has been handed to the OS, then exits. Callers that print and
+// are about to fail must `await` it.
+// ---------------------------------------------------------------------------
+function streamWritePending(stream) {
+  // `writableLength` is undocumented-but-stable stream state: bytes accepted by
+  // write() that the OS has not taken yet. A TTY (or a file) is synchronous, so
+  // this is 0 there and the wait is a no-op.
+  return typeof stream.writableLength === "number" && stream.writableLength > 0;
+}
+
+async function flushStream(stream) {
+  if (!streamWritePending(stream)) return;
+  await new Promise((resolveDrain) => {
+    // Don't wait forever on a stream whose reader went away (EPIPE): a broken
+    // pipe must not turn a clean failure into a hang.
+    const done = () => {
+      stream.removeListener("drain", done);
+      stream.removeListener("error", done);
+      resolveDrain();
+    };
+    stream.once("drain", done);
+    stream.once("error", done);
+    // Belt and braces: some platforms never emit `drain` for a pipe whose
+    // buffer is already empty.
+    const tick = setInterval(() => {
+      if (!streamWritePending(stream)) {
+        clearInterval(tick);
+        done();
+      }
+    }, 5);
+    if (typeof tick.unref === "function") tick.unref();
+    setTimeout(() => {
+      clearInterval(tick);
+      done();
+    }, 5000).unref?.();
   });
-  return { values, positionals };
+}
+
+async function exitAfterFlush(code) {
+  try {
+    // A prompt may have left stdin flowing; nothing should keep the loop alive
+    // while we are on our way out.
+    process.stdin.pause?.();
+  } catch {}
+  await Promise.all([flushStream(process.stdout), flushStream(process.stderr)]);
+  process.exit(code);
+}
+
+function parse(argv) {
+  try {
+    const { values, positionals } = parseArgs({
+      args: argv,
+      allowPositionals: true,
+      options: {
+        provider: { type: "string", short: "p" },
+        model: { type: "string", short: "m" },
+        fallback: { type: "boolean", short: "f", default: false },
+        out: { type: "string", short: "o" },
+        size: { type: "string", short: "s" },
+        quality: { type: "string", short: "q" },
+        background: { type: "string" },
+        images: { type: "string", multiple: true },
+        json: { type: "boolean", default: false },
+        "dry-run": { type: "boolean", default: false },
+        force: { type: "boolean", default: false },
+        yes: { type: "boolean", short: "y", default: false },
+        help: { type: "boolean", short: "h", default: false },
+        verbose: { type: "boolean", short: "v", default: false },
+        category: { type: "string", short: "c" },
+        kind: { type: "string" },
+        mode: { type: "string" },
+        limit: { type: "string", short: "n" },
+        full: { type: "boolean", default: false },
+        "prompt-only": { type: "boolean", default: false },
+        raw: { type: "boolean", default: false },
+        id: { type: "string" },
+        seed: { type: "string" },
+        input: { type: "string" },
+        shape: { type: "string" },
+        set: { type: "string", multiple: true },
+        prompt: { type: "string", multiple: true },
+        concurrency: { type: "string" },
+        "skip-mcp": { type: "boolean", default: false },
+        "skip-test": { type: "boolean", default: false },
+        agent: { type: "string" },
+        all: { type: "boolean", default: false },
+        rules: { type: "boolean", default: false },
+        project: { type: "boolean", default: false },
+        global: { type: "boolean", default: false },
+        create: { type: "boolean", default: false },
+        only: { type: "string" },
+        version: { type: "boolean", short: "V", default: false },
+      },
+    });
+    return { values, positionals };
+  } catch (e) {
+    // A typo'd flag is the user's mistake, not a crash. This used to escape to
+    // main().catch() as `fatal: TypeError [ERR_PARSE_ARGS_UNKNOWN_OPTION]` plus
+    // a Node-internals stack trace, which reads like brushrouter broke. Every
+    // subcommand parses through here, so the handling lives in one place.
+    // The message is returned rather than printed+exited so the caller can
+    // flush before exiting (a pipe write is asynchronous).
+    return { values: null, positionals: null, error: String(e.message || e) };
+  }
+}
+
+// Value-taking flags, by long and short spelling. Used only to know how many
+// tokens a leading flag consumes while looking for the command.
+const VALUE_FLAGS = new Set([
+  "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
+  "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
+  "--mode", "--limit", "-n", "--id", "--seed", "--input", "--shape", "--set",
+  "--prompt", "--concurrency", "--agent", "--only",
+]);
+
+// Find the command token in an argv that may put flags first:
+//   ["--json", "providers"]            -> providers at index 1
+//   ["-o", "out.png", "gen", "a fox"]  -> gen at index 2 (out.png is a value)
+//   ["--help"]                         -> none (-1)
+// Returns { token, index } so the caller can drop exactly that token and hand
+// parseArgs the rest, and `--json` still reaches the subcommand once.
+function firstPositional(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i];
+    // `--` ends flag parsing: the next token is a positional by definition.
+    if (tok === "--") return { token: argv[i + 1] ?? null, index: i + 1 };
+    if (!tok.startsWith("-") || tok === "-") return { token: tok, index: i };
+    // `--flag=value` is self-contained; a bare value-taking flag eats the next
+    // token. Unknown flags are left alone — parseArgs reports them (exit 2).
+    if (!tok.includes("=") && VALUE_FLAGS.has(tok)) i++;
+  }
+  return { token: null, index: -1 };
 }
 
 // Counted on demand, defensively: `--help` must never crash because the library
@@ -147,7 +261,7 @@ ${paint(C.bold, "COMMANDS")}
   doctor                   Diagnose every provider's connectivity
   models [provider]        List available models (live, when the provider can)
   prompts [query]          Find a prompt recipe or a look to build an image from
-  init [--force]           Write a starter config to ${dim(USER_CONFIG_PATH)}
+  init [--force]           Write a starter config to ${dim(getUserConfigPath())}
   install [--dry-run]      Add brushrouter to detected agent MCP configs
   rules [--dry-run]        Inject or update clean brushrouter guidance in AI coding
                            tools (targets detected harnesses; see options below)
@@ -210,7 +324,7 @@ ${paint(C.bold, "EXAMPLES")}
 
 ${paint(C.bold, "SECURITY")}
   brushrouter never prints credentials, and never sends them to a model.
-  Keys live in the environment or in ${dim(KEYS_PATH)} (mode 0600), never in
+  Keys live in the environment or in ${dim(getKeysPath())} (mode 0600), never in
   logs, --json output, or MCP responses.
 `;
 }
@@ -220,15 +334,34 @@ async function cmdGenerate(args) {
   if (values.prompt && values.prompt.length > 1) {
     return cmdBatch(args);
   }
+  // Two bare prompts used to be glued together into one prompt ("a red fox a
+  // blue jay"), quietly generating a single wrong image instead of the batch
+  // the user obviously meant. Point at batch and stop.
+  if (positionals.length > 1) {
+    console.error(bad(`error: gen takes one prompt, got ${positionals.length}`));
+    console.error(dim(`  to generate several, use: brushrouter batch ${positionals.map((p) => JSON.stringify(p)).join(" ")}`));
+    console.error(dim("  (to pass a prompt containing spaces, quote it as one argument)"));
+    return exitAfterFlush(2);
+  }
   const prompt = values.prompt?.[0] || positionals.join(" ").trim();
   if (!prompt) {
     console.error(bad("error: no prompt given"));
     console.error(dim('usage: brushrouter gen "your prompt" [-o out.png]'));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
   const cwd = process.cwd();
   const cfg = loadConfig({ cwd });
   const out = values.out || `brushrouter-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+  // `-o` is a FILE for a single generation. A directory was silently accepted
+  // and then produced a file literally named after the directory, or an EEXIST
+  // from writeFileSync. Reject it up front, before any request is spent.
+  const outAbs = isAbsolute(out) ? out : resolve(cwd, out);
+  if (existsSync(outAbs) && statSync(outAbs).isDirectory()) {
+    console.error(bad(`error: -o "${out}" is a directory — gen writes one file`));
+    console.error(dim(`  give a file path, e.g. -o ${join(out, "image.png")}`));
+    console.error(dim(`  to write a directory of results, use: brushrouter batch ... -o ${out}`));
+    return exitAfterFlush(2);
+  }
   // Reference images: validate before spending a request, and never let a route
   // silently drop them (they used to be accepted and ignored on 4 of 7 routes).
   const imagePaths = values.images || [];
@@ -240,12 +373,12 @@ async function cmdGenerate(args) {
       assertImageFile(p, cwd);
     } catch (e) {
       console.error(bad(`error: --images ${redact(e.message)}`));
-      process.exit(2);
+      return exitAfterFlush(2);
     }
   }
   if (values.background && values.background !== "transparent" && values.background !== "opaque") {
     console.error(bad("error: --background must be opaque or transparent"));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
   if (imagePaths.length && values.provider) {
     // `supportsImages` is a static capability flag, not a health check. This used
@@ -256,7 +389,7 @@ async function cmdGenerate(args) {
       const capable = Object.entries(PROVIDERS).filter(([, v]) => v.supportsImages !== false).map(([id]) => id);
       console.error(bad(`error: ${values.provider} cannot take reference images`));
       console.error(dim(`  --images is supported by: ${capable.join(", ")}`));
-      process.exit(2);
+      return exitAfterFlush(2);
     }
   }
   // SECURITY: progress text embeds raw provider error bodies, which can echo a
@@ -271,7 +404,7 @@ async function cmdGenerate(args) {
       order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback });
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
-      process.exit(1);
+      return exitAfterFlush(1);
     }
     const rows = await probeAll(cfg);
     const byId = new Map(rows.map((r) => [r.id, r]));
@@ -329,7 +462,7 @@ async function cmdGenerate(args) {
       }
       if (e.code === "NO_AUTH") console.error(warn("\nHint: run `brushrouter doctor` to see which providers need login."));
     }
-    process.exit(1);
+    return exitAfterFlush(1);
   }
 
   let saved;
@@ -341,7 +474,7 @@ async function cmdGenerate(args) {
     } else {
       console.error(bad(`error: failed to save image to "${out}": ${e.message}`));
     }
-    process.exit(1);
+    return exitAfterFlush(1);
   }
   if (values.json) {
     console.log(
@@ -391,25 +524,62 @@ function loadBatchItems(filePath, cwd) {
   if (!trimmed) return [];
 
   if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    // Whole-file JSON is validated strictly. The old code swallowed parse
+    // errors with `catch {}` and fell through to line splitting, so a malformed
+    // array turned into one giant "prompt" made of raw JSON text and lost every
+    // real entry — a pay-per-image request spending money on garbage.
+    let parsed;
     try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item) => (typeof item === "string" ? { prompt: item } : item)).filter((it) => it && it.prompt);
+      parsed = JSON.parse(trimmed);
+    } catch (e) {
+      const err = new Error(`batch input is not valid JSON: ${e.message}`);
+      err.code = "BAD_JSON";
+      throw err;
+    }
+    if (!Array.isArray(parsed)) {
+      const err = new Error("batch input JSON must be an array of prompts or items");
+      err.code = "BAD_JSON";
+      throw err;
+    }
+    return parsed.map((item, i) => {
+      if (typeof item === "string") {
+        if (!item.trim()) {
+          const err = new Error(`batch item ${i} is an empty string`);
+          err.code = "BAD_ITEM";
+          throw err;
+        }
+        return { prompt: item };
       }
-    } catch {}
+      if (item && typeof item === "object" && typeof item.prompt === "string" && item.prompt.trim()) return item;
+      const err = new Error(`batch item ${i} has no usable "prompt" (got ${JSON.stringify(item)?.slice(0, 80)})`);
+      err.code = "BAD_ITEM";
+      throw err;
+    });
   }
 
   const lines = trimmed.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
   const items = [];
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     if (line.startsWith("{") && line.endsWith("}")) {
+      // A line that LOOKS like JSON must parse. Falling back to "use the raw
+      // text as the prompt" sent malformed JSON to the model as a prompt and
+      // reported the batch as successful.
+      let obj;
       try {
-        const obj = JSON.parse(line);
-        if (obj && obj.prompt) {
-          items.push(obj);
-          continue;
-        }
-      } catch {}
+        obj = JSON.parse(line);
+      } catch (e) {
+        const err = new Error(`batch line ${i + 1} is not valid JSON: ${e.message}`);
+        err.code = "BAD_JSON";
+        throw err;
+      }
+      if (!obj || typeof obj.prompt !== "string" || !obj.prompt.trim()) {
+        const err = new Error(`batch line ${i + 1} has no usable "prompt"`);
+        err.code = "BAD_ITEM";
+        throw err;
+      }
+      items.push(obj);
+      continue;
     }
     items.push({ prompt: line });
   }
@@ -420,6 +590,17 @@ async function cmdBatch(args) {
   const { values, positionals } = args;
   const cwd = process.cwd();
   const cfg = loadConfig({ cwd });
+
+  // Validate --concurrency here rather than at each use site: Number("abc") is
+  // NaN, and both the dry-run summary (printed as `NaN`) and the real run
+  // (silently no throttling) accepted it without a word.
+  if (values.concurrency !== undefined) {
+    const n = Number(values.concurrency);
+    if (!Number.isInteger(n) || n < 1) {
+      console.error(bad(`error: --concurrency expects a positive integer, got "${values.concurrency}"`));
+      return exitAfterFlush(2);
+    }
+  }
 
   let rawItems = [];
   if (values.prompt && values.prompt.length > 0) {
@@ -432,7 +613,7 @@ async function cmdBatch(args) {
     const arg = positionals[0];
     if (arg.endsWith(".txt") || arg.endsWith(".json") || arg.endsWith(".jsonl")) {
       console.error(bad(`error: batch input file not found: ${arg}`));
-      process.exit(1);
+      return exitAfterFlush(1);
     }
     rawItems = [{ prompt: arg }];
   } else {
@@ -442,19 +623,19 @@ async function cmdBatch(args) {
       console.error(dim('usage: brushrouter batch "prompt 1" "prompt 2" ... [-o ./out-dir]'));
       console.error(dim("       brushrouter batch prompts.txt [-o ./out-dir]"));
       console.error(dim("       cat prompts.txt | brushrouter batch [-o ./out-dir]"));
-      process.exit(2);
+      return exitAfterFlush(2);
     }
     try {
       rawItems = loadBatchItems(inputArg, cwd);
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
-      process.exit(1);
+      return exitAfterFlush(1);
     }
   }
 
   if (!rawItems.length) {
     console.error(bad("error: batch input contains no prompts"));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -585,7 +766,7 @@ async function cmdBatch(args) {
     } else {
       console.error(bad(`error: ${redact(e.message)}`));
     }
-    process.exit(1);
+    return exitAfterFlush(1);
   }
 
   const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -622,7 +803,7 @@ async function cmdBatch(args) {
   }
 
   if (result.completed === 0 && result.total > 0) {
-    process.exit(1);
+    return exitAfterFlush(1);
   }
 }
 
@@ -646,6 +827,10 @@ async function cmdProviders(args) {
 
 async function cmdDoctor(args) {
   const cwd = process.cwd();
+  // Resolved at use time, not module scope: BRUSHROUTER_USER_CONFIG /
+  // BRUSHROUTER_CONFIG_DIR may be set after import, and the frozen constants
+  // src/config.js still exports would miss them.
+  const userCfgPath = getUserConfigPath();
   const cfg = loadConfig({ cwd });
   const rows = await probeAll(cfg);
   const installedAgents = detectInstalledAgents().filter((a) => a.isInstalled);
@@ -653,7 +838,7 @@ async function cmdDoctor(args) {
     console.log(
       JSON.stringify(
         redactValue({
-          config: { user: USER_CONFIG_PATH, exists: existsSync(USER_CONFIG_PATH) },
+          config: { user: userCfgPath, exists: existsSync(userCfgPath) },
           providers: rows,
           agents: installedAgents,
         }),
@@ -687,7 +872,7 @@ async function cmdDoctor(args) {
     }
   }
 
-  if (!existsSync(USER_CONFIG_PATH)) {
+  if (!existsSync(getUserConfigPath())) {
     console.log(dim(`\nTip: run \`brushrouter setup\` to configure your environment and agents.`));
   }
 }
@@ -764,7 +949,7 @@ function cmdPrompts(args) {
   }
   if (!["categories", "related", "one"].includes(mode)) {
     console.error(bad(`unknown --mode "${mode}" (use: categories | related | one)`));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
 
   // --set ratio=16:9 --set text=ACME fills slots in the returned skeleton.
@@ -773,7 +958,7 @@ function cmdPrompts(args) {
     const eq = pair.indexOf("=");
     if (eq < 1) {
       console.error(bad(`--set expects key=value, got "${pair}"`));
-      process.exit(2);
+      return exitAfterFlush(2);
     }
     slotValues[pair.slice(0, eq).trim()] = pair.slice(eq + 1);
   }
@@ -783,7 +968,7 @@ function cmdPrompts(args) {
   for (const [flag, raw] of [["--limit", values.limit], ["--seed", values.seed]]) {
     if (raw !== undefined && !Number.isFinite(Number(raw))) {
       console.error(bad(`error: ${flag} expects a number, got "${raw}"`));
-      process.exit(2);
+      return exitAfterFlush(2);
     }
   }
 
@@ -802,12 +987,12 @@ function cmdPrompts(args) {
     });
   } catch (e) {
     console.error(bad(`error: ${e.message}`));
-    process.exit(1);
+    return exitAfterFlush(1);
   }
   if (values["prompt-only"] || values.raw) {
     if (!result.rows.length) {
       console.error(bad(result.matched ? `no recipes returned (limit ${result.limit})` : `nothing matched "${result.query || values.id || ""}"`));
-      process.exit(1);
+      return exitAfterFlush(1);
     }
     const pub = publicRecipe(result.rows[0], { full: true, values: slotValues, input: result.input });
     console.log(pub.prompt);
@@ -849,12 +1034,12 @@ function cmdRoutes(args) {
   const [action, ...names] = args.positionals || [];
   if (action && !["enable", "disable", "on", "off"].includes(action)) {
     console.error(bad(`unknown action "${action}" (use: enable | disable)`));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
   if (action && !names.length) {
     console.error(bad("no route given"));
     console.error(dim(`known routes: ${listProviderIds().join(", ")}`));
-    process.exit(2);
+    return exitAfterFlush(2);
   }
   if (action) {
     const enable = action === "enable" || action === "on";
@@ -863,7 +1048,7 @@ function cmdRoutes(args) {
     for (const name of names) {
       if (!listProviderIds().includes(name)) {
         console.error(bad(`error: unknown route "${name}" (known: ${listProviderIds().join(", ")})`));
-        process.exit(2);
+        return exitAfterFlush(2);
       }
       if (dry) {
         console.log(`${warn("→")} ${name} would be ${enable ? "enabled" : "disabled"}`);
@@ -874,7 +1059,7 @@ function cmdRoutes(args) {
         console.log(`${enable ? ok("✓") : warn("○")} ${name} ${enable ? "enabled" : "disabled"}`);
       } catch (e) {
         console.error(bad(`error: ${redact(e.message)}`));
-        process.exit(1);
+        return exitAfterFlush(1);
       }
     }
     if (dry) {
@@ -882,7 +1067,7 @@ function cmdRoutes(args) {
       return;
     }
     console.log(dim(`\nwritten to ${path}`));
-    console.log(dim("A disabled route is skipped by auto-routing; --provider <id> still forces it."));
+    console.log(dim("A disabled route is skipped by auto-routing and refused by --provider."));
     return;
   }
   // No action: show current state, in auto-routing order. `priority` is the
@@ -985,6 +1170,19 @@ async function cmdRules(args) {
   console.log(dim("Smart by default: only targets harnesses detected on this machine. Override with --all, --only <id>, --global, or --project.\n"));
 
   const detected = detectRuleFiles();
+
+  // Validate --only before touching anything: a typo'd id used to filter the
+  // list down to nothing and still exit 0, which reads as "already set up".
+  if (onlyIds) {
+    const known = detected.map((d) => d.id);
+    const unknown = onlyIds.filter((id) => !known.includes(id));
+    if (unknown.length) {
+      console.error(bad(`error: unknown harness id${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`));
+      console.error(dim(`valid ids: ${known.join(", ")}`));
+      return exitAfterFlush(2);
+    }
+  }
+
   let changed = 0;
   let currentCount = 0;
   let skippedCount = 0;
@@ -1051,6 +1249,7 @@ async function cmdRules(args) {
 async function cmdUpdate(args) {
   console.log(paint(C.bold, `brushrouter update (current version: v${PKG.version})\n`));
   const isGit = existsSync(join(PACKAGE_ROOT, ".git"));
+  let failed = false;
 
   const dry = args.values["dry-run"];
   if (dry) {
@@ -1074,6 +1273,7 @@ async function cmdUpdate(args) {
       console.log(out.includes("Already up to date") ? dim(`  ${out}`) : ok(`  ${out}`));
     } else {
       console.error(bad(`  git pull failed: ${(pullRes.stderr || pullRes.stdout || "").trim()}`));
+      failed = true;
     }
 
     try {
@@ -1088,8 +1288,11 @@ async function cmdUpdate(args) {
     if (npmRes.status === 0) {
       console.log(ok("  Updated brushrouter via npm install -g brushrouter@latest"));
     } else {
+      // A failed update must not exit 0: scripts and wrappers read the status.
+      failed = true;
+      console.error(bad(`  npm install failed${(npmRes.stderr || npmRes.stdout || "").trim() ? `: ${(npmRes.stderr || npmRes.stdout).trim()}` : ` (exit ${npmRes.status ?? "unknown"})`}`));
       console.log(dim("  To update manually, run: npm install -g brushrouter@latest"));
-      console.log(dim("  Or re-run the one-liner: curl -fsSL https://raw.githubusercontent.com/OWNER/brushrouter/main/install.sh | bash"));
+      console.log(dim(`  Or re-run the one-liner: curl -fsSL ${installScriptUrl()} | bash`));
     }
   }
 
@@ -1100,17 +1303,24 @@ async function cmdUpdate(args) {
 
   console.log("\nVerifying providers and routing after update:");
   await cmdDoctor({ values: { json: false } });
+  if (failed) return exitAfterFlush(1);
 }
 
 function cmdInit(args) {
-  if (existsSync(USER_CONFIG_PATH) && !args.values.force) {
-    console.error(warn(`config already exists: ${USER_CONFIG_PATH}`));
+  // Ask src/config.js for the paths NOW. BRUSHROUTER_USER_CONFIG /
+  // BRUSHROUTER_KEYS_PATH / BRUSHROUTER_CONFIG_DIR are honoured by loadConfig()
+  // and setRouteEnabled(), so init must write where they point — it used to
+  // write the frozen ~/.config/brushrouter path that loadConfig never reads,
+  // and the config silently did nothing.
+  const userConfigPath = getUserConfigPath();
+  if (existsSync(userConfigPath) && !args.values.force) {
+    console.error(warn(`config already exists: ${userConfigPath}`));
     console.error(dim("use `brushrouter init --force` to overwrite"));
-    process.exit(1);
+    return exitAfterFlush(1);
   }
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(USER_CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n");
-  console.log(`${ok("✓")} wrote ${USER_CONFIG_PATH}`);
+  mkdirSync(dirname(userConfigPath), { recursive: true });
+  writeFileSync(userConfigPath, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n");
+  console.log(`${ok("✓")} wrote ${userConfigPath}`);
   console.log(dim("\nNext:"));
   console.log(dim("  1. brushrouter doctor            # see what's connected"));
   console.log(dim("  2. brushrouter gen \"a cat\"       # generate"));
@@ -1141,25 +1351,101 @@ function applyFreePlanRouting(plan) {
   return "ChatGPT plan 'free' detected → gptweb2api route enabled for auto-routing (the web image bucket works on free plans, ~2-3 images/day)";
 }
 
+// ---------------------------------------------------------------------------
+// Interactive prompt.
+//
+// Uses readline so line editing works, BUT every exit path must close the
+// interface and pause stdin: an open readline interface holds a `data` listener
+// on stdin, which holds a ref on the event loop, so `setup` printed
+// "brushrouter is ready!" and then never exited (a scripted-pty run found the
+// process still alive 16 s later). `rl.pause()` alone is not enough — the
+// interface itself must be closed.
+//
+// Ctrl-C at a hidden prompt is its own hazard: the process dies while the tty
+// is still in raw mode, which leaves the terminal without echo or line
+// discipline. So SIGINT is trapped here, the tty is restored, and only then do
+// we exit.
+// ---------------------------------------------------------------------------
 function prompt(question, { hidden = false } = {}) {
   return new Promise((resolve) => {
     process.stdout.write(question);
     const stdin = process.stdin;
+    const stdout = process.stdout;
     const wasRaw = stdin.isRaw;
-    if (hidden && stdin.isTTY) stdin.setRawMode(true);
+
+    // A hidden answer is read as raw bytes, so no readline interface is created
+    // at all: readline echoes what it reads, and a secret must never hit the
+    // screen. For a visible prompt readline gives line editing for free.
+    const rl = hidden ? null : createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin.isTTY) });
+    if (rl) {
+      rl.setPrompt("");
+      rl.prompt();
+    }
+
+    let settled = false;
     let val = "";
+    if (hidden && stdin.isTTY) stdin.setRawMode(true);
+
+    // Single exit path: restore the tty, drop every listener, close readline,
+    // pause stdin, then resolve. Called from success, abort, and SIGINT.
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      process.removeListener("SIGINT", onSigint);
+      try {
+        if (hidden && stdin.isTTY) stdin.setRawMode(wasRaw);
+      } catch {}
+      try {
+        if (rl) {
+          rl.removeAllListeners();
+          rl.close();
+        }
+      } catch {}
+      // pause() is what stops stdin holding the event loop open once the
+      // interface is gone (closing readline alone leaves the socket ref'd).
+      try {
+        stdin.pause();
+        stdin.removeListener("data", onData);
+      } catch {}
+      resolve(value);
+    };
+
+    // Ctrl-C. In raw mode a tty delivers 0x03 as data (handled in onData); on a
+    // cooked terminal Node raises SIGINT. Both must restore the tty first, so
+    // the shell we return to is not left without echo.
+    const abort = () => {
+      if (settled) return;
+      process.stdout.write("\n");
+      process.removeListener("SIGINT", onSigint);
+      try {
+        if (hidden && stdin.isTTY) stdin.setRawMode(wasRaw);
+      } catch {}
+      try {
+        if (rl) {
+          rl.removeAllListeners();
+          rl.close();
+        }
+      } catch {}
+      try {
+        stdin.pause();
+        stdin.removeListener("data", onData);
+      } catch {}
+      settled = true;
+      // Do NOT resolve: resolving would let the caller run its next prompt
+      // (which re-enters raw mode) before this process finishes dying.
+      return exitAfterFlush(130);
+    };
+
+    const onSigint = () => abort();
+    process.once("SIGINT", onSigint);
+
     const onData = (chunk) => {
       const s = chunk.toString("utf8");
       for (const ch of s) {
+        if (ch === "\u0003") return abort();
         if (ch === "\n" || ch === "\r" || ch === "\u0004") {
-          if (hidden && stdin.isTTY) stdin.setRawMode(wasRaw);
-          stdin.removeListener("data", onData);
           process.stdout.write("\n");
-          return resolve(val.trim());
-        }
-        if (ch === "\u0003") {
-          process.stdout.write("\n");
-          process.exit(130);
+          return finish(val.trim());
         }
         if (ch === "\u007f" || ch === "\b") {
           val = val.slice(0, -1);
@@ -1168,8 +1454,16 @@ function prompt(question, { hidden = false } = {}) {
         val += ch;
       }
     };
-    stdin.resume();
-    stdin.on("data", onData);
+
+    if (hidden) {
+      stdin.resume();
+      stdin.on("data", onData);
+    } else {
+      rl.on("line", (line) => finish(line.trim()));
+      // Ctrl-D / closed stdin: resolve with whatever was typed rather than
+      // hanging forever waiting for a line that will never arrive.
+      rl.on("close", () => finish(val.trim()));
+    }
   });
 }
 
@@ -1183,10 +1477,14 @@ async function cmdSetup(args) {
 
   console.log(paint(C.bold, "brushrouter setup — auto-connect backends & AI agent MCP wiring\n"));
 
-  // Ensure user config directory exists with safe permissions
-  try {
-    mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  } catch {}
+  // Ensure the user config directory exists with safe permissions. Resolved at
+  // use time so BRUSHROUTER_CONFIG_DIR is honoured, and skipped on --dry-run
+  // (creating ~/.config/brushrouter is itself a write).
+  if (!dry) {
+    try {
+      mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
+    } catch {}
+  }
 
   // ---- Phase 1: Probe image generation capability ----
   console.log(paint(C.bold, "1. Checking image generation backends..."));
@@ -1228,53 +1526,54 @@ async function cmdSetup(args) {
       const picked = choice.trim() === "" ? "1" : choice.trim();
 
       if (picked === "1") {
-        console.log(dim("\nOpening browser for ChatGPT OAuth sign-in..."));
-        const { getConfigDir } = await import("../src/config.js");
-        const { runLogin } = await import("../src/oauth.js");
-        try {
-          const { path, plan, accountId } = await runLogin({
-            configDir: getConfigDir(),
-            log: (l) => console.log(dim(l)),
-          });
-          console.log(ok(`\n✓ Logged into ChatGPT (plan: ${plan || "active"}, account: ${accountId})`));
-          console.log(dim(`  Credentials saved to ${path} (mode 0600)`));
-          const freeNote = applyFreePlanRouting(plan);
-          if (freeNote) console.log(ok(`✓ ${freeNote}`));
-          cfg = loadConfig({ cwd });
-          probes = await probeAll(cfg);
-          ready = probes.filter((p) => p.available && p.enabled);
-        } catch (e) {
-          console.log(bad(`\nLogin failed: ${redact(e.message)}`));
-          console.log(dim("You can retry anytime with: brushrouter login"));
-        }
-      } else if (picked === "2") {
-        const key = await prompt("Paste your OpenRouter key (input hidden): ", { hidden: true });
-        if (key) {
+        if (dry) {
+          // --dry-run promises "apply nothing". Phase 2 used to ignore the flag
+          // entirely and run a real OAuth login (writing auth.json), save real
+          // keys and flip real route flags — a dry run that mutated the machine.
+          console.log(warn("\nDry run: would sign in to ChatGPT via browser OAuth"));
+          console.log(dim(`  credentials would be written to ${join(getConfigDir(), "auth.json")} (mode 0600)`));
+        } else {
+          console.log(dim("\nOpening browser for ChatGPT OAuth sign-in..."));
+          // Resolved here, not at module scope: BRUSHROUTER_* may point elsewhere.
+          const { runLogin } = await import("../src/oauth.js");
           try {
-            const path = saveKey("openrouter", key);
-            setRouteEnabled("openrouter", true);
-            console.log(ok(`✓ Saved OpenRouter key to ${path} (mode 0600)`));
-            console.log(ok("✓ openrouter enabled for auto-routing"));
+            const { path, plan, accountId } = await runLogin({
+              configDir: getConfigDir(),
+              log: (l) => console.log(dim(l)),
+            });
+            console.log(ok(`\n✓ Logged into ChatGPT (plan: ${plan || "active"}, account: ${accountId})`));
+            console.log(dim(`  Credentials saved to ${path} (mode 0600)`));
+            const freeNote = applyFreePlanRouting(plan);
+            if (freeNote) console.log(ok(`✓ ${freeNote}`));
             cfg = loadConfig({ cwd });
             probes = await probeAll(cfg);
             ready = probes.filter((p) => p.available && p.enabled);
           } catch (e) {
-            console.log(bad(`Failed to store key: ${redact(e.message)}`));
+            console.log(bad(`\nLogin failed: ${redact(e.message)}`));
+            console.log(dim("You can retry anytime with: brushrouter login"));
           }
         }
-      } else if (picked === "3") {
-        const key = await prompt("Paste your fal.ai key (input hidden): ", { hidden: true });
+      } else if (picked === "2" || picked === "3") {
+        const provider = picked === "2" ? "openrouter" : "fal";
+        const label = picked === "2" ? "OpenRouter" : "fal.ai";
+        const key = await prompt(`Paste your ${label} key (input hidden): `, { hidden: true });
         if (key) {
-          try {
-            const path = saveKey("fal", key);
-            setRouteEnabled("fal", true);
-            console.log(ok(`✓ Saved fal.ai key to ${path} (mode 0600)`));
-            console.log(ok("✓ fal enabled for auto-routing"));
-            cfg = loadConfig({ cwd });
-            probes = await probeAll(cfg);
-            ready = probes.filter((p) => p.available && p.enabled);
-          } catch (e) {
-            console.log(bad(`Failed to store key: ${redact(e.message)}`));
+          if (dry) {
+            console.log(warn(`\nDry run: would save the ${label} key`));
+            console.log(dim(`  key would be written to ${getKeysPath()} (mode 0600)`));
+            console.log(dim(`  route '${provider}' would be enabled for auto-routing`));
+          } else {
+            try {
+              const path = saveKey(provider, key);
+              setRouteEnabled(provider, true);
+              console.log(ok(`✓ Saved ${label} key to ${path} (mode 0600)`));
+              console.log(ok(`✓ ${provider} enabled for auto-routing`));
+              cfg = loadConfig({ cwd });
+              probes = await probeAll(cfg);
+              ready = probes.filter((p) => p.available && p.enabled);
+            } catch (e) {
+              console.log(bad(`Failed to store key: ${redact(e.message)}`));
+            }
           }
         }
       } else {
@@ -1291,7 +1590,10 @@ async function cmdSetup(args) {
   } else {
     console.log(`  ${warn("○")} 'brushrouter' is not currently in your PATH`);
     const inPackage = existsSync(join(cwd, "package.json"));
-    if (inPackage && interactive && !dry) {
+    if (inPackage && dry) {
+      // --dry-run must not spawn npm link, which writes into the global prefix.
+      console.log(dim("  Dry run: would run 'npm link' to add 'brushrouter' and 'br' to your PATH"));
+    } else if (inPackage && interactive && !dry) {
       const wantLink = await prompt("  Run 'npm link' now to make 'brushrouter' available globally? [Y/n] ");
       if (!/^n/i.test(wantLink)) {
         try {
@@ -1398,13 +1700,31 @@ async function cmdSetup(args) {
       const start = Date.now();
       try {
         const { generate } = await import("../src/router.js");
-        const res = await generate(cfg, { prompt: testPrompt, out: testOut });
+        // generate(opts, cfgIn) — the arguments were once swapped here, so the
+        // smoke test threw `Cannot read properties of undefined (reading
+        // 'filter')` from attemptOrder() and blamed the user's setup.
+        // The real return shape is { buffer, meta, provider, attempts }
+        // (see src/router.js generate()); `out` is passed through to the
+        // provider but the CLI writes the file itself, so do that here too.
+        const res = await generate(
+          { prompt: testPrompt, out: testOut, provider: ready[0].id, cwd },
+          cfg,
+        );
+        if (!res || !Buffer.isBuffer(res.buffer) || res.buffer.length === 0) {
+          throw new Error(`${res?.provider || ready[0].id} returned no image data`);
+        }
+        const saved = saveImage(testOut, res.buffer, cwd, { force: true });
         const sec = ((Date.now() - start) / 1000).toFixed(1);
-        const kb = Math.round(res.bytes.length / 1024);
+        const kb = Math.round(res.buffer.length / 1024);
+        const mime = detectImageMime(res.buffer) || "image/png";
         console.log(ok(`✓ done in ${sec}s!`));
-        console.log(ok(`  Saved: ${res.savedPath} (${res.mime}, ${kb} KB)`));
+        console.log(ok(`  Saved: ${saved.savedPath} (${mime}, ${kb} KB via ${res.provider}${res.meta?.model ? `/${res.meta.model}` : ""})`));
       } catch (e) {
         console.log(bad(`failed: ${redact(e.message)}`));
+        if (e.attempts?.length) {
+          console.log(dim(`  attempts: ${e.attempts.map((a) => `${a.provider}=${a.outcome}`).join(" → ")}`));
+        }
+        console.log(dim("  Setup itself is fine — run `brushrouter doctor` to check this provider."));
       }
     }
   }
@@ -1416,28 +1736,47 @@ async function cmdSetup(args) {
   console.log("  Rules:   br rules (sync clean ~60-token guidance into coding tools)");
   console.log("  Update:  br update (keep backends and prompt library current)");
   console.log("  Help:    br doctor | br prompts | br --help\n");
+
+  // Exit explicitly. Every prompt pauses stdin and closes its readline
+  // interface, but on Node a readline interface created with `terminal: true`
+  // still leaves the stdin socket ref'd, so the process sat there after
+  // "brushrouter is ready!". Flushing first also keeps a piped `setup` from
+  // truncating.
+  return exitAfterFlush(0);
 }
 
 async function main() {
   const argv = process.argv.slice(2);
-  // If the first token is a flag (e.g. `brushrouter --help` or `-h`), treat the
-  // whole argv as options rather than mistaking the flag for a command name.
-  const firstIsFlag = argv[0]?.startsWith("-");
-  const command = firstIsFlag ? null : argv[0];
-  const rest = firstIsFlag ? argv : argv.slice(1);
+  // A leading flag must not swallow the command. `brushrouter --json providers`
+  // used to treat the ENTIRE argv as options, so `command` was null and the
+  // process printed help and exited 0 — a successful-looking no-op. Walk past
+  // leading flags (and the value of a flag that takes one) to find the command
+  // token, then hand parseArgs the remaining flags plus that token, so it still
+  // sees `--json` exactly once.
+  const command = firstPositional(argv);
+  // Everything that is a flag, plus the command token itself: parseArgs keeps
+  // positionals, so the command survives for the subcommand to ignore.
+  const rest = command.index === -1 ? argv : argv.filter((_, i) => i !== command.index);
   const args = parse(rest);
-
-  if (args.values.version || command === "version" || (!command && (args.values.version || rest[0] === "-V"))) {
-    console.log(`brushrouter v${PKG.version}`);
-    process.exit(0);
+  if (args.error) {
+    // Print+flush rather than exiting from parse(): a usage message on a pipe
+    // must not be truncated by process.exit().
+    console.error(bad(`error: ${args.error}`));
+    console.error(dim("run `brushrouter --help` for usage"));
+    return exitAfterFlush(2);
   }
 
-  if (!command || command === "help" || args.values.help) {
+  if (args.values.version || command.token === "version") {
+    console.log(`brushrouter v${PKG.version}`);
+    return exitAfterFlush(0);
+  }
+
+  if (!command.token || command.token === "help" || args.values.help) {
     console.log(help());
-    process.exit(0);
+    return exitAfterFlush(0);
   }
   try {
-  switch (command) {
+  switch (command.token) {
     case "generate":
     case "gen":
       await cmdGenerate(args);
@@ -1473,7 +1812,7 @@ async function main() {
       } catch (e) {
         console.error(`vendor failed: ${redact(e.message)}`);
         console.error(dim("release assets preferred when upstream cuts them; otherwise building needs: git + Go ≥1.24 on PATH"));
-        process.exit(1);
+        return exitAfterFlush(1);
       }
       return;
     }
@@ -1486,8 +1825,10 @@ async function main() {
         console.log(`credentials: ${path}`);
         console.log(`try: brushrouter gen "test" --provider codex -o /tmp/t.png`);
       } catch (e) {
-        console.error(`login failed: ${e.message}`);
-        process.exit(1);
+        // OAuth failures quote request/response bodies, which can carry a token
+        // or client secret — every sibling branch redacts, and this one did not.
+        console.error(bad(`login failed: ${redact(e.message)}`));
+        return exitAfterFlush(1);
       }
       return;
     }
@@ -1512,7 +1853,7 @@ async function main() {
     default:
       console.error(bad(`unknown command: ${command}`));
       console.error(dim("run `brushrouter --help` for usage"));
-      process.exit(2);
+      return exitAfterFlush(2);
   }
   } finally {
     // The gptweb2api sidecar's open pipes pin the event loop; stop it once the
@@ -1526,5 +1867,5 @@ main().catch((e) => {
   // without a stack, the same way an invalid flag is reported.
   const detail = e.code === "BAD_CONFIG" ? e.message : e.stack || e.message;
   console.error(bad(`fatal: ${redact(detail)}`));
-  process.exit(1);
+  return exitAfterFlush(1);
 });

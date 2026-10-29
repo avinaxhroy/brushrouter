@@ -52,7 +52,13 @@ function whichSync(bin) {
     }
     if (result) break;
   }
-  whichCache.set(cacheKey, result);
+  // Only successes are cached. A miss is a statement about the filesystem at one
+  // instant, and the filesystem changes under us: `setup` checks isOnPath,
+  // runs `npm link`, then checks again with the same PATH — caching the null
+  // made the second check return the pre-install answer, so setup reported a
+  // failed install of a link that had just succeeded. Hits are stable (a path
+  // does not move), and miss cost is one stat per PATH entry.
+  if (result) whichCache.set(cacheKey, result);
   return result;
 }
 
@@ -183,11 +189,28 @@ function runtimeCacheCodexCandidates() {
 //
 // Discovery walks the filesystem and spawns `<cli> --version`, and both the
 // provider probe and generate ask the same question in the same process — so
-// the answer is memoized. The key includes the inputs that can change it
-// (an explicit override, and the two env vars read below); nothing else about
-// a running process can make a Codex install appear or move.
+// the answer is memoized. The key must cover *every* input that can change the
+// answer, or a login, a PATH edit or a `cd` keeps serving a stale miss. The old
+// key held only the explicit override and two env vars, and the search also
+// reads PATH, APPDATA/LOCALAPPDATA/PROGRAMFILES, XDG_CACHE_HOME, npm's prefix
+// vars, homedir and cwd.
 export function findCodexCli({ explicit = null } = {}) {
-  const key = `${explicit || ""}\u0000${process.env.BRUSHROUTER_CODEX_CLI || ""}\u0000${process.env.BRUSHROUTER_APP_DIRS || ""}`;
+  const key = [
+    explicit || "",
+    process.env.BRUSHROUTER_CODEX_CLI || "",
+    process.env.BRUSHROUTER_APP_DIRS || "",
+    process.env.PATH || "",
+    process.env.PATHEXT || "",
+    process.env.APPDATA || "",
+    process.env.LOCALAPPDATA || "",
+    process.env.PROGRAMFILES || "",
+    process.env.XDG_CACHE_HOME || "",
+    process.env.npm_config_prefix || "",
+    process.env.NPM_CONFIG_PREFIX || "",
+    homedir(),
+    process.cwd(),
+    process.platform,
+  ].join("\u0000");
   if (!codexCache.has(key)) codexCache.set(key, discoverCodexCli(explicit));
   return codexCache.get(key);
 }

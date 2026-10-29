@@ -64,8 +64,10 @@ Every provider implements:
 
 `generate()` in `src/router.js`:
 
-- **Explicit** (`--provider X`): attempt only `X` — or `X` first, then the rest of `priority`, when `--fallback` is given.
+- **Explicit** (`--provider X`): attempt only `X` — or `X` first, then the rest of `priority`, when `--fallback` is given. If `X` is `enabled: false` this is refused with `PROVIDER_DISABLED`; `--fallback` does not bypass the check.
 - **Auto**: walk `cfg.priority`, skip providers that are `enabled: false` or fail `probe()`, try each until one succeeds.
+
+`enabled: false` is a capability switch, not a preference. It is the only thing standing between an agent that holds a key and a route that bills per request, so it is enforced in `attemptOrder()` *and* `batchGenerate()` — naming a disabled route explicitly is a hard error, and turning it on requires `brushrouter routes enable <id>` (a persisted, deliberate change) rather than a flag any caller can append.
 
 Every attempt is recorded, so the CLI and the MCP response can both report the full trail (`codex-cli=failed → codex=failed → gemini=ok`).
 
