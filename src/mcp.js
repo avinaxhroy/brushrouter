@@ -688,65 +688,63 @@ async function runBatchGenerate(args, ctx, onProgress) {
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
       onProgress,
+      onItemDone: (r) => {
+        tryRecordHistory(
+          {
+            source: "mcp",
+            ok: true,
+            prompt: r.item.prompt,
+            provider: r.provider,
+            requestedProvider: r.item.provider || args.provider || null,
+            model: r.meta?.model || null,
+            requestedModel: r.item.model || null,
+            size: r.item.size || null,
+            actualSize: r.actualSize || null,
+            quality: r.item.quality || null,
+            background: r.item.background || null,
+            seed: r.meta?.seed ?? r.item.seed ?? null,
+            images: r.item.images || [],
+            imagesUsed: r.meta?.imagesUsed,
+            out: r.savedPath,
+            bytes: r.bytes ?? null,
+            mime: r.mime || null,
+            durationMs: r.durationMs ?? null,
+            attempts: r.attempts || [],
+            usage: r.meta?.usage || null,
+            costUsd: r.meta?.costUsd,
+            batchId,
+          },
+          { cfg, cwd },
+        );
+      },
+      onItemFail: (r) => {
+        tryRecordHistory(
+          {
+            source: "mcp",
+            ok: false,
+            prompt: r.item.prompt,
+            provider: r.item.provider || args.provider || null,
+            requestedProvider: r.item.provider || args.provider || null,
+            model: r.item.model || null,
+            requestedModel: r.item.model || null,
+            size: r.item.size || null,
+            quality: r.item.quality || null,
+            background: r.item.background || null,
+            seed: r.item.seed ?? null,
+            images: r.item.images || [],
+            out: r.item.out || null,
+            durationMs: r.durationMs ?? null,
+            attempts: r.attempts || [],
+            batchId,
+            error: redact(r.error),
+            errorCode: r.code || null,
+          },
+          { cfg, cwd },
+        );
+      },
     },
     cfg,
   );
-
-  for (const r of batchRes.results) {
-    if (r.ok) {
-      tryRecordHistory(
-        {
-          source: "mcp",
-          ok: true,
-          prompt: r.item.prompt,
-          provider: r.provider,
-          requestedProvider: r.item.provider || args.provider || null,
-          model: r.meta?.model || null,
-          requestedModel: r.item.model || null,
-          size: r.item.size || null,
-          actualSize: r.actualSize || null,
-          quality: r.item.quality || null,
-          background: r.item.background || null,
-          seed: r.meta?.seed ?? r.item.seed ?? null,
-          images: r.item.images || [],
-          imagesUsed: r.meta?.imagesUsed,
-          out: r.savedPath,
-          bytes: r.bytes ?? null,
-          mime: r.mime || null,
-          durationMs: r.durationMs ?? null,
-          attempts: r.attempts || [],
-          usage: r.meta?.usage || null,
-          costUsd: r.meta?.costUsd,
-          batchId,
-        },
-        { cfg, cwd },
-      );
-    } else {
-      tryRecordHistory(
-        {
-          source: "mcp",
-          ok: false,
-          prompt: r.item.prompt,
-          provider: r.item.provider || args.provider || null,
-          requestedProvider: r.item.provider || args.provider || null,
-          model: r.item.model || null,
-          requestedModel: r.item.model || null,
-          size: r.item.size || null,
-          quality: r.item.quality || null,
-          background: r.item.background || null,
-          seed: r.item.seed ?? null,
-          images: r.item.images || [],
-          out: r.item.out || null,
-          durationMs: r.durationMs ?? null,
-          attempts: r.attempts || [],
-          batchId,
-          error: redact(r.error),
-          errorCode: r.code || null,
-        },
-        { cfg, cwd },
-      );
-    }
-  }
 
   const completedResults = batchRes.results.filter((r) => r.ok);
   const blocks = shouldEmbed
