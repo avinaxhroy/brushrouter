@@ -190,10 +190,13 @@ export const DEFAULT_CONFIG = {
   },
 };
 
+const UNSAFE_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function deepMerge(base, override) {
   if (!override || typeof override !== "object") return base;
   const out = Array.isArray(base) ? [...base] : { ...base };
   for (const [k, v] of Object.entries(override)) {
+    if (UNSAFE_MERGE_KEYS.has(k)) continue;
     if (v && typeof v === "object" && !Array.isArray(v) && base?.[k] && typeof base[k] === "object" && !Array.isArray(base[k])) {
       out[k] = deepMerge(base[k], v);
     } else {

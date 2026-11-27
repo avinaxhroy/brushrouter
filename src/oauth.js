@@ -2,7 +2,7 @@
 // Reuses the codex CLI's public OAuth registration (client_id app_EMoamEEZ…,
 // localhost:1455 callback, PKCE) so the resulting tokens live in the codex
 // auth shape and the codex route's refresh flow already knows how to use them.
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { mkdir, writeFile, chmod } from "node:fs/promises";
@@ -51,6 +51,13 @@ export function credentialFromTokenResponse(tokens) {
   };
 }
 
+function safeStringEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ba = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
 // Waits for the browser to come back to localhost:1455/auth/callback.
 // Exported for tests: the callback contract (reject on ?error=, never render a
 // success page for a bad state, close the server on every path) is the bug-prone
@@ -94,7 +101,7 @@ function startCallbackServer(state, timeoutMs = 5 * 60_000) {
     // Check EVERYTHING before rendering anything: the state comparison used to
     // happen after the success page was written, so a forged callback with a
     // wrong state still told the user "sign-in complete".
-    const stateOk = url.searchParams.get("state") === state;
+    const stateOk = safeStringEqual(url.searchParams.get("state"), state);
     const code = url.searchParams.get("code");
     // ?error=... is the provider refusing the grant. It must REJECT here: it
     // used to resolve with { code: null }, and the caller then POSTed
@@ -152,12 +159,21 @@ function escapeHtml(s) {
 }
 
 function defaultOpen(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return;
+  const safeUrl = parsed.toString();
   if (process.platform === "win32") {
-    execFile("cmd", ["/c", "start", "", url], () => {});
+    // Avoid cmd.exe (`&` in OAuth query strings is a command separator in cmd).
+    execFile("rundll32.exe", ["url.dll,FileProtocolHandler", safeUrl], () => {});
   } else if (process.platform === "darwin") {
-    execFile("open", [url], () => {});
+    execFile("open", [safeUrl], () => {});
   } else {
-    execFile("xdg-open", [url], () => {});
+    execFile("xdg-open", [safeUrl], () => {});
   }
 }
 

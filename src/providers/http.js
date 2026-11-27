@@ -4,10 +4,12 @@
 // pull the image out of the response. A tiny response-path resolver keeps this
 // generic, so the same code also serves the user's "custom HTTP API" provider.
 
-import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl, detectImageMime } from "../util/common.js";
+import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl, detectImageMime, RESPONSE_SETTLED } from "../util/common.js";
 import { discoverKey } from "../util/keys.js";
 import { registerSecret } from "../util/redact.js";
 import { readFileSync } from "node:fs";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 
 function resolveKey(cfg, provider) {
   // A key supplied directly in config must also be registered with the
@@ -18,9 +20,10 @@ function resolveKey(cfg, provider) {
 
 export function resolvePath(obj, path) {
   // Supports "data.0.url" and "images.0.b64_json" style paths.
+  // Own properties only so a response path cannot walk prototype chains.
   return String(path)
     .split(".")
-    .reduce((acc, key) => (acc == null ? acc : acc[key]), obj);
+    .reduce((acc, key) => (acc != null && typeof acc === "object" && Object.hasOwn(acc, key) ? acc[key] : undefined), obj);
 }
 
 // Body templates are JSON, so a raw prompt with quotes/backslashes/newlines
@@ -63,10 +66,105 @@ function assertImageBytes(buffer, { provider, value, locator }) {
   throw e;
 }
 
-async function fetchImageToBuffer(url, headers) {
-  const res = await fetchWithTimeout(url, { headers }, 120000);
-  if (!res.ok) throw new Error(`image download failed: ${res.status}`);
-  return readBodyCapped(res);
+function isPrivateOrLocalHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  // IPv4 literal
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    return false;
+  }
+  // IPv6 literal
+  if (host.includes(":")) {
+    if (host === "::1" || host === "::" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) return true;
+    // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1 or ::ffff:7f00:1)
+    const mapped = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (mapped) return isPrivateOrLocalHost(mapped[1]);
+    if (host.startsWith("::ffff:")) return true;
+  }
+  return false;
+}
+
+export function assertSafeImageDownloadUrl(rawUrl, { allowedOrigins = [] } = {}) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    const e = new Error(`refusing invalid image download URL: ${String(rawUrl).slice(0, 120)}`);
+    e.code = "UNSAFE_URL";
+    throw e;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    const e = new Error(`refusing non-HTTP(S) image download URL (${parsed.protocol})`);
+    e.code = "UNSAFE_URL";
+    throw e;
+  }
+  if (allowedOrigins.includes(parsed.origin)) return parsed.toString();
+  if (isPrivateOrLocalHost(parsed.hostname)) {
+    const e = new Error(`refusing image download from private or loopback host "${parsed.hostname}"`);
+    e.code = "UNSAFE_URL";
+    throw e;
+  }
+  return parsed.toString();
+}
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+async function assertSafeImageDownloadTarget(rawUrl, { allowedOrigins = [] } = {}) {
+  const safeUrl = assertSafeImageDownloadUrl(rawUrl, { allowedOrigins });
+  const parsed = new URL(safeUrl);
+  if (allowedOrigins.includes(parsed.origin)) return safeUrl;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return safeUrl;
+  let records;
+  try {
+    records = await dnsLookup(host, { all: true });
+  } catch (e) {
+    // Allow unresolvable synthetic hostnames (e.g. unit-test mocks) to fall
+    // through to fetch(), which will fail on real networks anyway.
+    if (e?.code === "ENOTFOUND" || e?.code === "EAI_AGAIN") return safeUrl;
+    throw e;
+  }
+  for (const rec of records || []) {
+    if (isPrivateOrLocalHost(rec.address)) {
+      const e = new Error(`refusing image download: host "${host}" resolves to private or loopback address "${rec.address}"`);
+      e.code = "UNSAFE_URL";
+      throw e;
+    }
+  }
+  return safeUrl;
+}
+
+async function fetchImageToBuffer(url, headers, { allowedOrigins = [] } = {}) {
+  let current = await assertSafeImageDownloadTarget(url, { allowedOrigins });
+  const maxRedirects = 5;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const res = await fetchWithTimeout(current, { headers, redirect: "manual" }, 120000);
+    if (res.status >= 300 && res.status < 400) {
+      res[RESPONSE_SETTLED]?.();
+      const loc = res.headers?.get?.("location");
+      if (!loc) throw new Error(`image download redirect (${res.status}) had no Location header`);
+      if (hop === maxRedirects) throw new Error("image download exceeded maximum redirects");
+      current = await assertSafeImageDownloadTarget(new URL(loc, current).toString(), { allowedOrigins });
+      continue;
+    }
+    if (!res.ok) throw new Error(`image download failed: ${res.status}`);
+    return readBodyCapped(res);
+  }
+  throw new Error("image download failed");
 }
 
 // Shared implementation for any "POST json -> get url|b64|raw" image API.
@@ -173,9 +271,10 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
   if (value.startsWith("data:")) {
     const commaIdx = value.indexOf(",");
     buffer = Buffer.from(commaIdx >= 0 ? value.slice(commaIdx + 1) : value, "base64");
-  } else if (value.startsWith("http")) {
+  } else if (/^https?:\/\//i.test(value)) {
     sourceUrl = value;
-    buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" });
+    const epOrigin = originOf(applyUrlTemplate(cfg?.url || url, vars));
+    buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" }, { allowedOrigins: epOrigin ? [epOrigin] : [] });
   } else {
     // assume base64 payload
     buffer = Buffer.from(value, "base64");
@@ -286,9 +385,10 @@ export async function openrouterImagesGenerate({ prompt, size, quality, images =
   if (value.startsWith("data:")) {
     const commaIdx = value.indexOf(",");
     buffer = Buffer.from(commaIdx >= 0 ? value.slice(commaIdx + 1) : value, "base64");
-  } else if (value.startsWith("http")) {
+  } else if (/^https?:\/\//i.test(value)) {
     sourceUrl = value;
-    buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" });
+    const epOrigin = originOf(base);
+    buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" }, { allowedOrigins: epOrigin ? [epOrigin] : [] });
   } else buffer = Buffer.from(value, "base64");
   assertImageBytes(buffer, { provider: "OpenRouter /images", value, locator: "data[0]" });
   // imagesUsed reports what was actually sent (input_references went out above),
