@@ -1113,14 +1113,15 @@ test("findCodexCli discovers bundled CLI in desktop ChatGPT app", async () => {
 
 test("batchItemPath formats slug and padding correctly", async () => {
   const { batchItemPath } = await import("../src/util/common.js");
-  const p1 = batchItemPath("/tmp/out", 1, 10, "A Red Fox in the Snow!");
-  assert.equal(p1, "/tmp/out/01-a-red-fox-in-the-snow.png");
+  const outDir = resolve("/tmp/out");
+  const p1 = batchItemPath(outDir, 1, 10, "A Red Fox in the Snow!");
+  assert.equal(p1, resolve(outDir, "01-a-red-fox-in-the-snow.png"));
 
-  const p2 = batchItemPath("/tmp/out", 12, 100, "Isometric Coffee Shop");
-  assert.equal(p2, "/tmp/out/012-isometric-coffee-shop.png");
+  const p2 = batchItemPath(outDir, 12, 100, "Isometric Coffee Shop");
+  assert.equal(p2, resolve(outDir, "012-isometric-coffee-shop.png"));
 
-  const p3 = batchItemPath("/tmp/out", 1, 5, "");
-  assert.equal(p3, "/tmp/out/01-image.png");
+  const p3 = batchItemPath(outDir, 1, 5, "");
+  assert.equal(p3, resolve(outDir, "01-image.png"));
 });
 
 test("batchVariantPath suffixes index before extension", async () => {

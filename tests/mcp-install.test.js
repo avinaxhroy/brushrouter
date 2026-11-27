@@ -41,8 +41,8 @@ test("safeParseJsonc handles invalid JSON without crashing", () => {
 });
 
 test("getKnownAgentConfigs includes standard agents and extra from env", () => {
-  const custom1 = join(tmpdir(), "custom1.json");
-  const custom2 = join(tmpdir(), "custom2.json");
+  const custom1 = "/tmp/custom1.json";
+  const custom2 = "/tmp/custom2.json";
   const env = { BRUSHROUTER_MCP_CONFIGS: `${custom1}:${custom2}` };
   const configs = getKnownAgentConfigs({ env, os: "darwin" });
   const names = configs.map((c) => c.name);
