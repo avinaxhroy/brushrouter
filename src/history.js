@@ -461,15 +461,24 @@ export function buildReplayRequest(entry, overrides = {}) {
         ? [...entry.images]
         : [];
 
+  // On a succeeded generation (including fallback), replay targets the provider/model
+  // that actually produced the image rather than a failed requestedProvider.
+  const entryProvider = entry.ok
+    ? entry.provider || entry.requestedProvider || undefined
+    : entry.requestedProvider || entry.provider || undefined;
+  const entryModel = entry.ok
+    ? entry.model || entry.requestedModel || undefined
+    : entry.requestedModel || entry.model || undefined;
+
   const provider = overrides.provider !== undefined
     ? overrides.provider || undefined
-    : entry.requestedProvider || entry.provider || undefined;
+    : entryProvider;
 
   const model = overrides.model !== undefined
     ? overrides.model || undefined
-    : overrides.provider && overrides.provider !== entry.provider
+    : overrides.provider && overrides.provider !== entryProvider
       ? undefined
-      : entry.requestedModel || entry.model || undefined;
+      : entryModel;
 
   return {
     prompt,
