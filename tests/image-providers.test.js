@@ -78,6 +78,26 @@ test("OpenAI Images selects generation JSON or edits multipart with ordered refe
   assert.equal(calls, 2);
 });
 
+test("OpenAI Images preserves valid custom dimensions and maps unsupported sizes for each model", async (t) => {
+  const sizes = [];
+  mockFetch(t, async (_url, init) => {
+    sizes.push(JSON.parse(init.body).size);
+    return Response.json({ data: [{ b64_json: b64 }] });
+  });
+  const provider = PROVIDERS.openai;
+  await provider.generate({ prompt: "draw", size: "1536x864" }, { apiKey });
+  await provider.generate({ prompt: "draw" }, { apiKey, size: "1000x577" });
+  await provider.generate({ prompt: "draw", size: "1536x864", model: "gpt-image-1.5" }, { apiKey });
+  await provider.generate({ prompt: "draw", size: "auto" }, { apiKey });
+  assert.equal(sizes[0], "1536x864");
+  const [w, h] = sizes[1].split("x").map(Number);
+  assert.equal(w % 16 + h % 16, 0);
+  assert.ok(w * h >= 655360 && w * h <= 8294400);
+  assert.ok(Math.abs(w - 1000) < 100 && Math.abs(h - 577) < 100);
+  assert.equal(sizes[2], "1536x1024");
+  assert.equal(sizes[3], "auto");
+});
+
 test("AI Studio discovers Google keys and sends inline reference data without putting credentials in URLs", async (t) => {
   const request = fixture(t);
   const old = Object.fromEntries(["BRUSHROUTER_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"].map((key) => [key, process.env[key]]));
