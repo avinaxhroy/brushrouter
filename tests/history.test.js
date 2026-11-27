@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -669,4 +669,111 @@ test("parseSince parses relative durations and ISO dates, rejecting garbage", ()
   assert.equal(parseSince("2w", now), now - 14 * 86400_000);
   assert.equal(parseSince("2026-06-01T00:00:00Z", now), Date.UTC(2026, 5, 1, 0, 0, 0));
   assert.throws(() => parseSince("not-a-date", now), /invalid --since/);
+});
+
+test("review fixes: terminal sanitization, configured pricing on subscription, fallback replay, relative images, provider-filtered stats, and omitted {seed} template", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-rev-"));
+  const histPath = join(dir, "history.jsonl");
+  try {
+    // 1. Terminal escape sequences are stripped in list & detail rendering
+    const dirty = recordHistory(
+      {
+        ok: false,
+        prompt: "hello \x1b]0;pwned\x07\x1b[31mworld\x1b[0m",
+        provider: "fal",
+        error: "boom \x1b[2J\x1b[H\r\nfake",
+        attempts: [{ provider: "fal", outcome: "failed", reason: "err \x1b[31mred\x1b[0m" }],
+      },
+      { path: histPath },
+    );
+    const listText = renderHistoryList(listHistory({ path: histPath }));
+    const detailText = renderHistoryDetail(dirty);
+    assert.ok(!listText.includes("\x1b"), "list output should not contain ESC");
+    assert.ok(!detailText.includes("\x1b"), "detail output should not contain ESC");
+    assert.ok(detailText.includes("hello world"));
+
+    // 2. Configured pricing overrides subscription $0 default
+    const subConfigured = estimateCost({ provider: "codex", pricing: { codex: 0.02 } });
+    assert.equal(subConfigured.costUsd, 0.02);
+    assert.equal(subConfigured.costSource, "configured");
+
+    // 3. Fallback replay targets the winning provider/model, not the failed requested one
+    const fbEntry = recordHistory(
+      {
+        ok: true,
+        prompt: "mountain sunrise",
+        provider: "openrouter",
+        requestedProvider: "codex",
+        model: "google/gemini-3.1-flash-image",
+        requestedModel: "gpt-image-1",
+        costUsd: 0.039,
+        attempts: [
+          { provider: "codex", outcome: "failed", code: "RATE_LIMIT", durationMs: 200 },
+          { provider: "openrouter", outcome: "ok", model: "google/gemini-3.1-flash-image", durationMs: 900 },
+        ],
+      },
+      { path: histPath },
+    );
+    const replayReq = buildReplayRequest(fbEntry);
+    assert.equal(replayReq.provider, "openrouter");
+    assert.equal(replayReq.model, "google/gemini-3.1-flash-image");
+
+    // 4. Relative reference image paths are resolved against cwd when recorded
+    const imgRec = recordHistory(
+      { ok: true, prompt: "edit ref", provider: "fal", images: ["refs/a.png", "/abs/b.png"] },
+      { path: histPath, cwd: "/tmp/proj" },
+    );
+    assert.deepEqual(imgRec.images, ["/tmp/proj/refs/a.png", "/abs/b.png"]);
+
+    // 5. Provider-filtered stats do not count another provider's spend/results
+    const codexStats = computeStats({ provider: "codex" }, { path: histPath });
+    assert.equal(codexStats.summary.total, 0);
+    assert.equal(codexStats.summary.spend.totalUsd, 0);
+    assert.equal(codexStats.providers.length, 1);
+    assert.equal(codexStats.providers[0].provider, "codex");
+    assert.equal(codexStats.providers[0].attempts, 1);
+    assert.equal(codexStats.providers[0].attemptFailed, 1);
+
+    // 6. Custom HTTP unquoted {seed} placeholder serializes as JSON null when omitted
+    const prevFetch = globalThis.fetch;
+    let rawBody = null;
+    globalThis.fetch = async (_url, opts) => {
+      rawBody = opts.body;
+      const payload = { images: [{ url: `data:image/png;base64,${TINY_PNG.toString("base64")}` }] };
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async json() { return payload; },
+        async text() { return JSON.stringify(payload); },
+      };
+    };
+    try {
+      await httpImageGenerate(
+        { prompt: "seedless cat" },
+        { apiKey: "test-key" },
+        {
+          name: "custom",
+          url: "https://example.com/gen",
+          headers: {},
+          body: '{"prompt":"{prompt}","seed":{seed}}',
+          responsePath: "images.0.url",
+        },
+      );
+      assert.deepEqual(JSON.parse(rawBody), { prompt: "seedless cat", seed: null });
+    } finally {
+      globalThis.fetch = prevFetch;
+    }
+
+    // 7. CLI batch validates --seed
+    const badBatchSeed = spawnSync(
+      process.execPath,
+      [BIN, "batch", "a fox", "a bird", "--seed", "nope", "--dry-run"],
+      { encoding: "utf8", env: { ...process.env, BRUSHROUTER_HISTORY_PATH: histPath } },
+    );
+    assert.equal(badBatchSeed.status, 2);
+    assert.match(badBatchSeed.stderr, /--seed expects an integer/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
