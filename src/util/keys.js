@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 // BRUSHROUTER_KEYS_PATH may be set after module load, and a snapshot taken at
 // import time would then write a key store the rest of the process never reads.
 import { getConfigDir, getKeysPath } from "../config.js";
-import { registerSecret } from "./redact.js";
+import { registerSecret, safeParseMessage } from "./redact.js";
 
 // Auth stores that other agent runtimes already maintain. These are
 // product-standard locations (derived from HOME / XDG), not personal paths, so
@@ -158,12 +158,13 @@ export function saveKey(provider, key) {
       // the user. Move the damaged file aside first, so the old contents are
       // recoverable and `setup` can still finish.
       const backup = `${keysPath}.corrupt-${Date.now()}`;
+      const parseMsg = safeParseMessage(e);
       try {
         renameSync(keysPath, backup);
       } catch (renameErr) {
         // Could not preserve it — refuse to write rather than lose it silently.
         const err = new Error(
-          `cannot read ${keysPath} (${e.message}) and cannot move it aside (${renameErr.message}); ` +
+          `cannot read ${keysPath} (${parseMsg}) and cannot move it aside (${renameErr.message}); ` +
             `refusing to overwrite it. Fix or remove the file, then retry.`,
         );
         err.code = "KEYS_CORRUPT";
@@ -171,7 +172,7 @@ export function saveKey(provider, key) {
       }
       if (!data || typeof data !== "object") data = {};
       process.stderr.write(
-        `brushrouter: warning: ${keysPath} was not valid JSON (${e.message}); ` +
+        `brushrouter: warning: ${keysPath} was not valid JSON (${parseMsg}); ` +
           `moved it to ${backup} and continued with an empty key store. ` +
           `Keys in the old file are not active — re-add them or restore that backup.\n`,
       );

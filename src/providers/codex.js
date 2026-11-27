@@ -16,7 +16,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { fetchWithTimeout, sseData, jwtExpiryMs, jwtClientId, readImageAsDataUrl, normalizeSize } from "../util/common.js";
+import { fetchWithTimeout, sseData, jwtExpiryMs, jwtClientId, readImageAsDataUrl, normalizeSize, RESPONSE_SETTLED } from "../util/common.js";
 import { registerSecret, safeParseMessage } from "../util/redact.js";
 
 const CODEX_RESPONSES_ENDPOINT = process.env.BRUSHROUTER_CODEX_ENDPOINT || "https://chatgpt.com/backend-api/codex/responses";
@@ -150,6 +150,7 @@ function normalizeAuth(raw, filePath) {
     return {
       filePath,
       format: "opencode",
+      providerKey: "openai",
       access: o.access,
       refresh: o.refresh || null,
       accountId: o.accountId || null,
@@ -158,12 +159,17 @@ function normalizeAuth(raw, filePath) {
     };
   }
   // pi / omp (oh-my-pi) logins: any oauth entry in their per-provider auth.json
-  const m = raw.openai ?? Object.values(raw).find((v) => v?.type === "oauth" && typeof v.access === "string");
+  const entry = raw.openai
+    ? ["openai", raw.openai]
+    : Object.entries(raw).find(([, v]) => v?.type === "oauth" && typeof v.access === "string");
+  const providerKey = entry?.[0] || null;
+  const m = entry?.[1];
   if (m?.type === "oauth" && m.access) {
     const claim = openaiJwtClaim(m.access);
     return {
       filePath,
       format: raw.openai ? "opencode" : "pi",
+      providerKey,
       access: m.access,
       refresh: m.refresh || null,
       accountId: m.accountId || claim?.account_id || null,
@@ -236,8 +242,12 @@ function persistAuth(auth, newAccess, newRefresh) {
     if (newRefresh) raw.tokens.refresh_token = newRefresh;
     raw.last_refresh = new Date().toISOString();
   } else {
-    raw.openai.access = newAccess;
-    if (newRefresh) raw.openai.refresh = newRefresh;
+    const target = raw[auth.providerKey || "openai"];
+    if (!target || typeof target !== "object") {
+      throw new Error(`cannot persist the refreshed token to ${auth.filePath}: missing ${auth.providerKey || "openai"} entry`);
+    }
+    target.access = newAccess;
+    if (newRefresh) target.refresh = newRefresh;
   }
   writeFileSync(auth.filePath, JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
   // A refreshed token is a new secret the redactor has never seen.
@@ -378,27 +388,31 @@ async function callCodex(auth, { prompt, size, quality, model, images, backgroun
     }
     throw new Error(`codex responses request failed: ${res.status} ${detail.slice(0, 500)}`);
   }
-  for await (const data of sseData(res.body)) {
-    if (data === "[DONE]") continue;
-    let json;
-    try {
-      json = JSON.parse(data);
-    } catch {
-      continue;
+  try {
+    for await (const data of sseData(res.body)) {
+      if (data === "[DONE]") continue;
+      let json;
+      try {
+        json = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (json.type === "error" || json.error) {
+        throw new Error(`OpenAI API error: ${json.error?.message || json.message || JSON.stringify(json.error || json)}`);
+      }
+      if (json.type === "response.failed") {
+        const m = json.response?.error?.message || json.response?.status_details?.error?.message || "generation response failed";
+        throw new Error(`OpenAI response failed: ${m}`);
+      }
+      if (json.type === "response.created" || json.type === "response.output_item.added") {
+        onProgress?.("generating with Codex...", 40);
+      }
+      if (json.type === "response.output_item.done" && json.item?.type === "image_generation_call" && typeof json.item.result === "string" && json.item.result.length) {
+        return Buffer.from(json.item.result, "base64");
+      }
     }
-    if (json.type === "error" || json.error) {
-      throw new Error(`OpenAI API error: ${json.error?.message || json.message || JSON.stringify(json.error || json)}`);
-    }
-    if (json.type === "response.failed") {
-      const m = json.response?.error?.message || json.response?.status_details?.error?.message || "generation response failed";
-      throw new Error(`OpenAI response failed: ${m}`);
-    }
-    if (json.type === "response.created" || json.type === "response.output_item.added") {
-      onProgress?.("generating with Codex...", 40);
-    }
-    if (json.type === "response.output_item.done" && json.item?.type === "image_generation_call" && typeof json.item.result === "string" && json.item.result.length) {
-      return Buffer.from(json.item.result, "base64");
-    }
+  } finally {
+    res[RESPONSE_SETTLED]?.();
   }
   throw new Error("no image_generation result returned by codex backend");
 }
@@ -457,19 +471,29 @@ export const codexProvider = {
     // quota). The orchestrator route below stays as the fallback for accounts or
     // regions where they misbehave; opt out with providers.codex.endpoint="responses".
     if (cfg?.endpoint !== "responses") {
+      for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            const buf = await callCodexImagesDirect(auth, { prompt, size, quality, background, images }, cfg, cwd, onProgress);
-            return { buffer: buf, meta: { provider: "codex", model: "gpt-image-2", billing: "subscription", endpoint: "images", authFile: auth.filePath } };
+          const buf = await callCodexImagesDirect(auth, { prompt, size, quality, background, images }, cfg, cwd, onProgress);
+          return { buffer: buf, meta: { provider: "codex", model: "gpt-image-2", billing: "subscription", endpoint: "images", authFile: auth.filePath } };
         } catch (e) {
-            // Auth-class failures (403 plan gating, 401) cannot improve on the
-            // orchestrator route below — it authenticates with the same token. Fall
-            // back only for availability or request-shape problems.
-            if (e.code === "NO_AUTH" || /401|403/.test(e.message)) {
-                throw e;
-            }
-            lastErr = e;
-            onProgress?.(`images endpoint failed (${e.message}); falling back to the orchestrator route...`, 20);
+          if (!refreshed && auth.refresh && /401|unauthorized|invalid_token/i.test(e?.message)) {
+            try {
+              auth = await refreshAuthToken(auth, cfg);
+              refreshed = true;
+              continue;
+            } catch {}
+          }
+          // Auth-class failures (403 plan gating, 401) cannot improve on the
+          // orchestrator route below — it authenticates with the same token. Fall
+          // back only for availability or request-shape problems.
+          if (e.code === "NO_AUTH" || /401|403/.test(e.message)) {
+            throw e;
+          }
+          lastErr = e;
+          onProgress?.(`images endpoint failed (${e.message}); falling back to the orchestrator route...`, 20);
+          break;
         }
+      }
     }
     for (let i = 0; i < candidates.length; i++) {
       try {

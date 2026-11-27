@@ -87,9 +87,26 @@ export function freePath(requested) {
 export function saveImage(out, buf, cwd = process.cwd(), { force = false } = {}) {
   const requested = isAbsolute(out) ? out : resolve(cwd, out);
   mkdirSync(dirname(requested), { recursive: true });
-  const finalPath = force ? requested : freePath(requested);
-  writeFileSync(finalPath, buf);
-  return { savedPath: finalPath, requestedPath: requested, versioned: finalPath !== requested };
+  if (force) {
+    writeFileSync(requested, buf);
+    return { savedPath: requested, requestedPath: requested, versioned: false };
+  }
+  // Atomic exclusive create (`wx`) closes the TOCTOU window where two concurrent
+  // saves both see !existsSync(candidate) and the second silently overwrites.
+  const ext = extname(requested);
+  const base = ext ? requested.slice(0, -ext.length) : requested;
+  const candidateExt = ext || ".png";
+  for (let v = 1; v <= 9999; v++) {
+    const candidate = v === 1 ? requested : `${base}-v${v}${candidateExt}`;
+    try {
+      writeFileSync(candidate, buf, { flag: "wx" });
+      return { savedPath: candidate, requestedPath: requested, versioned: candidate !== requested };
+    } catch (e) {
+      if (e?.code === "EEXIST") continue;
+      throw e;
+    }
+  }
+  throw new Error(`could not find a free filename near ${requested}`);
 }
 
 export function slugify(text, maxLen = 32) {
@@ -127,16 +144,18 @@ export const MAX_REF_IMAGE_BYTES = 20 * 1024 * 1024;
 export function readImageAsDataUrl(filePath, cwd = process.cwd()) {
   const abs = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
   const fd = openSync(abs, "r");
+  let buf;
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error(`not a regular file: ${abs}`);
     if (st.size > MAX_REF_IMAGE_BYTES) {
       throw new Error(`reference image too large (${Math.round(st.size / 1048576)}MB; limit ${MAX_REF_IMAGE_BYTES / 1048576}MB): ${abs}`);
     }
+    // Read from the already-opened, already-statted descriptor (no TOCTOU reopen).
+    buf = readFileSync(fd);
   } finally {
     closeSync(fd);
   }
-  const buf = readFileSync(abs);
   const mime = detectImageMime(buf);
   if (!mime) throw new Error(`unsupported reference image type: ${abs}`);
   return `data:${mime};base64,${buf.toString("base64")}`;
@@ -152,6 +171,11 @@ export function assertImageFile(filePath, cwd = process.cwd()) {
   const abs = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
   const fd = openSync(abs, "r");
   try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`not a regular file: ${abs}`);
+    if (st.size > MAX_REF_IMAGE_BYTES) {
+      throw new Error(`reference image too large (${Math.round(st.size / 1048576)}MB; limit ${MAX_REF_IMAGE_BYTES / 1048576}MB): ${abs}`);
+    }
     const n = readSync(fd, MAGIC_BUF, 0, 12, 0);
     const mime = detectImageMime(MAGIC_BUF.subarray(0, n));
     if (!mime) throw new Error(`unsupported reference image type: ${abs}`);
@@ -189,7 +213,7 @@ export async function readBodyCapped(res, max = 64 * 1024 * 1024) {
         await reader.cancel();
       } catch {}
     }
-    return Buffer.concat(chunks);
+    return Buffer.concat(chunks, size);
   } finally {
     // The body is done, so the fetch timeout no longer applies to it. Without
     // this the timer would stay armed and fire at a completed response.

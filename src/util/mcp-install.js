@@ -31,7 +31,7 @@ import { join, dirname } from "node:path";
 import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import { isOnPath } from "./discover.js";
-import { redact } from "./redact.js";
+import { redact, safeParseMessage } from "./redact.js";
 
 /**
  * Safely strip single-line (//) and multi-line comments from JSONC text
@@ -49,7 +49,7 @@ export function safeParseJsonc(text) {
   try {
     return JSON.parse(stripped);
   } catch (e) {
-    e.message = `invalid JSON: ${e.message}`;
+    e.message = `invalid JSON: ${safeParseMessage(e)}`;
     throw e;
   }
 }
@@ -384,11 +384,18 @@ export function installMcpToAgent(agent, entry, { dry = false, force = false } =
   try {
     data = safeParseJsonc(raw);
   } catch (e) {
-    return { name: agent.name, path: agent.path, status: "error", error: `invalid JSON: ${redact(e.message)}` };
+    return { name: agent.name, path: agent.path, status: "error", error: redact(e.message) };
+  }
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { name: agent.name, path: agent.path, status: "error", error: "invalid JSON: expected a top-level object" };
   }
 
   // Determine which key is in use: mcpServers, servers, or context_servers
   const key = data.mcpServers ? "mcpServers" : data.servers ? "servers" : data.context_servers ? "context_servers" : defaultKey;
+  if (data[key] != null && (typeof data[key] !== "object" || Array.isArray(data[key]))) {
+    return { name: agent.name, path: agent.path, status: "error", error: `invalid JSON: "${key}" must be an object` };
+  }
   data[key] = data[key] || {};
 
   const existing = data[key].brushrouter;

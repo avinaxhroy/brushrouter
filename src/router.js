@@ -133,6 +133,14 @@ async function attemptOrder(cfg, { provider, fallback, images }) {
   return enabled;
 }
 
+function promptForBackground(prompt, background, providerId) {
+  // codex takes background as an API field; every other route can only put it
+  // in the prompt, so say it there rather than drop the request.
+  return background === "transparent" && providerId !== "codex"
+    ? `${prompt} Generate the image with a fully transparent background (no scene behind the subject, RGBA output).`
+    : prompt;
+}
+
 export async function generate({ prompt, size, quality, background, images, out, cwd = process.cwd(), provider, model, fallback = false, onProgress }, cfgIn) {
   const cfg = cfgIn || loadConfig({ cwd });
   const order = await attemptOrder(cfg, { provider, fallback, images });
@@ -156,12 +164,7 @@ export async function generate({ prompt, size, quality, background, images, out,
       }
     }
     notify(onProgress, `using ${id}...`, 10);
-    // codex takes background as an API field; every other route can only put it
-    // in the prompt, so say it there rather than drop the request.
-    const promptForProvider =
-      background === "transparent" && id !== "codex"
-        ? `${prompt} Generate the image with a fully transparent background (no scene behind the subject, RGBA output).`
-        : prompt;
+    const promptForProvider = promptForBackground(prompt, background, id);
     try {
       const result = await p.generate({ prompt: promptForProvider, size, quality, background, images, out, cwd, model, onProgress }, pcfg);
       // Contract check: a provider must return actual image bytes. A provider
@@ -266,9 +269,10 @@ export async function batchGenerate(
     return DEFAULT_PROVIDER_CONCURRENCY[id] || 1;
   }
 
+  const providerLimit = new Map(allowedProviders.map((id) => [id, getProviderConcurrency(id)]));
   const globalMax = Number(concurrency) > 0
     ? Number(concurrency)
-    : allowedProviders.reduce((sum, id) => sum + getProviderConcurrency(id), 0);
+    : allowedProviders.reduce((sum, id) => sum + providerLimit.get(id), 0);
 
   const queue = items.map((it, idx) => {
     const obj = typeof it === "string" ? { prompt: it } : { ...it };
@@ -309,7 +313,7 @@ export async function batchGenerate(
       const until = cooldownUntil.get(id) || 0;
       if (until > now) continue;
       const active = activeCount.get(id) || 0;
-      if (active < getProviderConcurrency(id)) return id;
+      if (active < providerLimit.get(id)) return id;
     }
     return null;
   }
@@ -351,9 +355,16 @@ export async function batchGenerate(
       if (pendingQueue.length > 0 && inFlight === 0) {
         const now = Date.now();
         let nextExpiry = Infinity;
-        for (const id of allowedProviders) {
-          const until = cooldownUntil.get(id) || 0;
-          if (until > now) nextExpiry = Math.min(nextExpiry, until - now);
+        // Only wait on providers that at least one pending item can actually use;
+        // otherwise an incompatible item (e.g. reference images with only a
+        // text-only provider in cooldown) stalls for the whole cooldown window.
+        for (const item of pendingQueue) {
+          for (const id of allowedProviders) {
+            if (item.failedProviders.has(id)) continue;
+            if (item.images?.length && PROVIDERS[id]?.supportsImages === false) continue;
+            const until = cooldownUntil.get(id) || 0;
+            if (until > now) nextExpiry = Math.min(nextExpiry, until - now);
+          }
         }
         if (nextExpiry < Infinity) {
           clearTimeout(retryTimer);
@@ -393,7 +404,7 @@ export async function batchGenerate(
       try {
         const res = await p.generate(
           {
-            prompt: item.prompt,
+            prompt: promptForBackground(item.prompt, item.background, pId),
             size: item.size,
             quality: item.quality,
             background: item.background,

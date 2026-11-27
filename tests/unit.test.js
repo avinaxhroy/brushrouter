@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, chmodSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 import { detectImageMime, extForMime, freePath, saveImage, decodeJwt, jwtClientId, jwtExpiryMs, normalizeSize, appendTailed, readImageAsDataUrl, readBodyCapped, pngSize, MAX_REF_IMAGE_BYTES } from "../src/util/common.js";
 import { resolvePath } from "../src/providers/http.js";
@@ -3296,4 +3297,450 @@ test("findRecipes exposes offset so rows past the page cap are reachable", async
   assert.deepEqual(past.rows, []);
   assert.equal(past.matched, true);
   assert.equal(past.total, page1.total);
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review fixes
+// ---------------------------------------------------------------------------
+
+function makeTempHome() {
+  const home = mkdtempSync(join(tmpdir(), "br-review-home-"));
+  const cfgDir = join(home, ".config", "brushrouter");
+  mkdirSync(cfgDir, { recursive: true });
+  return { home, cfgDir, userConfig: join(cfgDir, "config.json") };
+}
+
+test("CLI unknown command prints the command token, not [object Object]", () => {
+  const home = makeTempHome();
+  try {
+    const r = spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "bogus-cmd"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home.home, BRUSHROUTER_CONFIG_DIR: home.cfgDir, BRUSHROUTER_USER_CONFIG: home.userConfig },
+    });
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /unknown command: bogus-cmd/);
+    assert.doesNotMatch(r.stderr, /\[object Object\]/);
+  } finally {
+    rmSync(home.home, { recursive: true, force: true });
+  }
+});
+
+test("gptweb2api probe returns needs-login without throwing and supports cookie-only fallback", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-gw-probe-"));
+  const fakeBin = join(dir, "gptweb2api");
+  writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const prevHome = process.env.HOME;
+  const prevCfg = process.env.BRUSHROUTER_CONFIG_DIR;
+  const prevCookie = process.env.BRUSHROUTER_GPTWEB_COOKIE;
+  process.env.HOME = dir;
+  process.env.BRUSHROUTER_CONFIG_DIR = join(dir, "cfg");
+  delete process.env.BRUSHROUTER_GPTWEB_COOKIE;
+  try {
+    const noCred = await gptweb2apiProvider.probe({ bin: fakeBin });
+    assert.equal(noCred.available, false);
+    assert.equal(noCred.auth, "needs-login");
+
+    const cookieOnly = await gptweb2apiProvider.probe({ bin: fakeBin, cookie: "__Secure-next-auth.session-token=fake" });
+    assert.equal(cookieOnly.available, true);
+    assert.equal(cookieOnly.auth, "builtin");
+    assert.match(cookieOnly.detail, /cookie/);
+  } finally {
+    process.env.HOME = prevHome;
+    if (prevCfg === undefined) delete process.env.BRUSHROUTER_CONFIG_DIR;
+    else process.env.BRUSHROUTER_CONFIG_DIR = prevCfg;
+    if (prevCookie === undefined) delete process.env.BRUSHROUTER_GPTWEB_COOKIE;
+    else process.env.BRUSHROUTER_GPTWEB_COOKIE = prevCookie;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("codex refreshAuthToken persists refreshed tokens for non-openai pi/omp auth keys", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-pi-refresh-"));
+  const authPath = join(dir, "auth.json");
+  const makeJwt = (payload) =>
+    `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.sig`;
+  const oldJwt = makeJwt({ client_id: "app_test_client_id", exp: Math.floor(Date.now() / 1000) - 60 });
+  const newJwt = makeJwt({ client_id: "app_test_client_id", exp: Math.floor(Date.now() / 1000) + 3600 });
+  writeFileSync(
+    authPath,
+    JSON.stringify({ "openai-codex": { type: "oauth", access: oldJwt, refresh: "ref_old_token_123456" } }),
+  );
+  const { readAuth, refreshAuthToken } = await import("../src/providers/codex.js");
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ access_token: newJwt, refresh_token: "ref_new_token_654321" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  try {
+    const auth = readAuth({ authFile: authPath });
+    assert.equal(auth.format, "pi");
+    assert.equal(auth.providerKey, "openai-codex");
+    await refreshAuthToken(auth, {});
+    const persisted = JSON.parse(readFileSync(authPath, "utf8"));
+    assert.equal(persisted["openai-codex"].access, newJwt);
+    assert.equal(persisted["openai-codex"].refresh, "ref_new_token_654321");
+  } finally {
+    globalThis.fetch = origFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fal and gemini providers reject reference images loudly with UNSUPPORTED", async () => {
+  const { falProvider } = await import("../src/providers/http.js");
+  const { geminiProvider } = await import("../src/providers/gemini.js");
+  await assert.rejects(
+    () => falProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"] }, { apiKey: "fal-test-key-123456" }),
+    (err) => err.code === "UNSUPPORTED" && /reference images/i.test(err.message),
+  );
+  await assert.rejects(
+    () => geminiProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"] }, {}),
+    (err) => err.code === "UNSUPPORTED" && /reference images/i.test(err.message),
+  );
+});
+
+test("assertImageFile rejects non-regular files and oversized files", async () => {
+  const { assertImageFile, MAX_REF_IMAGE_BYTES } = await import("../src/util/common.js");
+  const { openSync, writeSync, ftruncateSync, closeSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "br-assert-img-"));
+  try {
+    assert.throws(() => assertImageFile(dir), /not a regular file/);
+    const huge = join(dir, "huge.png");
+    const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+    const fd = openSync(huge, "w");
+    try {
+      writeSync(fd, pngHeader, 0, pngHeader.length, 0);
+      ftruncateSync(fd, MAX_REF_IMAGE_BYTES + 1);
+    } finally {
+      closeSync(fd);
+    }
+    assert.throws(() => assertImageFile(huge), /too large/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("batchGenerate appends transparent background hint on non-codex providers", async () => {
+  const { batchGenerate, PROVIDERS } = await import("../src/router.js");
+  const seen = [];
+  const orig = PROVIDERS.fal;
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+    "base64",
+  );
+  PROVIDERS.fal = {
+    ...orig,
+    probe: async () => ({ available: true, auth: "ok" }),
+    generate: async ({ prompt }) => {
+      seen.push(prompt);
+      return { buffer: png, meta: { model: "mock" } };
+    },
+  };
+  try {
+    const cfg = loadConfig({ overrides: { providers: { fal: { enabled: true } } } });
+    const res = await batchGenerate({ items: [{ prompt: "a red fox", background: "transparent" }], provider: "fal" }, cfg);
+    assert.equal(res.completed, 1);
+    assert.match(seen[0], /fully transparent background/);
+  } finally {
+    PROVIDERS.fal = orig;
+  }
+});
+
+test("CLI gen --dry-run --images prioritizes image-capable providers", () => {
+  const home = makeTempHome();
+  try {
+    const img = join(home.home, "ref.png");
+    writeFileSync(img, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64"));
+    writeFileSync(
+      home.userConfig,
+      JSON.stringify({
+        priority: ["gemini", "fal", "openrouter"],
+        providers: { gemini: { enabled: true }, fal: { enabled: true }, openrouter: { enabled: true } },
+      }),
+    );
+    const r = spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "gen", "edit this", "--images", img, "--dry-run", "--json"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home.home, BRUSHROUTER_CONFIG_DIR: home.cfgDir, BRUSHROUTER_USER_CONFIG: home.userConfig },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(parsed.wouldTry[0].id, "openrouter", `expected image-capable openrouter first, got ${JSON.stringify(parsed.wouldTry)}`);
+  } finally {
+    rmSync(home.home, { recursive: true, force: true });
+  }
+});
+
+test("CLI batch --dry-run respects --provider and rejects disabled providers", () => {
+  const home = makeTempHome();
+  try {
+    writeFileSync(
+      home.userConfig,
+      JSON.stringify({ providers: { openrouter: { enabled: false }, fal: { enabled: true, concurrency: 3 } } }),
+    );
+    const disabled = spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "batch", "a fox", "--provider", "openrouter", "--dry-run"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home.home, BRUSHROUTER_CONFIG_DIR: home.cfgDir, BRUSHROUTER_USER_CONFIG: home.userConfig },
+    });
+    assert.equal(disabled.status, 1);
+    assert.match(disabled.stderr, /disabled/i);
+
+    const scoped = spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "batch", "a fox", "--provider", "fal", "--dry-run", "--json"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home.home, BRUSHROUTER_CONFIG_DIR: home.cfgDir, BRUSHROUTER_USER_CONFIG: home.userConfig },
+    });
+    assert.equal(scoped.status, 0, scoped.stderr);
+    const parsed = JSON.parse(scoped.stdout);
+    assert.deepEqual(parsed.readyProviders, [{ id: "fal", concurrency: 3 }]);
+    assert.equal(parsed.concurrency, 3);
+  } finally {
+    rmSync(home.home, { recursive: true, force: true });
+  }
+});
+
+test("CLI prompts --offset paginates and emits limit/offset/hasMore in JSON", () => {
+  const home = makeTempHome();
+  try {
+    const env = { ...process.env, HOME: home.home, BRUSHROUTER_CONFIG_DIR: home.cfgDir, BRUSHROUTER_USER_CONFIG: home.userConfig };
+    const p1 = JSON.parse(spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "prompts", "product", "--limit", "2", "--offset", "0", "--json"], { encoding: "utf8", env }).stdout);
+    const p2 = JSON.parse(spawnSync(process.execPath, [resolve("bin/brushrouter.js"), "prompts", "product", "--limit", "2", "--offset", "2", "--json"], { encoding: "utf8", env }).stdout);
+    assert.equal(p1.limit, 2);
+    assert.equal(p1.offset, 0);
+    assert.equal(p1.hasMore, true);
+    assert.equal(p2.offset, 2);
+    assert.notEqual(p1.recipes[0].id, p2.recipes[0].id);
+  } finally {
+    rmSync(home.home, { recursive: true, force: true });
+  }
+});
+
+test("MCP generate_image rejects missing or empty prompt in sync and async modes", async () => {
+  const { handleToolCall } = await import("../src/mcp.js");
+  await assert.rejects(() => handleToolCall("generate_image", {}), /non-empty "prompt"/);
+  await assert.rejects(() => handleToolCall("generate_image", { prompt: "   " }), /non-empty "prompt"/);
+  await assert.rejects(() => handleToolCall("generate_image", { prompt: "", async: true }), /non-empty "prompt"/);
+  await assert.rejects(() => handleToolCall("generate_image", "bad-args"), /must be an object/);
+});
+
+test("openrouterProvider.probe strips trailing slash from baseUrl", async () => {
+  const { openrouterProvider } = await import("../src/providers/http.js");
+  const urls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const res = await openrouterProvider.probe({ apiKey: "sk-or-test-key-1234567890", baseUrl: "https://example.test/api/v1/" });
+    assert.equal(res.available, true);
+    assert.ok(urls.includes("https://example.test/api/v1/models"), `unexpected URLs: ${JSON.stringify(urls)}`);
+    assert.ok(!urls.some((u) => u.includes("//models")), `double slash in URLs: ${JSON.stringify(urls)}`);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("runLogin binds the OAuth callback server BEFORE calling open() and skips open() on EADDRINUSE", async () => {
+  const { createServer } = await import("node:http");
+  const { runLogin, REDIRECT_PORT } = await import("../src/oauth.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-oauth-order-"));
+  const authPath = join(dir, "auth.json");
+  const origFetch = globalThis.fetch;
+  try {
+    // 1. Immediate callback from inside open() must succeed (server already listening).
+    const payload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_plan_type: "plus", chatgpt_account_id: "acct_order_test" },
+    })).toString("base64url");
+    const fakeIdToken = `eyJhbGciOiJub25lIn0.${payload}.sig`;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ access_token: "at_order_12345678", refresh_token: "rt_order_12345678", id_token: fakeIdToken }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    let callbackStatus = 0;
+    const res = await runLogin({
+      configDir: dir,
+      log: () => {},
+      open: async (authUrl) => {
+        const state = new URL(authUrl).searchParams.get("state");
+        const r = await origFetch(`http://127.0.0.1:${REDIRECT_PORT}/auth/callback?code=ok_code&state=${state}`);
+        callbackStatus = r.status;
+      },
+    });
+    assert.equal(callbackStatus, 200);
+    assert.equal(res.plan, "plus");
+    assert.equal(res.accountId, "acct_order_test");
+
+    // 2. If port 1455 is already busy, open() must NOT be called.
+    const blocker = createServer();
+    await new Promise((r) => blocker.listen(REDIRECT_PORT, "127.0.0.1", r));
+    let opened = false;
+    try {
+      await assert.rejects(
+        () => runLogin({ configDir: dir, log: () => {}, open: async () => { opened = true; } }),
+        /localhost:1455 is busy/,
+      );
+      assert.equal(opened, false, "browser should not open when callback port is busy");
+    } finally {
+      await new Promise((r) => blocker.close(r));
+    }
+  } finally {
+    globalThis.fetch = origFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("saveImage uses atomic exclusive create and versions collisions without overwriting", async () => {
+  const { saveImage } = await import("../src/util/common.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-save-wx-"));
+  try {
+    const a = saveImage("out.png", Buffer.from("img-1"), dir);
+    const b = saveImage("out.png", Buffer.from("img-2"), dir);
+    const c = saveImage("out.png", Buffer.from("img-3"), dir);
+    assert.equal(a.versioned, false);
+    assert.equal(b.versioned, true);
+    assert.ok(b.savedPath.endsWith("out-v2.png"));
+    assert.ok(c.savedPath.endsWith("out-v3.png"));
+    assert.equal(readFileSync(a.savedPath, "utf8"), "img-1");
+    assert.equal(readFileSync(b.savedPath, "utf8"), "img-2");
+    assert.equal(readFileSync(c.savedPath, "utf8"), "img-3");
+    const d = saveImage("out.png", Buffer.from("img-forced"), dir, { force: true });
+    assert.equal(d.savedPath, a.savedPath);
+    assert.equal(readFileSync(a.savedPath, "utf8"), "img-forced");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("batchGenerate does not sleep for cooldown on providers incompatible with pending items", async () => {
+  const { batchGenerate, PROVIDERS } = await import("../src/router.js");
+  const origGenerate = PROVIDERS.fal.generate;
+  const origProbe = PROVIDERS.fal.probe;
+  PROVIDERS.fal.probe = async () => ({ available: true });
+  PROVIDERS.fal.generate = async () => {
+    const e = new Error("429 Too Many Requests");
+    e.code = "QUOTA";
+    throw e;
+  };
+  try {
+    const t0 = Date.now();
+    const res = await batchGenerate({
+      items: [
+        { prompt: "text only" },
+        { prompt: "needs ref", images: ["/tmp/does-not-matter.png"] },
+      ],
+      provider: "fal",
+      fallback: false,
+      cooldownMs: 30000,
+      concurrency: 1,
+      cfg: { providers: { fal: { apiKey: "fal-key-test" } }, order: ["fal"] },
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(res.failed, 2);
+    assert.ok(elapsed < 2000, `expected immediate failure for incompatible item, took ${elapsed}ms`);
+  } finally {
+    PROVIDERS.fal.generate = origGenerate;
+    PROVIDERS.fal.probe = origProbe;
+  }
+});
+
+test("codexCliProvider.generate validates reference images before spawning CLI", async () => {
+  const { codexCliProvider } = await import("../src/providers/codex-cli.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-codexcli-ref-"));
+  const fakeCli = join(dir, "fake-codex");
+  const badRef = join(dir, "not-an-image.png");
+  writeFileSync(fakeCli, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex 0.1.0\"; exit 0; fi\nexit 99\n", { mode: 0o755 });
+  writeFileSync(badRef, "plain text, not png");
+  try {
+    await assert.rejects(
+      () => codexCliProvider.generate({ prompt: "edit", images: [badRef], cwd: dir }, { cli: fakeCli }),
+      /unsupported reference image type/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP generate_image and batch_generate_images fail fast on invalid args before starting async jobs", async () => {
+  const { handleToolCall, handleRequest } = await import("../src/mcp.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-mcp-failfast-"));
+  try {
+    // 1. Directory passed to out must be rejected in both sync and async modes.
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", out: dir }, { cwd: dir }),
+      /is a directory/,
+    );
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", out: dir, async: true }, { cwd: dir }),
+      /is a directory/,
+    );
+    // 2. Invalid count/concurrency must fail fast in async mode before starting a job.
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", count: 99, async: true }, { cwd: dir }),
+      /at most 8/,
+    );
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", concurrency: 0, async: true }, { cwd: dir }),
+      /positive integer/,
+    );
+    // 3. Invalid batch args must fail fast in async mode before starting a job.
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { prompts: [], async: true }, { cwd: dir }),
+      /requires 'prompts' or 'items'/,
+    );
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { items: [{ prompt: "  " }], async: true }, { cwd: dir }),
+      /missing a non-empty "prompt"/,
+    );
+    // 4. batch_generate_images schema exposes per-item `images`.
+    const listed = await handleRequest({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { cwd: dir });
+    const batchTool = listed.result.tools.find((t) => t.name === "batch_generate_images");
+    assert.ok(batchTool?.inputSchema?.properties?.items?.items?.properties?.images, "batch schema should expose per-item images");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("injectRuleToFile updates existing block even when a stray end marker appears earlier", async () => {
+  const { injectRuleToFile, RULE_START_MARKER, RULE_END_MARKER, BRUSHROUTER_RULE_BODY } = await import("../src/util/rules.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-rules-marker-"));
+  const file = join(dir, "AGENTS.md");
+  try {
+    writeFileSync(file, `intro\n${RULE_END_MARKER}\n${RULE_START_MARKER}\nold text\n${RULE_END_MARKER}\n`);
+    const res = injectRuleToFile(file);
+    assert.equal(res.status, "updated");
+    const after = readFileSync(file, "utf8");
+    assert.equal(after.split(RULE_START_MARKER).length - 1, 1, "should not duplicate rule block");
+    assert.ok(after.includes(BRUSHROUTER_RULE_BODY));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("openrouterImagesGenerate ignores zero-dimension sizes and strips multiple trailing slashes", async () => {
+  const { openrouterImagesGenerate } = await import("../src/providers/http.js");
+  const origFetch = globalThis.fetch;
+  let capturedUrl = null;
+  let capturedBody = null;
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  globalThis.fetch = async (url, init) => {
+    capturedUrl = String(url);
+    capturedBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ data: [{ b64_json: pngBytes.toString("base64") }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  try {
+    await openrouterImagesGenerate(
+      { prompt: "test", size: "0x1024", images: [], cwd: process.cwd() },
+      { baseUrl: "https://example.test/api/v1///" },
+      "test/model",
+      "sk-or-test-key-1234567890",
+    );
+    assert.equal(capturedUrl, "https://example.test/api/v1/images");
+    assert.equal(capturedBody.aspect_ratio, undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

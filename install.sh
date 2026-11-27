@@ -54,7 +54,7 @@ echo -e "  ${GREEN}✓${RESET} Found Node.js $(node -v)"
 
 # 3. Determine repository location
 IS_UPDATE=0
-if [ "$1" == "--update" ] || [ "$1" == "-u" ]; then
+if [ "${1:-}" = "--update" ] || [ "${1:-}" = "-u" ]; then
   IS_UPDATE=1
   shift
 fi

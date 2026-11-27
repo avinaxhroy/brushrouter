@@ -5,7 +5,7 @@
 // generate tool description advertises which providers are currently connected
 // so the calling agent can make an informed choice (or let auto-routing decide).
 
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
@@ -109,10 +109,15 @@ const BATCH_TOOL_SCHEMA = {
             quality: { type: "string" },
             background: { type: "string", enum: ["opaque", "transparent"] },
             model: { type: "string" },
+            images: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional reference image paths for this item.",
+            },
           },
           required: ["prompt"],
         },
-        description: "List of items with per-item options (e.g. prompt, out, size, quality, model).",
+        description: "List of items with per-item options (e.g. prompt, out, size, quality, background, model, images).",
       },
       outDir: {
         type: "string",
@@ -150,14 +155,14 @@ const BATCH_TOOL_SCHEMA = {
 const JOB_TOOL_SCHEMA = {
   name: JOB_TOOL_NAME,
   description:
-    "Collect the image from an async generate_image call. Call it with the jobId returned by " +
-    "generate_image {async:true}. While the job is still working it returns a status and you " +
-    "should do other work and poll again; once complete it returns the saved path and the image " +
-    "itself. Jobs live only for this server session.",
+    "Collect the image(s) from an async generate_image or batch_generate_images call. Call it with the jobId returned by " +
+    "generate_image {async:true} or batch_generate_images {async:true}. While the job is still working it returns a status and you " +
+    "should do other work and poll again; once complete it returns the saved path(s) and the image(s). " +
+    "Jobs live only for this server session.",
   inputSchema: {
     type: "object",
     properties: {
-      jobId: { type: "string", description: "The jobId returned by generate_image with async:true." },
+      jobId: { type: "string", description: "The jobId returned by generate_image or batch_generate_images with async:true." },
     },
     required: ["jobId"],
   },
@@ -288,15 +293,61 @@ async function mapLimited(items, limit, fn) {
   return out;
 }
 
+function assertGenerateArgs(args, cwd = process.cwd()) {
+  if (typeof args?.prompt !== "string" || args.prompt.trim() === "") {
+    throw new Error('generate_image requires a non-empty "prompt" string');
+  }
+  const count = positiveInt(args.count, "count", { max: MAX_COUNT });
+  const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
+  if (args.out != null) {
+    if (typeof args.out !== "string" || args.out.trim() === "") {
+      throw new Error('generate_image "out" must be a non-empty file path string');
+    }
+    const resolvedOut = resolve(cwd, args.out);
+    if (existsSync(resolvedOut) && statSync(resolvedOut).isDirectory()) {
+      throw new Error(`generate_image "out" is a directory, not a file path: ${resolvedOut}`);
+    }
+  }
+  return { count, concurrency };
+}
+
+function validateBatchArgs(args) {
+  let rawItems = [];
+  if (Array.isArray(args.items) && args.items.length) {
+    rawItems = args.items;
+  } else if (Array.isArray(args.prompts) && args.prompts.length) {
+    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
+  } else {
+    throw new Error("batch_generate_images requires 'prompts' or 'items' array");
+  }
+
+  // The schema declares `prompt` required, but MCP clients are not obliged to
+  // validate against it. Sending an empty prompt to a provider costs a real
+  // request and reports "✓" for a blank image, so reject it here and name the
+  // offending index. A bare string entry is a prompt, not an object to spread —
+  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
+  const normalized = rawItems.map((item, idx) => {
+    const entry = typeof item === "string" ? { prompt: item } : item;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
+    }
+    if (typeof entry.prompt !== "string" || entry.prompt.trim() === "") {
+      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
+    }
+    return entry;
+  });
+  const concurrency = args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency");
+  return { rawItems: normalized, concurrency };
+}
+
 // Runs the generation and returns the exact tools/call content the agent would
 // have received from a blocking call. Shared by the sync and async paths so the
 // two can never drift.
 async function runGenerate(args, ctx, onProgress) {
   const { cwd = process.cwd() } = ctx;
+  const { count, concurrency } = assertGenerateArgs(args, cwd);
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
-  const count = positiveInt(args.count, "count", { max: MAX_COUNT });
-  const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
   if (count === 1) {
     const result = await generate({ ...args, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
     const saved = saveImage(out, result.buffer, cwd);
@@ -318,7 +369,7 @@ async function runGenerate(args, ctx, onProgress) {
       content: [{ type: "text", text }, block],
       isError: false,
     };
-    content[SAVED_PATH] = saved.savedPath;
+    content[SAVED_PATH] = [saved.savedPath];
     return content;
   }
 
@@ -354,7 +405,7 @@ async function runGenerate(args, ctx, onProgress) {
     // Zero images means the call failed; a partial set is still a usable answer.
     isError: good.length === 0,
   };
-  content[SAVED_PATH] = good.map((r) => r.savedPath).join("; ");
+  content[SAVED_PATH] = good.map((r) => r.savedPath);
   return content;
 }
 
@@ -375,31 +426,7 @@ function imageBlock(result) {
 async function runBatchGenerate(args, ctx, onProgress) {
   const { cwd = process.cwd() } = ctx;
   const cfg = loadConfig({ cwd });
-
-  let rawItems = [];
-  if (Array.isArray(args.items) && args.items.length) {
-    rawItems = args.items;
-  } else if (Array.isArray(args.prompts) && args.prompts.length) {
-    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
-  } else {
-    throw new Error("batch_generate_images requires 'prompts' or 'items' array");
-  }
-
-  // The schema declares `prompt` required, but MCP clients are not obliged to
-  // validate against it. Sending an empty prompt to a provider costs a real
-  // request and reports "✓" for a blank image, so reject it here and name the
-  // offending index. A bare string entry is a prompt, not an object to spread —
-  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
-  rawItems = rawItems.map((item, idx) => {
-    const normalised = typeof item === "string" ? { prompt: item } : item;
-    if (!normalised || typeof normalised !== "object" || Array.isArray(normalised)) {
-      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
-    }
-    if (typeof normalised.prompt !== "string" || normalised.prompt.trim() === "") {
-      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
-    }
-    return normalised;
-  });
+  const { rawItems, concurrency } = validateBatchArgs(args);
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, args.outDir || `brushrouter-batch-${timestamp}`);
@@ -416,7 +443,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
       items,
       outDir,
       cwd,
-      concurrency: args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency"),
+      concurrency,
       provider: args.provider,
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
@@ -449,7 +476,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
     content: [{ type: "text", text: redact(textLines.join("\n")) }, ...blocks],
     isError: batchRes.completed === 0 && batchRes.total > 0,
   };
-  content[SAVED_PATH] = completedResults.map((r) => r.savedPath).join("; ");
+  content[SAVED_PATH] = completedResults.map((r) => r.savedPath);
   return content;
 }
 
@@ -517,7 +544,9 @@ function startJob(argsIn, ctx, runner = runGenerate) {
 function rebuildContent(job) {
   let paths = [];
   try {
-    paths = (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
+    paths = Array.isArray(job.savedPath)
+      ? job.savedPath.filter(Boolean)
+      : (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
     const blocks = [];
     const missing = [];
     for (const p of paths) {
@@ -684,7 +713,10 @@ export async function handlePromptToolCall(args = {}) {
   };
 }
 
-export async function handleToolCall(name, args, ctx = {}) {
+export async function handleToolCall(name, args = {}, ctx = {}) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("tool arguments must be an object");
+  }
   if (name === PROMPT_TOOL_NAME) return handlePromptToolCall(args);
   if (name === JOB_TOOL_NAME) {
     pruneJobs();
@@ -696,6 +728,7 @@ export async function handleToolCall(name, args, ctx = {}) {
   }
   if (name === BATCH_TOOL_NAME) {
     if (args.async === true) {
+      validateBatchArgs(args);
       const job = startJob(args, ctx, runBatchGenerate);
       return {
         content: [
@@ -711,6 +744,7 @@ export async function handleToolCall(name, args, ctx = {}) {
   }
   if (name !== TOOL_NAME) throw new Error(`unknown tool: ${name}`);
   if (args.async === true) {
+    assertGenerateArgs(args, ctx?.cwd || process.cwd());
     const job = startJob(args, ctx);
     return {
       content: [
@@ -925,41 +959,50 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
 
   process.stdin.setEncoding("utf8");
   let discarding = false; // skipping the tail of an abandoned oversized line
+  let bufBytes = 0; // incremental UTF-8 byte count of `buf` (avoids O(N^2) rescanning)
   const oversizeError = () =>
     send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: request exceeds the ${MAX_REQUEST_BYTES / 1048576}MB input limit` } });
   process.stdin.on("data", (chunk) => {
     buf += chunk;
+    bufBytes += byteLength(chunk);
     if (discarding) {
       // Look ahead only for the newline that ends the abandoned line, then fall
       // through so whatever follows it is processed as normal requests.
       const nlIdx = buf.indexOf("\n");
       if (nlIdx < 0) {
         buf = "";
+        bufBytes = 0;
         return;
       }
       buf = buf.slice(nlIdx + 1);
+      bufBytes = byteLength(buf);
       discarding = false;
     }
-    // Measure BYTES, not UTF-16 code units: String.length counts a 3-byte
-    // character as 1, so a multi-byte line was admitted at up to ~3x the cap.
-    if (byteLength(buf) > MAX_REQUEST_BYTES && !buf.includes("\n")) {
-      // A request line has grown past the cap unfinished. Requests carry paths
-      // and prompts, never byte payloads, so this cannot be an actionable
-      // request: drop it and answer the client once.
-      buf = "";
-      discarding = true;
-      oversizeError();
-      return;
-    }
+    let start = 0;
     let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = idx + 1 < buf.length ? buf.slice(idx + 1) : "";
+    while ((idx = buf.indexOf("\n", start)) >= 0) {
+      const line = buf.slice(start, idx).trim();
+      start = idx + 1;
       if (byteLength(line) > MAX_REQUEST_BYTES) {
         oversizeError();
         continue;
       }
       void handleLine(line);
+    }
+    if (start > 0) {
+      buf = start < buf.length ? buf.slice(start) : "";
+      bufBytes = buf.length > 0 ? byteLength(buf) : 0;
+    }
+    // Measure BYTES, not UTF-16 code units: String.length counts a 3-byte
+    // character as 1, so a multi-byte line was admitted at up to ~3x the cap.
+    if (bufBytes > MAX_REQUEST_BYTES) {
+      // A request line has grown past the cap unfinished. Requests carry paths
+      // and prompts, never byte payloads, so this cannot be an actionable
+      // request: drop it and answer the client once.
+      buf = "";
+      bufBytes = 0;
+      discarding = true;
+      oversizeError();
     }
   });
   process.stdin.on("end", () => {

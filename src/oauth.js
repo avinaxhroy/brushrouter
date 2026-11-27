@@ -4,9 +4,10 @@
 // auth shape and the codex route's refresh flow already knows how to use them.
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { mkdir, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
+import { fetchWithTimeout } from "./util/common.js";
 import { redact } from "./util/redact.js";
 
 export const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -54,72 +55,95 @@ export function credentialFromTokenResponse(tokens) {
 // Exported for tests: the callback contract (reject on ?error=, never render a
 // success page for a bad state, close the server on every path) is the bug-prone
 // part, and it can only be exercised from outside.
-export function listenForCallback(state, timeoutMs = 5 * 60_000) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (v, e) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        server.close();
-      } catch {}
-      e ? reject(e) : resolve(v);
-    };
-    const server = createServer((req, res) => {
-      const url = new URL(req.url || "", REDIRECT_URI);
-      if (url.pathname !== "/auth/callback") {
-        res.writeHead(404);
-        res.end("not found");
-        return;
-      }
-      const err = url.searchParams.get("error");
-      // Check EVERYTHING before rendering anything: the state comparison used to
-      // happen after the success page was written, so a forged callback with a
-      // wrong state still told the user "sign-in complete".
-      const stateOk = url.searchParams.get("state") === state;
-      const code = url.searchParams.get("code");
-      // ?error=... is the provider refusing the grant. It must REJECT here: it
-      // used to resolve with { code: null }, and the caller then POSTed
-      // grant_type=authorization_code&code=null and surfaced an opaque 400.
-      if (err) {
-        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`<h3>ChatGPT sign-in failed: ${escapeHtml(err)}</h3>`);
-        finish(null, new Error(`ChatGPT sign-in failed: ${err}`));
-        return;
-      }
-      if (!stateOk) {
-        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<h3>ChatGPT sign-in failed: state mismatch — start the login again.</h3>");
-        finish(null, new Error("OAuth state mismatch — start the login again"));
-        return;
-      }
-      if (!code) {
-        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<h3>ChatGPT sign-in failed: no authorization code.</h3>");
-        finish(null, new Error("callback had no authorization code"));
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end("<h3>ChatGPT sign-in complete — you can close this tab.</h3>");
-      finish({ code });
-    });
-    const timer = setTimeout(
-      () => finish(null, new Error("login timed out after 5 minutes — try again")),
-      timeoutMs,
-    );
-    server.once("error", (e) =>
-      finish(
-        null,
-        e.code === "EADDRINUSE"
-          ? new Error("localhost:1455 is busy — another sign-in flow may be running; close it and retry")
-          : e,
-      ),
-    );
-    // keep-alive sockets would otherwise hold close() open past the redirect.
-    server.on("connection", (s) => s.unref?.());
-    server.listen(REDIRECT_PORT, "127.0.0.1", () => {});
+function startCallbackServer(state, timeoutMs = 5 * 60_000) {
+  let settled = false;
+  let resolveReady, rejectReady;
+  const ready = new Promise((res, rej) => {
+    resolveReady = res;
+    rejectReady = rej;
   });
+  let resolveResult, rejectResult;
+  const result = new Promise((res, rej) => {
+    resolveResult = res;
+    rejectResult = rej;
+  });
+  let timer = null;
+  const finish = (v, e) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try {
+      server.close();
+    } catch {}
+    if (e) {
+      rejectReady(e);
+      rejectResult(e);
+    } else {
+      resolveReady();
+      resolveResult(v);
+    }
+  };
+  const server = createServer((req, res) => {
+    const url = new URL(req.url || "", REDIRECT_URI);
+    if (url.pathname !== "/auth/callback") {
+      res.writeHead(404);
+      res.end("not found");
+      return;
+    }
+    const err = url.searchParams.get("error");
+    // Check EVERYTHING before rendering anything: the state comparison used to
+    // happen after the success page was written, so a forged callback with a
+    // wrong state still told the user "sign-in complete".
+    const stateOk = url.searchParams.get("state") === state;
+    const code = url.searchParams.get("code");
+    // ?error=... is the provider refusing the grant. It must REJECT here: it
+    // used to resolve with { code: null }, and the caller then POSTed
+    // grant_type=authorization_code&code=null and surfaced an opaque 400.
+    if (err) {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<h3>ChatGPT sign-in failed: ${escapeHtml(err)}</h3>`);
+      finish(null, new Error(`ChatGPT sign-in failed: ${err}`));
+      return;
+    }
+    if (!stateOk) {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<h3>ChatGPT sign-in failed: state mismatch — start the login again.</h3>");
+      finish(null, new Error("OAuth state mismatch — start the login again"));
+      return;
+    }
+    if (!code) {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<h3>ChatGPT sign-in failed: no authorization code.</h3>");
+      finish(null, new Error("callback had no authorization code"));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("<h3>ChatGPT sign-in complete — you can close this tab.</h3>");
+    finish({ code });
+  });
+  timer = setTimeout(
+    () => finish(null, new Error("login timed out after 5 minutes — try again")),
+    timeoutMs,
+  );
+  server.once("error", (e) =>
+    finish(
+      null,
+      e.code === "EADDRINUSE"
+        ? new Error("localhost:1455 is busy — another sign-in flow may be running; close it and retry")
+        : e,
+    ),
+  );
+  // keep-alive sockets would otherwise hold close() open past the redirect.
+  server.on("connection", (s) => s.unref?.());
+  server.listen(REDIRECT_PORT, "127.0.0.1", () => resolveReady());
+  const cancel = () => finish(null, new Error("login canceled"));
+  return { ready, result, cancel };
+}
+
+export function listenForCallback(state, timeoutMs = 5 * 60_000) {
+  const { ready, result } = startCallbackServer(state, timeoutMs);
+  ready.catch(() => {});
+  return result;
 }
 
 // The callback page interpolates a query parameter into HTML.
@@ -128,27 +152,31 @@ function escapeHtml(s) {
 }
 
 function defaultOpen(url) {
-  const cmd =
-    process.platform === "win32"
-      ? `cmd /c start "" ${JSON.stringify(url)}`
-      : process.platform === "darwin"
-      ? `open ${JSON.stringify(url)}`
-      : `xdg-open ${JSON.stringify(url)}`;
-  exec(cmd, () => {}); // fire and forget; the URL is printed either way
+  if (process.platform === "win32") {
+    execFile("cmd", ["/c", "start", "", url], () => {});
+  } else if (process.platform === "darwin") {
+    execFile("open", [url], () => {});
+  } else {
+    execFile("xdg-open", [url], () => {});
+  }
 }
 
 async function exchangeCode(code, verifier) {
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      client_id: OAUTH_CLIENT_ID,
-      redirect_uri: REDIRECT_URI,
-      code_verifier: verifier,
-    }),
-  });
+  const res = await fetchWithTimeout(
+    TOKEN_URL,
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: OAUTH_CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
+    },
+    30000,
+  );
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     // The body can echo the request, credentials included; never surface it raw.
@@ -181,11 +209,21 @@ export async function runLogin({ configDir, open = defaultOpen, log = () => {} }
     prompt: "login",
   })) authorize.searchParams.set(k, v);
 
-  log("Sign in to ChatGPT in your browser (it should open automatically):");
-  log(authorize.toString());
-  await open(authorize.toString());
+  // Bind the callback server BEFORE launching the browser: an already-signed-in
+  // browser redirects immediately, and EADDRINUSE should fail before opening a tab.
+  const callback = startCallbackServer(state);
+  try {
+    await callback.ready;
+    log("Sign in to ChatGPT in your browser (it should open automatically):");
+    log(authorize.toString());
+    await open(authorize.toString());
+  } catch (e) {
+    callback.cancel();
+    callback.result.catch(() => {});
+    throw e;
+  }
 
-  const { code } = await listenForCallback(state);
+  const { code } = await callback.result;
   const cred = credentialFromTokenResponse(await exchangeCode(code, verifier));
   const path = join(configDir, "auth.json");
   // 0700 on the directory and 0600 on the file: this holds access, refresh and

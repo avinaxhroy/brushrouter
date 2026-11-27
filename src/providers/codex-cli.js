@@ -20,7 +20,7 @@ import { join, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendTailed } from "../util/common.js";
+import { appendTailed, assertImageFile, detectImageMime } from "../util/common.js";
 import { findCodexCli } from "../util/discover.js";
 import { openaiJwtClaim } from "./codex.js";
 import { redact } from "../util/redact.js";
@@ -36,21 +36,30 @@ function run(cmd, args, { timeoutMs = 300000, cwd, env, input, shell = false } =
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
     const timer = setTimeout(() => {
       try {
         child.kill("SIGKILL");
       } catch {}
-      resolve({ code: 124, stdout, stderr: stderr + "\ntimed out", timedOut: true });
+      finish({ code: 124, stdout, stderr: stderr + "\ntimed out", timedOut: true });
     }, timeoutMs);
     child.stdout.on("data", (d) => (stdout = appendTailed(stdout, d)));
     child.stderr.on("data", (d) => (stderr = appendTailed(stderr, d)));
+    child.stdin?.on("error", () => {});
     child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ code: 127, stdout, stderr: stderr + `\n${e.message}` });
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      finish({ code: 127, stdout, stderr: stderr + `\n${e.message}` });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      finish({ code, stdout, stderr });
     });
     if (input) child.stdin.end(input);
   });
@@ -184,7 +193,10 @@ export const codexCliProvider = {
         .filter(Boolean)
         .join(" ");
 
-      const absImages = images.map((p) => (isAbsolute(p) ? p : resolve(cwd || process.cwd(), p)));
+      const absImages = images.map((p) => {
+        assertImageFile(p, cwd || process.cwd());
+        return isAbsolute(p) ? p : resolve(cwd || process.cwd(), p);
+      });
       const args = [
         ...cli.argsPrefix,
         "exec",
@@ -239,8 +251,14 @@ export const codexCliProvider = {
       if (!found) found = findNewestImage(work);
 
       if (found && existsSync(found)) {
+        const buf = readFileSync(found);
+        if (!detectImageMime(buf)) {
+          const e = new Error(`Codex CLI wrote a non-image file at ${found} (${buf.length} bytes)`);
+          e.code = "BAD_IMAGE_PAYLOAD";
+          throw e;
+        }
         return {
-          buffer: readFileSync(found),
+          buffer: buf,
           meta: { provider: "codex-cli", model, source: "file" },
         };
       }

@@ -62,8 +62,8 @@ export const DEFAULT_CONFIG = {
     "Call find_image_prompts first when the request is vague or you want a proven composition, then generate_image with the filled prompt — prefer this over shelling out to an image API yourself. " +
     "Generations can take a minute or more: pass async:true to generate_image to get a jobId immediately and poll image_result instead of blocking.",
 
-  // Per-provider settings. `enabled: false` removes a provider from auto-routing
-  // (an explicit --provider can still force it).
+  // Per-provider settings. `enabled: false` disables a provider for both
+  // auto-routing and explicit `--provider` calls (`PROVIDER_DISABLED`).
   providers: {
     "codex-cli": {
       enabled: true,
@@ -109,8 +109,7 @@ export const DEFAULT_CONFIG = {
       // route that spends per-request money from a key rather than reusing a
       // login you already pay for, so it stays out of auto-routing until you
       // ask for it. Turn it on with `brushrouter routes enable openrouter`,
-      // `BRUSHROUTER_ENABLE=openrouter`, or `enabled: true` here; an explicit
-      // `--provider openrouter` works regardless of this flag.
+      // `BRUSHROUTER_ENABLE=openrouter`, or `enabled: true` here.
       enabled: false,
       // Key auto-discovered from agent auth stores / env, or set here.
       // (Prefer BRUSHROUTER_OPENROUTER_KEY or ~/.config/brushrouter/keys.json.)
@@ -146,7 +145,7 @@ export const DEFAULT_CONFIG = {
       // ChatGPT PLANS (~2-3 images/day) because it is a normal web-chat turn.
       // Off by default like the other non-native routes: enabling it installs a
       // locally BUILT binary from a pinned upstream commit (`brushrouter vendor
-      // gptweb2api`). An explicit --provider always works regardless.
+      // gptweb2api`). Enable with `brushrouter routes enable gptweb2api`.
       enabled: false,
       // null => <config dir>/gptweb2api/gptweb2api (or BRUSHROUTER_GPTWEB_BIN).
       bin: null,
