@@ -135,9 +135,6 @@ export function estimateCost({ provider, model, usage, costUsd, pricing = null }
   if (explicit != null && Number.isFinite(Number(explicit)) && Number(explicit) >= 0) {
     return { costUsd: roundUsd(Number(explicit)), costSource: "provider" };
   }
-  if (provider && SUBSCRIPTION_PROVIDERS.has(provider)) {
-    return { costUsd: 0, costSource: "subscription" };
-  }
   if (pricing && typeof pricing === "object") {
     const candidates = [
       provider && model ? `${provider}/${model}` : null,
@@ -152,6 +149,9 @@ export function estimateCost({ provider, model, usage, costUsd, pricing = null }
         }
       }
     }
+  }
+  if (provider && SUBSCRIPTION_PROVIDERS.has(provider)) {
+    return { costUsd: 0, costSource: "subscription" };
   }
   if (model && typeof model === "string") {
     const clean = model.trim().toLowerCase();
