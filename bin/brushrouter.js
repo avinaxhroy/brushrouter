@@ -612,7 +612,7 @@ async function cmdGenerate(args) {
 
   let saved;
   try {
-    saved = saveImage(out, result.buffer, cwd, { force: values.force });
+    saved = saveImage(out, result.buffer, cwd, { force: values.force, matchExtension: !values.out });
   } catch (e) {
     if (values.json) {
       console.log(JSON.stringify(redactValue({ ok: false, error: e.message, code: "SAVE_FAILED" }), null, 2));
@@ -997,7 +997,7 @@ async function cmdBatch(args) {
     ...item,
     ...(item.mask != null || values.mask != null ? { mask: item.mask ?? values.mask } : {}),
     ...(item.seed !== undefined ? { seed: item.seed } : batchSeed !== undefined ? { seed: batchSeed } : {}),
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, resolvedItems.length, item.slugLabel || item.prompt),
+    out: item.out ? resolve(outDir, item.out) : undefined,
   }));
 
   for (const [index, item] of items.entries()) {
@@ -1017,6 +1017,7 @@ async function cmdBatch(args) {
     : null;
 
   if (values["dry-run"]) {
+    const previewPath = (item, index) => item.out || batchItemPath(outDir, index + 1, items.length, item.slugLabel || item.prompt);
     let plans;
     try {
       plans = await Promise.all(items.map(async (item) => {
@@ -1060,7 +1061,7 @@ async function cmdBatch(args) {
             items: items.map((it, idx) => ({
               index: idx + 1,
               prompt: it.prompt,
-              out: it.out,
+              out: previewPath(it, idx),
               code: plans[idx].code,
               error: plans[idx].error,
               ...(it.mask !== undefined ? { mask: it.mask } : {}),
@@ -1089,7 +1090,7 @@ async function cmdBatch(args) {
       const it = items[i];
       const tagParts = [it.recipe, it.look && it.look !== it.recipe ? it.look : null].filter(Boolean);
       const tag = tagParts.length ? `[${tagParts.join(" + ")}] ` : "";
-      const destination = plans[i].error ? warn(redact(plans[i].error)) : it.out;
+      const destination = plans[i].error ? warn(redact(plans[i].error)) : previewPath(it, i);
       console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${destination}`);
     }
     if (items.length > 10) console.log(dim(`    ... and ${items.length - 10} more`));

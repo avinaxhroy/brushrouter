@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -32,14 +32,19 @@ test("saving provider output uses the detected format rather than a misleading d
   const { cwd } = fixture(t);
   const webp = Buffer.from("RIFF\x04\0\0\0WEBP", "latin1");
   const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
-  const first = saveImage("result.png", webp, cwd);
+  const first = saveImage("result.png", webp, cwd, { matchExtension: true });
   assert.equal(first.savedPath, join(cwd, "result.webp"));
   assert.equal(first.requestedPath, join(cwd, "result.png"));
   assert.equal(first.versioned, false);
   assert.equal(existsSync(first.requestedPath), false);
-  assert.equal(saveImage("result.png", webp, cwd).savedPath, join(cwd, "result-v2.webp"));
-  assert.equal(saveImage("result.png", jpg, cwd, { force: true }).savedPath, join(cwd, "result.jpg"));
+  assert.equal(saveImage("result.png", webp, cwd, { matchExtension: true }).savedPath, join(cwd, "result-v2.webp"));
+  assert.equal(saveImage("result.png", jpg, cwd, { force: true, matchExtension: true }).savedPath, join(cwd, "result.jpg"));
   assert.equal(saveImage("result.jpeg", jpg, cwd).savedPath, join(cwd, "result.jpeg"));
+  writeFileSync(join(cwd, "result.png"), png);
+  writeFileSync(join(cwd, "result.webp"), "existing neighbor");
+  assert.equal(saveImage("result.png", webp, cwd, { force: true }).savedPath, join(cwd, "result.png"));
+  assert.deepEqual(readFileSync(join(cwd, "result.png")), webp);
+  assert.equal(readFileSync(join(cwd, "result.webp"), "utf8"), "existing neighbor");
 });
 
 test("checkout config cannot activate or move metered routes ahead of user-configured routes", (t) => {

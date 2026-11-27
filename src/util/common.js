@@ -86,11 +86,11 @@ export function freePath(requested) {
   throw new Error(`could not find a free filename near ${requested}`);
 }
 
-export function saveImage(out, buf, cwd = process.cwd(), { force = false } = {}) {
+export function saveImage(out, buf, cwd = process.cwd(), { force = false, matchExtension = false } = {}) {
   const requested = isAbsolute(out) ? out : resolve(cwd, out);
   const requestedExt = extname(requested).toLowerCase();
   const imageExt = IMAGE_EXTENSIONS[detectImageMime(buf)];
-  const path = imageExt && [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(requestedExt) &&
+  const path = matchExtension && imageExt && [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(requestedExt) &&
       requestedExt !== imageExt && !(requestedExt === ".jpeg" && imageExt === ".jpg")
     ? requested.slice(0, -requestedExt.length) + imageExt
     : requested;

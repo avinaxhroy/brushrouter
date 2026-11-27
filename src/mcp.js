@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { requireMaskImage } from "./providers/image-api.js";
 import { loadConfig } from "./config.js";
-import { saveImage, detectImageMime, batchVariantPath, batchItemPath, pngSize } from "./util/common.js";
+import { saveImage, detectImageMime, batchVariantPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, resolveBatchItem, expandBrainstormBatch, getRecipe, loadRecipes } from "./library.js";
 import {
@@ -610,7 +610,7 @@ async function runGenerate(args, ctx, onProgress) {
       );
       throw e;
     }
-    const saved = saveImage(out, result.buffer, cwd);
+    const saved = saveImage(out, result.buffer, cwd, { matchExtension: !args.out });
     const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
     const dims = pngSize(result.buffer);
     const histRec = tryRecordHistory(
@@ -679,7 +679,7 @@ async function runGenerate(args, ctx, onProgress) {
         { ...effectiveArgs, out: target, count: undefined, cwd, fallback: args.fallback === true },
         cfg,
       );
-      const saved = saveImage(target, result.buffer, cwd);
+      const saved = saveImage(target, result.buffer, cwd, { matchExtension: !args.out });
       const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
       const dims = pngSize(result.buffer);
       const histRec = tryRecordHistory(
@@ -784,9 +784,9 @@ async function runBatchGenerate(args, ctx, onProgress) {
   const outDir = resolve(cwd, args.outDir || `brushrouter-batch-${timestamp}`);
   mkdirSync(outDir, { recursive: true });
 
-  const items = rawItems.map((item, idx) => ({
+  const items = rawItems.map((item) => ({
     ...item,
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.slugLabel || item.prompt),
+    out: item.out ? resolve(outDir, item.out) : undefined,
   }));
 
   const shouldEmbed = args.embedImages === true || (!("embedImages" in args) && rawItems.length <= 3);

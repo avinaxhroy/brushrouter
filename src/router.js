@@ -409,6 +409,7 @@ export async function batchGenerate(
       ...(obj.look ? { look: obj.look } : {}),
       ...(obj.source ? { source: obj.source } : {}),
       out: outPath,
+      matchExtension: !obj.out,
       attempts: [],
       failedProviders: new Set(),
       startedAt: null,
@@ -550,7 +551,7 @@ export async function batchGenerate(
 
         let saved = null;
         if (item.out) {
-          saved = saveImage(item.out, res.buffer, cwd, { force });
+          saved = saveImage(item.out, res.buffer, cwd, { force, matchExtension: item.matchExtension });
         }
 
         const resolvedSeed = Number.isInteger(res.meta?.seed) ? res.meta.seed : Number.isInteger(item.seed) ? item.seed : undefined;
