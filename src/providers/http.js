@@ -29,8 +29,13 @@ export function resolvePath(obj, path) {
 // Body templates are JSON, so a raw prompt with quotes/backslashes/newlines
 // would corrupt the document. Escape, then drop the wrapping quotes.
 function applyTemplate(tpl, vars) {
-  return String(tpl).replace(/\{(\w+)\}/g, (_, k) => {
-    if (vars[k] == null) return "";
+  return String(tpl).replace(/\{(\w+)\}/g, (match, k, offset, str) => {
+    if (vars[k] == null) {
+      // Unquoted placeholder (e.g. `"seed": {seed}`) must serialize as valid JSON `null`,
+      // whereas a quoted placeholder (`"{seed}"`) becomes an empty string.
+      const quoted = str[offset - 1] === '"' && str[offset + match.length] === '"';
+      return quoted ? "" : "null";
+    }
     return JSON.stringify(String(vars[k])).slice(1, -1);
   });
 }
@@ -221,7 +226,7 @@ export async function httpImageGenerate({ prompt, size, quality, seed, images = 
     prompt,
     size: size || "1024x1024",
     quality: quality || "standard",
-    seed: seed != null ? String(seed) : "",
+    seed: seed != null ? String(seed) : null,
     model,
     apiKey: key || "",
     image: imageUrls[0] || "",
