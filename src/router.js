@@ -525,6 +525,8 @@ export {
   getRecipe,
   publicRecipe,
   fill,
+  composePrompt,
+  ratioToSize,
   listCategories,
   loadRecipes,
   recipeCounts,
@@ -536,4 +538,6 @@ export {
   renderCategories,
   RECIPES_DIR,
   STYLES_FILE,
+  MODES,
+  STRICT_SLOTS,
 } from "./library.js";

@@ -3898,3 +3898,60 @@ test("saveKey backs up non-object keys.json and readBodyCapped caps arrayBuffer 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("MCP exposes native prompts/resources and direct recipe+look generate_image validation", async () => {
+  const { handleRequest, handleToolCall } = await import("../src/mcp.js");
+  const init = await handleRequest({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, { cwd: process.cwd() });
+  assert.ok(init.result.capabilities.prompts, "should advertise MCP prompts capability");
+  assert.ok(init.result.capabilities.resources, "should advertise MCP resources capability");
+
+  const plist = await handleRequest({ jsonrpc: "2.0", id: 2, method: "prompts/list", params: {} }, { cwd: process.cwd() });
+  assert.ok(plist.result.prompts.some((p) => p.name === "logo-mark"));
+
+  const pget = await handleRequest(
+    { jsonrpc: "2.0", id: 3, method: "prompts/get", params: { name: "logo-mark", arguments: { text: "ACME", _twist: "gold leaf" } } },
+    { cwd: process.cwd() },
+  );
+  assert.match(pget.result.messages[0].content.text, /ACME/);
+  assert.match(pget.result.messages[0].content.text, /gold leaf/);
+
+  const rlist = await handleRequest({ jsonrpc: "2.0", id: 4, method: "resources/list", params: {} }, { cwd: process.cwd() });
+  assert.ok(rlist.result.resources.some((r) => r.uri === "brushrouter://categories"));
+  assert.ok(rlist.result.resources.some((r) => r.uri === "brushrouter://slots"));
+
+  const rread = await handleRequest(
+    { jsonrpc: "2.0", id: 5, method: "resources/read", params: { uri: "brushrouter://recipes/logo-mark" } },
+    { cwd: process.cwd() },
+  );
+  const parsedRecipe = JSON.parse(rread.result.contents[0].text);
+  assert.equal(parsedRecipe.id, "logo-mark");
+
+  // Direct recipe in generate_image fails fast when required free slot is missing
+  await assert.rejects(
+    () => handleToolCall("generate_image", { recipe: "logo-mark", async: true }, { cwd: process.cwd() }),
+    /missing required slot/,
+  );
+
+  // CLI gen --recipe --set --twist --dry-run --json resolves composed prompt cleanly
+  const { execFileSync } = await import("node:child_process");
+  const cliOut = execFileSync(
+    process.execPath,
+    [
+      join(process.cwd(), "bin/brushrouter.js"),
+      "gen",
+      "--recipe",
+      "logo-mark",
+      "--set",
+      "text=ACME",
+      "--twist",
+      "brass finish",
+      "--dry-run",
+      "--json",
+    ],
+    { encoding: "utf8" },
+  );
+  const cliJson = JSON.parse(cliOut);
+  assert.equal(cliJson.dryRun, true);
+  assert.match(cliJson.prompt, /ACME/);
+  assert.match(cliJson.prompt, /brass finish/);
+});
