@@ -142,6 +142,11 @@ export function batchItemPath(outDir, index, total, prompt = "", customOut = nul
 export const MAX_REF_IMAGE_BYTES = 20 * 1024 * 1024;
 
 export function readImageAsDataUrl(filePath, cwd = process.cwd()) {
+  const { buffer, mime } = readImageFile(filePath, cwd);
+  return `data:${mime};base64,${buffer.toString("base64")}`;
+}
+
+export function readImageFile(filePath, cwd = process.cwd()) {
   const abs = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
   const fd = openSync(abs, "r");
   let buf;
@@ -158,7 +163,7 @@ export function readImageAsDataUrl(filePath, cwd = process.cwd()) {
   }
   const mime = detectImageMime(buf);
   if (!mime) throw new Error(`unsupported reference image type: ${abs}`);
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  return { buffer: buf, mime };
 }
 
 // Same validation as readImageAsDataUrl, same errors, but reads only the magic

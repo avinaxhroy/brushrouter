@@ -1,0 +1,290 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { PROVIDERS, generate, batchGenerate, planAttemptOrder } from "../src/router.js";
+import { handleToolCall, handleRequest } from "../src/mcp.js";
+import { discoverKey } from "../src/util/keys.js";
+
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
+const b64 = png.toString("base64");
+const dataUrl = `data:image/png;base64,${b64}`;
+const apiKey = "fixture-key-not-a-real-credential";
+
+function fixture(t) {
+  const cwd = mkdtempSync(join(tmpdir(), "br-edit-test-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  for (const file of ["base image.png", "extra.png", "mask.png"]) writeFileSync(join(cwd, file), png);
+  return { cwd, prompt: 'replace the sky "carefully"', images: ["base image.png", "extra.png"], mask: "mask.png" };
+}
+
+function mockFetch(t, fetch) {
+  const original = globalThis.fetch;
+  globalThis.fetch = fetch;
+  t.after(() => { globalThis.fetch = original; });
+}
+
+test("OpenAI Images selects generation JSON or edits multipart with ordered references and a PNG mask", async (t) => {
+  const request = fixture(t);
+  const cfg = { apiKey, size: "1024x1024", quality: "medium" };
+  assert.equal((await PROVIDERS.openai.probe(cfg)).available, true);
+  let calls = 0;
+  mockFetch(t, async (url, init) => {
+    assert.equal(init.headers.Authorization, `Bearer ${apiKey}`);
+    if (calls++ === 0) {
+      assert.equal(url, "https://api.openai.com/v1/images/generations");
+      assert.deepEqual(JSON.parse(init.body), { model: "gpt-image-1", prompt: request.prompt, size: "1024x1024", quality: "medium" });
+    } else {
+      assert.equal(url, "https://api.openai.com/v1/images/edits");
+      assert.equal(init.headers["Content-Type"], undefined);
+      assert.equal(init.body.get("model"), "gpt-image-1.5");
+      assert.equal(init.body.get("size"), "1536x1024");
+      assert.equal(init.body.get("background"), "transparent");
+      const refs = init.body.getAll("image[]");
+      assert.deepEqual(refs.map((ref) => ref.name), ["reference-1.png", "reference-2.png"]);
+      assert.deepEqual(Buffer.from(await refs[0].arrayBuffer()), png);
+      assert.deepEqual(Buffer.from(await init.body.get("mask").arrayBuffer()), png);
+    }
+    return Response.json({ data: [{ b64_json: b64 }] });
+  });
+  assert.deepEqual((await PROVIDERS.openai.generate({ prompt: request.prompt }, cfg)).buffer, png);
+  const edit = await PROVIDERS.openai.generate({ ...request, model: "gpt-image-1.5", size: "1536X1024", background: "transparent" }, cfg);
+  assert.deepEqual(edit.buffer, png);
+  assert.equal(edit.meta.maskUsed, true);
+  assert.equal(calls, 2);
+});
+
+test("AI Studio discovers Google keys and sends inline reference data without putting credentials in URLs", async (t) => {
+  const request = fixture(t);
+  const old = Object.fromEntries(["BRUSHROUTER_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"].map((key) => [key, process.env[key]]));
+  t.after(() => {
+    for (const [key, value] of Object.entries(old)) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  delete process.env.BRUSHROUTER_GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  process.env.GOOGLE_API_KEY = apiKey;
+  assert.equal(discoverKey("gemini-api").source, "env:GOOGLE_API_KEY");
+  process.env.GEMINI_API_KEY = apiKey;
+  assert.equal(discoverKey("gemini-api").source, "env:GEMINI_API_KEY");
+  assert.equal((await PROVIDERS["gemini-api"].probe({})).available, true);
+  mockFetch(t, async (url, init) => {
+    assert.equal(url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent");
+    assert.equal(init.headers["x-goog-api-key"], apiKey);
+    const payload = JSON.parse(init.body);
+    assert.deepEqual(payload.contents[0].parts, [{ text: request.prompt }, ...request.images.map(() => ({ inlineData: { mimeType: "image/png", data: b64 } }))]);
+    assert.deepEqual(payload.generationConfig.imageConfig, { aspectRatio: "16:9" });
+    return Response.json({ candidates: [{ content: { parts: [{ text: "image" }, { inlineData: { mimeType: "image/png", data: b64 } }] } }] });
+  });
+  const result = await PROVIDERS["gemini-api"].generate({ ...request, size: "1920x1080", mask: undefined }, {});
+  assert.deepEqual(result.buffer, png);
+  assert.equal(result.meta.imagesUsed, true);
+});
+
+test("Replicate polls a versioned prediction and downloads output without forwarding credentials", async (t) => {
+  const request = fixture(t);
+  const version = "a".repeat(64);
+  const cfg = { apiKey, baseUrl: "http://127.0.0.1:9998/v1", model: `owner/model:${version}`, imageInput: "sources", imageInputArray: true, maskInput: "matte", inputs: { steps: 12 }, widthInput: "w", pollIntervalMs: 1 };
+  let calls = 0;
+  mockFetch(t, async (url, init) => {
+    calls++;
+    switch (new URL(url).pathname) {
+      case "/v1/predictions":
+        assert.equal(init.headers.Prefer, "wait=10");
+        assert.deepEqual(JSON.parse(init.body), { version, input: { prompt: request.prompt, steps: 12, w: 512, sources: [dataUrl, dataUrl], matte: dataUrl } });
+        return Response.json({ id: "job_1", status: "starting" });
+      case "/v1/predictions/job_1":
+        assert.equal(init.headers.Authorization, `Bearer ${apiKey}`);
+        return Response.json({ id: "job_1", status: "succeeded", output: ["http://127.0.0.1:9998/output.png"] });
+      case "/output.png":
+        assert.equal(init.headers, undefined);
+        return new Response(png);
+      default:
+        assert.fail(`unexpected request: ${url}`);
+    }
+  });
+  const result = await PROVIDERS.replicate.generate({ ...request, size: "512x768" }, cfg);
+  assert.deepEqual(result.buffer, png);
+  assert.equal(result.meta.maskUsed, true);
+  await assert.rejects(() => PROVIDERS.replicate.generate(request, { ...cfg, maskInput: undefined }), { code: "UNSUPPORTED" });
+  assert.equal(calls, 3);
+});
+
+test("Replicate defaults to the unversioned Flux model and redacts echoed API credentials", async (t) => {
+  assert.equal((await PROVIDERS.replicate.probe({ apiKey })).available, true);
+  mockFetch(t, async (url, init) => {
+    assert.equal(url, "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions");
+    assert.deepEqual(JSON.parse(init.body), { input: { prompt: "draw", aspect_ratio: "16:9" } });
+    return Response.json({ detail: apiKey }, { status: 429 });
+  });
+  await assert.rejects(() => PROVIDERS.replicate.generate({ prompt: "draw", size: "1600x900" }, { apiKey }),
+    (err) => err.code === "RATE_LIMIT" && err.message.includes("***") && !err.message.includes(apiKey));
+});
+
+test("ComfyUI probes, queues default Flux and template edits, uploads masks, polls, and downloads saved output", async (t) => {
+  const request = fixture(t);
+  const workflow = join(request.cwd, "workflow.json");
+  writeFileSync(workflow, JSON.stringify({ 1: { class_type: "CustomEdit", inputs: {
+    text: "Brief: {prompt}", seed: "{seed}", dimensions: ["{width}", "{height}", "{size}"], refs: ["{image}", "{image2}"], mask: "{mask}",
+  } } }));
+  const uploads = [];
+  let queued = 0;
+  let polled = 0;
+  mockFetch(t, async (url, init) => {
+    const parsed = new URL(url);
+    assert.equal(parsed.origin, "http://127.0.0.1:8188");
+    switch (parsed.pathname) {
+      case "/system_stats": return Response.json({ system: {} });
+      case "/upload/image": {
+        assert.equal(init.body.get("type"), "input");
+        const file = init.body.get("image");
+        assert.deepEqual(Buffer.from(await file.arrayBuffer()), png);
+        uploads.push(file.name);
+        return Response.json({ name: `upload-${uploads.length}.png`, subfolder: "imports" });
+      }
+      case "/prompt": {
+        const graph = JSON.parse(init.body).prompt;
+        if (++queued === 1) {
+          assert.equal(graph["1"].inputs.unet_name, "flux1-schnell.safetensors");
+          assert.equal(graph["4"].inputs.text, request.prompt);
+          assert.equal(graph["8"].class_type, "SaveImage");
+        } else {
+          assert.deepEqual(graph["1"].inputs, {
+            text: `Brief: ${request.prompt}`, seed: graph["1"].inputs.seed, dimensions: [640, 896, "640x896"],
+            refs: ["imports/upload-1.png", "imports/upload-2.png"], mask: "imports/upload-3.png",
+          });
+          assert.equal(typeof graph["1"].inputs.seed, "number");
+        }
+        return Response.json({ prompt_id: "job" });
+      }
+      case "/history/job":
+        if (polled++ % 2 === 0) return Response.json({});
+        return Response.json({ job: { outputs: { 8: { images: [{ filename: "with space.png", subfolder: "test", type: "output" }] } } } });
+      case "/view":
+        assert.deepEqual(Object.fromEntries(parsed.searchParams), { filename: "with space.png", subfolder: "test", type: "output" });
+        return new Response(png);
+      default: assert.fail(`unexpected request: ${url}`);
+    }
+  });
+  assert.equal((await PROVIDERS.comfyui.probe({})).available, true);
+  assert.deepEqual((await PROVIDERS.comfyui.generate({ prompt: request.prompt }, { pollIntervalMs: 1 })).buffer, png);
+  await assert.rejects(() => PROVIDERS.comfyui.generate(request, {}), { code: "UNSUPPORTED" });
+  const result = await PROVIDERS.comfyui.generate({ ...request, size: "640x896" }, { workflow, pollIntervalMs: 1 });
+  assert.deepEqual(result.buffer, png);
+  assert.equal(result.meta.maskUsed, true);
+  assert.equal(new Set(uploads).size, 3);
+  assert.equal(polled, 4);
+});
+
+test("fal selects generation, edit and inpainting endpoints with appropriate reference fields", async (t) => {
+  const request = fixture(t);
+  let calls = 0;
+  mockFetch(t, async (url, init) => {
+    assert.equal(init.headers.Authorization, `Key ${apiKey}`);
+    const payload = JSON.parse(init.body);
+    assert.equal(payload.prompt, request.prompt);
+    switch (calls++) {
+      case 0:
+        assert.equal(url, "https://fal.run/fal-ai/flux/schnell");
+        assert.equal(payload.image_urls, undefined);
+        break;
+      case 1:
+        assert.equal(url, "https://fal.run/fal-ai/flux-2/edit");
+        assert.deepEqual(payload.image_urls, [dataUrl, dataUrl]);
+        break;
+      case 2:
+        assert.equal(url, "https://fal.run/custom/inpaint");
+        assert.equal(payload.image_url, dataUrl);
+        assert.equal(payload.mask_url, dataUrl);
+        assert.equal(payload.image_urls, undefined);
+        break;
+      default:
+        assert.fail("unexpected fal request");
+    }
+    return Response.json({ images: [{ url: dataUrl }] });
+  });
+  assert.deepEqual((await PROVIDERS.fal.generate({ prompt: request.prompt }, { apiKey })).buffer, png);
+  assert.deepEqual((await PROVIDERS.fal.generate({ ...request, mask: undefined }, { apiKey })).buffer, png);
+  await assert.rejects(() => PROVIDERS.fal.generate(request, { apiKey }), { code: "UNSUPPORTED" });
+  const edit = await PROVIDERS.fal.generate({ ...request, images: request.images.slice(0, 1) }, { apiKey, inpaintModel: "custom/inpaint" });
+  assert.equal(edit.meta.maskUsed, true);
+  assert.equal(calls, 3);
+});
+
+test("Gemini and Antigravity stage references and never mistake them for generated outputs", { skip: process.platform === "win32" }, async (t) => {
+  const request = fixture(t);
+  for (const binary of ["gemini-fixture", "agy-fixture"]) {
+    const cli = join(request.cwd, binary);
+    const script = `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2).join(" ");
+if (!args.includes("@reference-inputs/1.png") || !args.includes("@reference-inputs/2.png")) process.exit(7);
+if (fs.readFileSync("reference-inputs/1.png").toString("base64") !== "${b64}") process.exit(8);
+console.log(process.cwd() + "/reference-inputs/1.png");
+if (!args.includes("NO OUTPUT")) fs.writeFileSync("brushrouter-out.png", Buffer.from("${b64}", "base64"));
+`;
+    writeFileSync(cli, script, { mode: 0o700 });
+    assert.deepEqual((await PROVIDERS.gemini.generate({ ...request, mask: undefined }, { cli })).buffer, png);
+    await assert.rejects(() => PROVIDERS.gemini.generate({ ...request, prompt: "NO OUTPUT", mask: undefined }, { cli }), /produced no image/);
+  }
+});
+
+test("single and batch mask routing skips incompatible routes even with explicit fallback", async (t) => {
+  const request = fixture(t);
+  const seen = [];
+  const cfg = { priority: ["gemini-api", "openai"], providers: {} };
+  t.mock.method(PROVIDERS["gemini-api"], "generate", async () => { assert.fail("incompatible route was invoked"); });
+  t.mock.method(PROVIDERS.openai, "probe", async () => ({ available: true }));
+  t.mock.method(PROVIDERS.openai, "generate", async (input) => { seen.push(input.mask); return { buffer: png, meta: {} }; });
+  assert.deepEqual(await planAttemptOrder(cfg, request), ["openai"]);
+  await assert.rejects(() => generate({ ...request, provider: "gemini-api" }, cfg), { code: "UNSUPPORTED" });
+  await assert.rejects(() => generate({ ...request, images: [] }, cfg), { code: "INVALID_MASK" });
+  assert.equal((await generate({ ...request, provider: "gemini-api", fallback: true }, cfg)).meta.maskUsed, true);
+  const batch = await batchGenerate({ items: [request], provider: "gemini-api", fallback: true }, cfg);
+  assert.equal(batch.results[0].provider, "openai");
+  assert.equal(batch.results[0].meta.maskUsed, true);
+  const unsupported = await batchGenerate({ items: [request], provider: "gemini-api" }, cfg);
+  assert.equal(unsupported.results[0].code, "UNSUPPORTED");
+  await assert.rejects(() => batchGenerate({ items: [{ ...request, images: [] }] }, cfg), { code: "INVALID_MASK" });
+  assert.deepEqual(seen, [request.mask, request.mask]);
+});
+
+test("CLI mask flag and MCP mask schemas forward inputs and reject missing bases", async (t) => {
+  const request = fixture(t);
+  const config = join(request.cwd, "config.json");
+  writeFileSync(config, JSON.stringify({ providers: { openai: { enabled: true } } }));
+  const original = process.env.BRUSHROUTER_USER_CONFIG;
+  process.env.BRUSHROUTER_USER_CONFIG = config;
+  t.after(() => {
+    if (original == null) delete process.env.BRUSHROUTER_USER_CONFIG;
+    else process.env.BRUSHROUTER_USER_CONFIG = original;
+  });
+  const cli = resolve("bin/brushrouter.js");
+  const dry = spawnSync(process.execPath, [cli, "--mask", request.mask, "gen", request.prompt, "-p", "openai", "--images", request.images[0], "--dry-run", "--json"], { cwd: request.cwd, encoding: "utf8" });
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.equal(JSON.parse(dry.stdout).mask, request.mask);
+  const invalid = spawnSync(process.execPath, [cli, "gen", request.prompt, "--mask", request.mask], { cwd: request.cwd, encoding: "utf8" });
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /requires a base image/);
+
+  t.mock.method(PROVIDERS.openai, "generate", async ({ images, mask }) => {
+    assert.deepEqual(images, request.images);
+    assert.equal(mask, request.mask);
+    return { buffer: png, meta: {} };
+  });
+  const ctx = { cwd: request.cwd };
+  const { result } = await handleRequest({ jsonrpc: "2.0", id: 1, method: "tools/list" }, ctx);
+  assert.equal(result.tools.find((tool) => tool.name === "generate_image").inputSchema.properties.mask.type, "string");
+  assert.equal(result.tools.find((tool) => tool.name === "batch_generate_images").inputSchema.properties.items.items.properties.mask.type, "string");
+  const single = await handleToolCall("generate_image", { ...request, provider: "openai", out: "single.png" }, ctx);
+  assert.equal(single.isError, false);
+  assert.ok(existsSync(join(request.cwd, "single.png")));
+  const batch = await handleToolCall("batch_generate_images", { provider: "openai", items: [{ ...request, out: "batch.png" }], outDir: "out" }, ctx);
+  assert.equal(batch.isError, false);
+  assert.ok(existsSync(join(request.cwd, "out", "batch.png")));
+  await assert.rejects(() => handleToolCall("generate_image", { ...request, images: [] }, ctx), { code: "INVALID_MASK" });
+});

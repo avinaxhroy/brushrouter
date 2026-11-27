@@ -169,6 +169,7 @@ function parse(argv) {
         quality: { type: "string", short: "q" },
         background: { type: "string" },
         images: { type: "string", multiple: true },
+        mask: { type: "string" },
         json: { type: "boolean", default: false },
         "dry-run": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
@@ -233,7 +234,7 @@ function parse(argv) {
 // tokens a leading flag consumes while looking for the command.
 const VALUE_FLAGS = new Set([
   "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
-  "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
+  "--quality", "-q", "--background", "--images", "--mask", "--category", "-c", "--kind",
   "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape",
   "--recipe", "--look", "--twist", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
@@ -316,6 +317,7 @@ ${paint(C.bold, "OPTIONS")}
                            the codex route; phrase prompts as "sticker/isolated"
                            to reliably keep alpha — other routes get a prompt hint)
       --images <path>      Reference image (repeatable; image-to-image)
+      --mask <path>        Inpaint the first reference image (requires --images)
       --json               Machine-readable output
   -c, --category <id>      Recipes: restrict to one category
       --kind <k>           Recipes: job (a layout we wrote, ${LIB_COUNTS.job}) | look
@@ -472,6 +474,16 @@ async function cmdGenerate(args) {
   // Reference images: validate before spending a request, and never let a route
   // silently drop them (they used to be accepted and ignored on 4 of 7 routes).
   const imagePaths = values.images || [];
+  const mask = values.mask;
+  if (mask != null) {
+    try {
+      if (!mask.trim() || !imagePaths.length) throw new Error("requires a base image via --images");
+      assertImageFile(mask, cwd);
+    } catch (e) {
+      console.error(bad(`error: --mask ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
+  }
   for (const p of imagePaths) {
     try {
       // Header-only: this loop only needs to reject a bad reference before a
@@ -487,7 +499,7 @@ async function cmdGenerate(args) {
     console.error(bad("error: --background must be opaque or transparent"));
     return exitAfterFlush(2);
   }
-  if (imagePaths.length && values.provider) {
+  if (imagePaths.length && values.provider && !(mask && values.fallback)) {
     // `supportsImages` is a static capability flag, not a health check. This used
     // to call probeAll() — spawning the Codex CLI and hitting the OpenRouter API
     // — to read a constant. An unknown id is left for generate() to reject.
@@ -508,7 +520,7 @@ async function cmdGenerate(args) {
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback, images: imagePaths });
+      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback, images: imagePaths, mask });
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -516,7 +528,7 @@ async function cmdGenerate(args) {
     const rows = await probeAll(cfg);
     const byId = new Map(rows.map((r) => [r.id, r]));
     if (values.json) {
-      console.log(JSON.stringify(redactValue({ dryRun: true, prompt, out, provider: values.provider || null, model: values.model || null, images: imagePaths, wouldTry: order.map((id) => ({ id, ready: Boolean(byId.get(id)?.available), detail: byId.get(id)?.detail || null })) }), null, 2));
+      console.log(JSON.stringify(redactValue({ dryRun: true, prompt, out, provider: values.provider || null, model: values.model || null, images: imagePaths, mask, wouldTry: order.map((id) => ({ id, ready: Boolean(byId.get(id)?.available), detail: byId.get(id)?.detail || null })) }), null, 2));
       return;
     }
     console.log(paint(C.bold, "Dry run") + dim(" — no request sent, no quota used\n"));
@@ -524,6 +536,7 @@ async function cmdGenerate(args) {
     console.log(`  out:      ${out}`);
     if (values.model) console.log(`  model:    ${values.model}`);
     if (imagePaths.length) console.log(`  images:   ${imagePaths.join(", ")}`);
+    if (mask) console.log(`  mask:     ${redact(mask)}`);
     console.log(dim("\n  would try, in order:"));
     for (const id of order) {
       const r = byId.get(id);
@@ -545,6 +558,7 @@ async function cmdGenerate(args) {
         background: values.background || undefined,
         seed,
         images: imagePaths,
+        mask,
         out,
         cwd,
         provider: values.provider,
@@ -981,9 +995,22 @@ async function cmdBatch(args) {
 
   const items = resolvedItems.map((item, idx) => ({
     ...item,
+    ...(item.mask != null || values.mask != null ? { mask: item.mask ?? values.mask } : {}),
     ...(item.seed !== undefined ? { seed: item.seed } : batchSeed !== undefined ? { seed: batchSeed } : {}),
     out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, resolvedItems.length, item.slugLabel || item.prompt),
   }));
+
+  for (const [index, item] of items.entries()) {
+    if (item.mask == null) continue;
+    try {
+      if (typeof item.mask !== "string" || !item.mask.trim() || !item.images.length) throw new Error("requires a mask file path and a base image");
+      assertImageFile(item.mask, cwd);
+      for (const path of item.images) assertImageFile(path, cwd);
+    } catch (e) {
+      console.error(bad(`error: batch item ${index + 1} mask: ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
+  }
 
   const onProgress = values.verbose
     ? (msg) => process.stderr.write(dim(`  · ${redact(msg)}\n`))
@@ -992,7 +1019,10 @@ async function cmdBatch(args) {
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback });
+      const plans = await Promise.all(items.map((item) => planAttemptOrder(cfg, {
+        provider: values.provider, fallback: values.fallback, images: item.images, mask: item.mask,
+      })));
+      order = [...new Set(plans.flat())];
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -1024,6 +1054,7 @@ async function cmdBatch(args) {
               index: idx + 1,
               prompt: it.prompt,
               out: it.out,
+              ...(it.mask !== undefined ? { mask: it.mask } : {}),
               ...(it.size ? { size: it.size } : {}),
               ...(it.recipe ? { recipe: it.recipe } : {}),
               ...(it.look ? { look: it.look } : {}),
@@ -1620,7 +1651,7 @@ async function cmdProviders(args) {
   const width = Math.max(0, ...rows.map((r) => r.id.length));
   for (const r of rows) {
     const badge = !r.enabled ? warn("disabled") : r.available ? ok("connected") : bad("unavailable");
-    console.log(`  ${r.id.padEnd(width)}  ${badge}  ${dim(r.label)}${r.supportsImages ? "" : dim("  (no reference images)")}`);
+    console.log(`  ${r.id.padEnd(width)}  ${badge}  ${dim(r.label)}${r.supportsMask ? dim("  (inpainting)") : r.supportsImages ? "" : dim("  (no reference images)")}`);
     if (r.detail) console.log(`  ${" ".repeat(width)}  ${dim(redact(r.detail))}`);
   }
   console.log(dim(`\nAuto-routing order: ${cfg.priority.join(" → ")}`));
@@ -1695,7 +1726,11 @@ async function cmdModels(args) {
       "gemini-2.5-flash-image",
     ],
     openrouter: [],
-    fal: ["fal-ai/flux/schnell", "fal-ai/flux/dev", "fal-ai/flux-pro/v1.1"],
+    fal: ["fal-ai/flux/schnell", "fal-ai/flux/dev", "fal-ai/flux-pro/v1.1", "fal-ai/flux-2/edit", "fal-ai/flux-lora/inpainting"],
+    openai: ["gpt-image-1", "gpt-image-1.5", "gpt-image-1-mini"],
+    "gemini-api": ["gemini-2.5-flash-image"],
+    replicate: ["black-forest-labs/flux-schnell"],
+    comfyui: ["flux1-schnell.safetensors"],
     "custom-http": ["(from your config)"],
   };
   // OpenRouter is the one provider with a live catalogue — fetch it so the user

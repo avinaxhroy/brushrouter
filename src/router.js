@@ -17,6 +17,11 @@ import { codexProvider, readAuth } from "./providers/codex.js";
 import { gptweb2apiProvider } from "./providers/gptweb2api.js";
 import { geminiProvider } from "./providers/gemini.js";
 import { openrouterProvider, falProvider, customHttpProvider } from "./providers/http.js";
+import { openAIProvider } from "./providers/openai.js";
+import { geminiAPIProvider } from "./providers/gemini-api.js";
+import { replicateProvider } from "./providers/replicate.js";
+import { comfyUIProvider } from "./providers/comfyui.js";
+import { providerError, requireMaskImage } from "./providers/image-api.js";
 
 // Invoke a caller-supplied callback (progress, item completion, cooldown, ...).
 // These are UI hooks: one that throws must never escape into routing code, or
@@ -34,8 +39,12 @@ export const PROVIDERS = {
   codex: codexProvider,
   gptweb2api: gptweb2apiProvider,
   gemini: geminiProvider,
+  comfyui: comfyUIProvider,
   openrouter: openrouterProvider,
   fal: falProvider,
+  openai: openAIProvider,
+  "gemini-api": geminiAPIProvider,
+  replicate: replicateProvider,
   "custom-http": customHttpProvider,
 };
 
@@ -63,6 +72,7 @@ export async function probeAll(cfg) {
         kind: p.kind,
         note: p.note,
         supportsImages: p.supportsImages !== false,
+        supportsMask: p.supportsMask === true,
         enabled: pcfg.enabled !== false,
         ...status,
       };
@@ -72,8 +82,8 @@ export async function probeAll(cfg) {
 
 // Exported so the CLI's `gen --dry-run` reports the exact order the router
 // would use instead of re-deriving it.
-export async function planAttemptOrder(cfg, { provider, fallback, images = [] } = {}) {
-  return attemptOrder(cfg, { provider, fallback, images });
+export async function planAttemptOrder(cfg, { provider, fallback, images = [], mask } = {}) {
+  return attemptOrder(cfg, { provider, fallback, images, mask });
 }
 
 // Turn "that route is switched off" into a rejection the caller can act on.
@@ -103,7 +113,8 @@ function assertProviderEnabled(cfg, id) {
 }
 
 // Build the ordered attempt list for a request.
-async function attemptOrder(cfg, { provider, fallback, images }) {
+async function attemptOrder(cfg, { provider, fallback, images, mask }) {
+  requireMaskImage(mask, images);
   const all = listProviderIds();
   const allSet = new Set(all);
   if (provider) {
@@ -111,9 +122,13 @@ async function attemptOrder(cfg, { provider, fallback, images }) {
     // Checked before the fallback branch so `--provider X --fallback` cannot
     // reach a disabled X through the "rest of the chain" path either.
     assertProviderEnabled(cfg, provider);
-    if (!fallback) return [provider];
+    if (!fallback) {
+      if (mask && !PROVIDERS[provider].supportsMask) throw providerError("UNSUPPORTED", `${provider} does not support masks`);
+      return [provider];
+    }
     const rest = cfg.priority.filter((p) => p !== provider && allSet.has(p) && providerConfig(cfg, p).enabled !== false);
-    return [provider, ...rest];
+    const explicit = [provider, ...rest];
+    return mask ? maskRoutes(explicit) : explicit;
   }
   let enabled = cfg.priority.filter((p) => allSet.has(p) && providerConfig(cfg, p).enabled !== false);
   // A free ChatGPT login can only generate through the gptweb2api web bucket
@@ -132,21 +147,32 @@ async function attemptOrder(cfg, { provider, fallback, images }) {
     const incapable = enabled.filter((p) => PROVIDERS[p]?.supportsImages === false);
     enabled = [...capable, ...incapable];
   }
-  return enabled;
+  return mask ? maskRoutes(enabled) : enabled;
+}
+
+function maskRoutes(ids) {
+  const compatible = ids.filter((id) => PROVIDERS[id].supportsMask === true);
+  if (!compatible.length) throw providerError("UNSUPPORTED", "no enabled provider supports masks");
+  return compatible;
+}
+
+function acceptsItem(id, item) {
+  return (!item.mask || PROVIDERS[id].supportsMask === true) &&
+    (!item.images?.length || PROVIDERS[id].supportsImages !== false);
 }
 
 function promptForBackground(prompt, background, providerId) {
-  // codex takes background as an API field; every other route can only put it
+  // Codex and OpenAI Images take background as an API field; other routes put it
   // in the prompt, so say it there rather than drop the request.
-  return background === "transparent" && providerId !== "codex"
+  return background === "transparent" && providerId !== "codex" && providerId !== "openai"
     ? `${prompt} Generate the image with a fully transparent background (no scene behind the subject, RGBA output).`
     : prompt;
 }
 
-export async function generate({ prompt, size, quality, background, seed, images, out, cwd = process.cwd(), provider, model, fallback = false, onProgress, history = false }, cfgIn) {
+export async function generate({ prompt, size, quality, background, seed, images, mask, out, cwd = process.cwd(), provider, model, fallback = false, onProgress, history = false }, cfgIn) {
   const cfg = cfgIn || loadConfig({ cwd });
   const genStartedAt = Date.now();
-  const order = await attemptOrder(cfg, { provider, fallback, images });
+  const order = await attemptOrder(cfg, { provider, fallback, images, mask });
   if (!order.length) {
     const err = new Error("no providers enabled — check your config");
     err.code = "NO_PROVIDERS";
@@ -171,7 +197,7 @@ export async function generate({ prompt, size, quality, background, seed, images
     const promptForProvider = promptForBackground(prompt, background, id);
     const attemptStart = Date.now();
     try {
-      const result = await p.generate({ prompt: promptForProvider, size, quality, background, seed, images, out, cwd, model, onProgress }, pcfg);
+      const result = await p.generate({ prompt: promptForProvider, size, quality, background, seed, images, mask, out, cwd, model, onProgress }, pcfg);
       // Contract check: a provider must return actual image bytes. A provider
       // that accidentally returns an Error object (or nothing) must be treated
       // as a failure here, not silently spread into a buffer-less result.
@@ -189,6 +215,7 @@ export async function generate({ prompt, size, quality, background, seed, images
         ...result.meta,
         imagesUsed: p.supportsImages !== false && Boolean(images?.length),
         ...(resolvedSeed !== undefined ? { seed: resolvedSeed } : {}),
+        ...(mask && { maskUsed: true }),
       };
       const durationMs = Date.now() - genStartedAt;
       let historyRecord = null;
@@ -318,6 +345,7 @@ export async function batchGenerate(
   if (!Array.isArray(items) || items.length === 0) {
     return { results: [], total: 0, completed: 0, failed: 0 };
   }
+  for (const item of items) requireMaskImage(item?.mask, item?.images);
 
   let allowedProviders = [];
   if (provider) {
@@ -376,6 +404,7 @@ export async function batchGenerate(
       seed: obj.seed,
       model: obj.model,
       images: obj.images || [],
+      mask: obj.mask,
       ...(obj.recipe ? { recipe: obj.recipe } : {}),
       ...(obj.look ? { look: obj.look } : {}),
       ...(obj.source ? { source: obj.source } : {}),
@@ -399,8 +428,7 @@ export async function batchGenerate(
     const now = Date.now();
     for (const id of allowedProviders) {
       if (item.failedProviders.has(id)) continue;
-      const p = PROVIDERS[id];
-      if (item.images?.length && p.supportsImages === false) continue;
+      if (!acceptsItem(id, item)) continue;
       const until = cooldownUntil.get(id) || 0;
       if (until > now) continue;
       const active = activeCount.get(id) || 0;
@@ -452,7 +480,7 @@ export async function batchGenerate(
         for (const item of pendingQueue) {
           for (const id of allowedProviders) {
             if (item.failedProviders.has(id)) continue;
-            if (item.images?.length && PROVIDERS[id]?.supportsImages === false) continue;
+            if (!acceptsItem(id, item)) continue;
             const until = cooldownUntil.get(id) || 0;
             if (until > now) nextExpiry = Math.min(nextExpiry, until - now);
           }
@@ -470,12 +498,13 @@ export async function batchGenerate(
           }, Math.max(50, nextExpiry));
         } else {
           const item = pendingQueue.shift();
+          const noMaskRoutes = item.mask && !allowedProviders.some((id) => PROVIDERS[id].supportsMask);
           const failure = {
             ok: false,
             index: item.index,
             item,
-            error: "all available providers failed or incompatible",
-            code: "ALL_FAILED",
+            error: noMaskRoutes ? "no available provider supports masks" : "all available providers failed or incompatible",
+            code: noMaskRoutes ? "UNSUPPORTED" : "ALL_FAILED",
             attempts: item.attempts,
           };
           results[item.index] = failure;
@@ -503,6 +532,7 @@ export async function batchGenerate(
             background: item.background,
             seed: item.seed,
             images: item.images,
+            mask: item.mask,
             out: item.out,
             cwd,
             model: item.model,
@@ -542,6 +572,7 @@ export async function batchGenerate(
             ...res.meta,
             imagesUsed: p.supportsImages !== false && Boolean(item.images?.length),
             ...(resolvedSeed !== undefined ? { seed: resolvedSeed } : {}),
+            ...(item.mask && { maskUsed: true }),
           },
           attempts: item.attempts,
         };
@@ -566,7 +597,7 @@ export async function batchGenerate(
         }
 
         const hasCandidate = allowedProviders.some(
-          (cand) => !item.failedProviders.has(cand) && (!item.images?.length || PROVIDERS[cand]?.supportsImages !== false),
+          (cand) => !item.failedProviders.has(cand) && acceptsItem(cand, item),
         );
 
         if (hasCandidate && (!provider || fallback)) {

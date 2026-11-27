@@ -48,6 +48,8 @@ const ENV_NAMES = {
   openrouter: ["BRUSHROUTER_OPENROUTER_KEY", "OPENROUTER_API_KEY", "OPENROUTER_KEY"],
   fal: ["BRUSHROUTER_FAL_KEY", "FAL_KEY", "FAL_API_KEY"],
   openai: ["BRUSHROUTER_OPENAI_KEY", "OPENAI_API_KEY"],
+  "gemini-api": ["BRUSHROUTER_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"],
+  replicate: ["BRUSHROUTER_REPLICATE_KEY", "REPLICATE_API_TOKEN"],
   custom: ["BRUSHROUTER_CUSTOM_KEY"],
 };
 
@@ -118,7 +120,7 @@ export function discoverKey(provider, fileCache = null) {
 export function discoverAll() {
   const fileCache = new Map();
   const out = {};
-  for (const p of ["openrouter", "fal", "openai", "custom"]) out[p] = discoverKey(p, fileCache);
+  for (const p of ["openrouter", "fal", "openai", "gemini-api", "replicate", "custom"]) out[p] = discoverKey(p, fileCache);
   return out;
 }
 

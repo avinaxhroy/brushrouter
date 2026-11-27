@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
+import { requireMaskImage } from "./providers/image-api.js";
 import { loadConfig } from "./config.js";
 import { saveImage, detectImageMime, batchVariantPath, batchItemPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
@@ -85,6 +86,7 @@ const TOOL_SCHEMA = {
         description:
           "Optional reference image paths (for image-to-image / editing). Each file is read from the local filesystem and sent to the chosen provider, so only pass paths the user has agreed to upload.",
       },
+      mask: { type: "string", description: "Optional inpainting mask file path for the first reference image. Requires images and a mask-capable route; only pass files the user has agreed to upload." },
       async: {
         type: "boolean",
         description:
@@ -140,9 +142,10 @@ const BATCH_TOOL_SCHEMA = {
               items: { type: "string" },
               description: "Optional reference image paths for this item.",
             },
+            mask: { type: "string", description: "Optional inpainting mask file path; requires a reference image in this item." },
           },
         },
-        description: "List of items with per-item options (prompt, recipe, look, values, twist, includeNegatives, out, size, quality, background, model, images).",
+        description: "List of items with per-item options (prompt, recipe, look, values, twist, includeNegatives, out, size, quality, background, model, images, mask).",
       },
       brainstorm: {
         type: "string",
@@ -452,6 +455,7 @@ async function mapLimited(items, limit, fn) {
 }
 
 function assertGenerateArgs(args, cwd = process.cwd()) {
+  requireMaskImage(args?.mask, args?.images);
   const hasRecipe = typeof args?.recipe === "string" && args.recipe.trim() !== "";
   const hasLook = typeof args?.look === "string" && args.look.trim() !== "";
   let resolvedPrompt = typeof args?.prompt === "string" ? args.prompt : "";
@@ -555,6 +559,7 @@ function validateBatchArgs(args) {
   const normalized = rawItems.map((item, idx) =>
     resolveBatchItem(item, batchDefaults, { index: idx, label: "batch_generate_images items" }),
   );
+  for (const item of normalized) requireMaskImage(item.mask, item.images);
   return { rawItems: normalized, concurrency, brainstorm: null };
 }
 

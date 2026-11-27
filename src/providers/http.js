@@ -10,6 +10,7 @@ import { registerSecret } from "../util/redact.js";
 import { readFileSync } from "node:fs";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { providerError, requireMaskImage } from "./image-api.js";
 
 function resolveKey(cfg, provider) {
   // A key supplied directly in config must also be registered with the
@@ -153,11 +154,11 @@ async function assertSafeImageDownloadTarget(rawUrl, { allowedOrigins = [] } = {
   return safeUrl;
 }
 
-async function fetchImageToBuffer(url, headers, { allowedOrigins = [] } = {}) {
+export async function fetchImageToBuffer(url, headers, { allowedOrigins = [], remaining = () => 120000 } = {}) {
   let current = await assertSafeImageDownloadTarget(url, { allowedOrigins });
   const maxRedirects = 5;
   for (let hop = 0; hop <= maxRedirects; hop++) {
-    const res = await fetchWithTimeout(current, { headers, redirect: "manual" }, 120000);
+    const res = await fetchWithTimeout(current, { headers, redirect: "manual" }, remaining());
     if (res.status >= 300 && res.status < 400) {
       res[RESPONSE_SETTLED]?.();
       const loc = res.headers?.get?.("location");
@@ -596,7 +597,8 @@ function generateOpenRouter({ prompt, size, quality, seed, images, cwd, onProgre
 
 export const falProvider = {
   id: "fal",
-  supportsImages: false,
+  supportsImages: true,
+  supportsMask: true,
   label: "fal.ai",
   kind: "api-key",
   note: "Fast hosted models (FLUX, etc). Key from config or BRUSHROUTER_FAL_KEY.",
@@ -605,12 +607,16 @@ export const falProvider = {
     if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_FAL_KEY)" };
     return { available: true, auth: "ok", detail: `key from ${found.source} (validated on first use)` };
   },
-  async generate({ prompt, size, quality, seed, images = [], cwd, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, size, quality, seed, images = [], mask, cwd, onProgress, model: requestedModel }, cfg) {
+    requireMaskImage(mask, images);
+    if (mask && images.length !== 1) throw providerError("UNSUPPORTED", "fal inpainting supports exactly one base image");
     const found = resolveKey(cfg, "fal");
-    const model = requestedModel || cfg?.model || "fal-ai/flux/schnell";
+    const model = requestedModel || (mask ? cfg?.inpaintModel || "fal-ai/flux-lora/inpainting"
+      : images.length ? cfg?.editModel || "fal-ai/flux-2/edit" : cfg?.model || "fal-ai/flux/schnell");
     const base = (cfg?.baseUrl || "https://fal.run").replace(/\/$/, "");
     const n = String(size || "1024x1024").match(/(\d+)\s*[xX]\s*(\d+)/);
-    return httpImageGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, {
+    const maskUrl = mask && readImageAsDataUrl(mask, cwd);
+    const result = await httpImageGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, {
       id: "fal",
       name: "fal.ai",
       url: `${base}/${model}`,
@@ -621,17 +627,19 @@ export const falProvider = {
       keyPrefix: "Key ",
       headers: {},
       model,
-      // Text-to-image only: the vendor route takes a prompt, no image inputs.
-      supportsRefImages: false,
-      body: JSON.stringify({
-        prompt: "{prompt}",
+      supportsRefImages: true,
+      buildBody: ({ prompt, imageUrls }) => ({
+        prompt,
         image_size: n ? { width: Number(n[1]), height: Number(n[2]) } : "square_hd",
         num_images: 1,
         ...(Number.isInteger(seed) ? { seed } : {}),
+        ...(mask ? { image_url: imageUrls[0], mask_url: maskUrl }
+          : imageUrls.length ? { image_urls: imageUrls } : {}),
       }),
       responsePath: "json:images.0.url",
       defaultModel: model,
     });
+    return { ...result, meta: { ...result.meta, maskUsed: Boolean(mask) } };
   },
 };
 

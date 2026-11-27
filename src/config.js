@@ -53,7 +53,7 @@ export const DEFAULT_CONFIG = {
   // Order rationale: prefer NATIVE, already-authenticated routes (no keys, no
   // extra login) before anything that needs credentials, and the setup-heavy
   // sidecar route (gptweb2api) before the user-configured endpoint.
-  priority: ["codex-cli", "codex", "gemini", "openrouter", "fal", "gptweb2api", "custom-http"],
+  priority: ["codex-cli", "codex", "gemini", "comfyui", "openrouter", "fal", "openai", "gemini-api", "replicate", "gptweb2api", "custom-http"],
 
   // Session-start guidance handed to MCP clients in the `initialize` result.
   // This is the one place an MCP server can tell the calling model WHEN to
@@ -151,7 +151,41 @@ export const DEFAULT_CONFIG = {
       apiKey: null,
       baseUrl: "https://fal.run",
       model: "fal-ai/flux/schnell",
+      editModel: "fal-ai/flux-2/edit",
+      inpaintModel: "fal-ai/flux-lora/inpainting",
       timeoutMs: 180000,
+    },
+
+    openai: {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-image-1",
+      timeoutMs: 180000,
+    },
+    "gemini-api": {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      model: "gemini-2.5-flash-image",
+      timeoutMs: 180000,
+    },
+    replicate: {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://api.replicate.com/v1",
+      model: "black-forest-labs/flux-schnell",
+      inputs: {},
+      imageInput: null,
+      maskInput: null,
+      timeoutMs: 300000,
+    },
+    comfyui: {
+      enabled: false,
+      baseUrl: "http://127.0.0.1:8188",
+      model: "flux1-schnell.safetensors",
+      workflow: null,
+      timeoutMs: 300000,
     },
 
     gptweb2api: {
@@ -342,6 +376,14 @@ function envOverrides() {
     BRUSHROUTER_OPENROUTER_RESOLUTION: ["openrouter", "resolution"],
     BRUSHROUTER_FAL_KEY: ["fal", "apiKey"],
     BRUSHROUTER_FAL_MODEL: ["fal", "model"],
+    BRUSHROUTER_FAL_EDIT_MODEL: ["fal", "editModel"],
+    BRUSHROUTER_FAL_INPAINT_MODEL: ["fal", "inpaintModel"],
+    BRUSHROUTER_OPENAI_MODEL: ["openai", "model"],
+    BRUSHROUTER_GEMINI_API_MODEL: ["gemini-api", "model"],
+    BRUSHROUTER_REPLICATE_MODEL: ["replicate", "model"],
+    BRUSHROUTER_COMFYUI_URL: ["comfyui", "baseUrl"],
+    BRUSHROUTER_COMFYUI_MODEL: ["comfyui", "model"],
+    BRUSHROUTER_COMFYUI_WORKFLOW: ["comfyui", "workflow"],
     BRUSHROUTER_CUSTOM_URL: ["custom-http", "url"],
     BRUSHROUTER_CUSTOM_KEY: ["custom-http", "apiKey"],
     BRUSHROUTER_GPTWEB_COOKIE: ["gptweb2api", "cookie"],
