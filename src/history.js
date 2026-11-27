@@ -839,6 +839,20 @@ export function formatPct(rate) {
   return `${(rate * 100).toFixed(1)}%`;
 }
 
+function sanitizeTerminalText(value) {
+  if (value == null) return "";
+  return String(value)
+    // Strip OSC sequences (e.g. ESC ] ... BEL or ESC \)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    // Strip CSI / ANSI escape sequences
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    // Strip remaining 2-byte ESC sequences
+    .replace(/\x1b[@-Z\\-_]/g, "")
+    // Strip C0 and C1 control characters (preserving spaces, normalizing \r/\n/\t to space)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+}
+
 export function renderHistoryList(result) {
   if (!result.entries.length) {
     return result.total === 0
@@ -851,15 +865,16 @@ export function renderHistoryList(result) {
   for (const e of result.entries) {
     const status = e.ok ? "✓" : "✗";
     const ts = e.ts ? e.ts.replace("T", " ").slice(0, 19) : "unknown";
-    const prov = e.provider || e.requestedProvider || "—";
-    const model = e.model ? `/${e.model}` : "";
+    const prov = sanitizeTerminalText(e.provider || e.requestedProvider || "—");
+    const model = e.model ? `/${sanitizeTerminalText(e.model)}` : "";
     const dur = formatDurationMs(e.durationMs);
-    const cost = e.ok ? formatUsd(e.costUsd, e.costSource) : e.errorCode || "failed";
+    const cost = e.ok ? formatUsd(e.costUsd, e.costSource) : sanitizeTerminalText(e.errorCode || "failed");
     const seed = e.seed != null ? ` seed=${e.seed}` : "";
-    const snippet = String(e.prompt || "").replace(/\s+/g, " ").slice(0, 64);
-    const more = String(e.prompt || "").length > 64 ? "…" : "";
-    lines.push(`${status} ${e.id}  ${ts}  ${prov}${model}  ${dur}  ${cost}${seed}`);
-    lines.push(`    "${snippet}${more}"${e.out ? ` -> ${e.out}` : ""}`);
+    const cleanPrompt = sanitizeTerminalText(e.prompt || "");
+    const snippet = cleanPrompt.slice(0, 64);
+    const more = cleanPrompt.length > 64 ? "…" : "";
+    lines.push(`${status} ${sanitizeTerminalText(e.id)}  ${ts}  ${prov}${model}  ${dur}  ${cost}${seed}`);
+    lines.push(`    "${snippet}${more}"${e.out ? ` -> ${sanitizeTerminalText(e.out)}` : ""}`);
   }
   if (result.hasMore) {
     lines.push(`(showing ${result.offset + 1}-${result.offset + result.entries.length} of ${result.matched}; pass offset=${result.offset + result.entries.length} for more)`);
@@ -898,14 +913,14 @@ export function renderHistoryDetail(entry) {
   if (entry.usage) {
     lines.push(`  tokens:     prompt=${entry.usage.promptTokens ?? 0}, completion=${entry.usage.completionTokens ?? 0}, total=${entry.usage.totalTokens ?? 0}`);
   }
-  if (entry.error) lines.push(`  error:      ${entry.error}${entry.errorCode ? ` [${entry.errorCode}]` : ""}`);
-  lines.push(`  prompt:     ${entry.prompt}`);
+  if (entry.error) lines.push(`  error:      ${sanitizeTerminalText(entry.error)}${entry.errorCode ? ` [${sanitizeTerminalText(entry.errorCode)}]` : ""}`);
+  lines.push(`  prompt:     ${sanitizeTerminalText(entry.prompt)}`);
   if (entry.attempts?.length) {
     lines.push("  attempts:");
     for (const a of entry.attempts) {
       const dur = a.durationMs != null ? ` (${formatDurationMs(a.durationMs)})` : "";
-      const reason = a.reason ? ` — ${a.reason}` : "";
-      lines.push(`    - ${a.provider}: ${a.outcome}${a.model ? ` [${a.model}]` : ""}${dur}${reason}`);
+      const reason = a.reason ? ` — ${sanitizeTerminalText(a.reason)}` : "";
+      lines.push(`    - ${sanitizeTerminalText(a.provider)}: ${sanitizeTerminalText(a.outcome)}${a.model ? ` [${sanitizeTerminalText(a.model)}]` : ""}${dur}${reason}`);
     }
   }
   lines.push(`  replay:     brushrouter replay ${entry.id}`);
