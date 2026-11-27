@@ -624,36 +624,40 @@ export function computeStats(filters = {}, { path = getHistoryPath(), now = Date
 
   let firstTs = null;
   let lastTs = null;
+  let total = 0;
 
   for (const e of entries) {
-    if (e.ts) {
-      if (!firstTs || e.ts < firstTs) firstTs = e.ts;
-      if (!lastTs || e.ts > lastTs) lastTs = e.ts;
-    }
-    if (e.ok) succeeded++;
-    else failed++;
-
-    if (Number.isFinite(e.bytes) && e.bytes > 0) totalBytes += e.bytes;
-    if (Number.isFinite(e.durationMs) && e.durationMs >= 0) totalDurations.push(e.durationMs);
-
-    if (e.usage) {
-      if (Number.isFinite(e.usage.promptTokens)) promptTokens += e.usage.promptTokens;
-      if (Number.isFinite(e.usage.completionTokens)) completionTokens += e.usage.completionTokens;
-      if (Number.isFinite(e.usage.totalTokens)) totalTokens += e.usage.totalTokens;
-    }
-
-    const costVal = Number.isFinite(e.costUsd) && e.costUsd >= 0 ? e.costUsd : null;
-    if (e.ok) {
-      if (e.costSource === "provider" && costVal != null) providerUsd += costVal;
-      else if (e.costSource === "configured" && costVal != null) configuredUsd += costVal;
-      else if (e.costSource === "estimated" && costVal != null) estimatedUsd += costVal;
-      else if (e.costSource === "subscription") subscriptionCount++;
-      else if (costVal == null) unknownCostCount++;
-    }
-
-    // Per-provider final generation accounting
     const finalProv = e.provider || (e.attempts?.findLast?.((a) => a.outcome !== "skipped")?.provider) || e.requestedProvider || "unknown";
-    if (!filters.provider || finalProv === filters.provider) {
+    const ownedByFilter = !filters.provider || finalProv === filters.provider;
+    const costVal = Number.isFinite(e.costUsd) && e.costUsd >= 0 ? e.costUsd : null;
+
+    if (ownedByFilter) {
+      total++;
+      if (e.ts) {
+        if (!firstTs || e.ts < firstTs) firstTs = e.ts;
+        if (!lastTs || e.ts > lastTs) lastTs = e.ts;
+      }
+      if (e.ok) succeeded++;
+      else failed++;
+
+      if (Number.isFinite(e.bytes) && e.bytes > 0) totalBytes += e.bytes;
+      if (Number.isFinite(e.durationMs) && e.durationMs >= 0) totalDurations.push(e.durationMs);
+
+      if (e.usage) {
+        if (Number.isFinite(e.usage.promptTokens)) promptTokens += e.usage.promptTokens;
+        if (Number.isFinite(e.usage.completionTokens)) completionTokens += e.usage.completionTokens;
+        if (Number.isFinite(e.usage.totalTokens)) totalTokens += e.usage.totalTokens;
+      }
+
+      if (e.ok) {
+        if (e.costSource === "provider" && costVal != null) providerUsd += costVal;
+        else if (e.costSource === "configured" && costVal != null) configuredUsd += costVal;
+        else if (e.costSource === "estimated" && costVal != null) estimatedUsd += costVal;
+        else if (e.costSource === "subscription") subscriptionCount++;
+        else if (costVal == null) unknownCostCount++;
+      }
+
+      // Per-provider final generation accounting
       const pb = getProviderBucket(finalProv);
       pb.generations++;
       if (e.ok) pb.succeeded++;
@@ -694,8 +698,8 @@ export function computeStats(filters = {}, { path = getHistoryPath(), now = Date
       }
     }
 
-    // Per-model breakdown (for entries that have a model)
-    if (e.model) {
+    // Per-model breakdown (for entries owned by the filtered provider)
+    if (ownedByFilter && e.model) {
       const mKey = `${finalProv}::${e.model}`;
       if (!modelMap.has(mKey)) {
         modelMap.set(mKey, {
@@ -717,19 +721,20 @@ export function computeStats(filters = {}, { path = getHistoryPath(), now = Date
     }
 
     // Daily trend
-    const day = typeof e.ts === "string" && e.ts.length >= 10 ? e.ts.slice(0, 10) : "unknown";
-    if (!dailyMap.has(day)) {
-      dailyMap.set(day, { date: day, total: 0, succeeded: 0, failed: 0, durations: [], spendUsd: 0 });
+    if (ownedByFilter) {
+      const day = typeof e.ts === "string" && e.ts.length >= 10 ? e.ts.slice(0, 10) : "unknown";
+      if (!dailyMap.has(day)) {
+        dailyMap.set(day, { date: day, total: 0, succeeded: 0, failed: 0, durations: [], spendUsd: 0 });
+      }
+      const db = dailyMap.get(day);
+      db.total++;
+      if (e.ok) db.succeeded++;
+      else db.failed++;
+      if (Number.isFinite(e.durationMs) && e.durationMs >= 0) db.durations.push(e.durationMs);
+      if (e.ok && costVal != null) db.spendUsd += costVal;
     }
-    const db = dailyMap.get(day);
-    db.total++;
-    if (e.ok) db.succeeded++;
-    else db.failed++;
-    if (Number.isFinite(e.durationMs) && e.durationMs >= 0) db.durations.push(e.durationMs);
-    if (e.ok && costVal != null) db.spendUsd += costVal;
   }
 
-  const total = entries.length;
   const totalUsd = roundUsd(providerUsd + configuredUsd + estimatedUsd);
 
   const providers = [...providerMap.values()]
