@@ -186,7 +186,7 @@ test("ComfyUI probes, queues default Flux and template edits, uploads masks, pol
   const request = fixture(t);
   const workflow = join(request.cwd, "workflow.json");
   writeFileSync(workflow, JSON.stringify({ 1: { class_type: "CustomEdit", inputs: {
-    text: "Brief: {prompt}", seed: "{seed}", dimensions: ["{width}", "{height}", "{size}"], refs: ["{image}", "{image2}"], mask: "{mask}",
+    text: "Brief: {prompt}", seed: "{seed}", dimensions: ["{width}", "{height}", "{size}"], refs: ["{image}", "{image2}"], mask: "{mask}", model: "{model}",
   } } }));
   const uploads = [];
   let queued = 0;
@@ -212,7 +212,7 @@ test("ComfyUI probes, queues default Flux and template edits, uploads masks, pol
         } else {
           assert.deepEqual(graph["1"].inputs, {
             text: `Brief: ${request.prompt}`, seed: graph["1"].inputs.seed, dimensions: [640, 896, "640x896"],
-            refs: ["imports/upload-1.png", "imports/upload-2.png"], mask: "imports/upload-3.png",
+            refs: ["imports/upload-1.png", "imports/upload-2.png"], mask: "imports/upload-3.png", model: "alternate.safetensors",
           });
           assert.equal(typeof graph["1"].inputs.seed, "number");
         }
@@ -230,9 +230,10 @@ test("ComfyUI probes, queues default Flux and template edits, uploads masks, pol
   assert.equal((await PROVIDERS.comfyui.probe({})).available, true);
   assert.deepEqual((await PROVIDERS.comfyui.generate({ prompt: request.prompt }, { pollIntervalMs: 1 })).buffer, png);
   await assert.rejects(() => PROVIDERS.comfyui.generate(request, {}), { code: "UNSUPPORTED" });
-  const result = await PROVIDERS.comfyui.generate({ ...request, size: "640x896" }, { workflow, pollIntervalMs: 1 });
+  const result = await PROVIDERS.comfyui.generate({ ...request, size: "640x896", model: "alternate.safetensors" }, { workflow, pollIntervalMs: 1 });
   assert.deepEqual(result.buffer, png);
   assert.equal(result.meta.maskUsed, true);
+  assert.equal(result.meta.model, "alternate.safetensors");
   assert.equal(new Set(uploads).size, 3);
   assert.equal(polled, 4);
 });
@@ -253,7 +254,9 @@ test("ComfyUI loads relative workflows from the user config directory, not the c
   writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({ providers: { comfyui: { workflow: "untrusted.json" } } }));
   const cfg = loadConfig({ cwd, userConfig: { providers: { comfyui: { workflow: "graph.json" } } } });
   assert.equal(cfg.providers.comfyui.workflow, "graph.json");
+  let requests = 0;
   mockFetch(t, async (url, init) => {
+    requests++;
     if (url.endsWith("/prompt")) {
       assert.equal(JSON.parse(init.body).prompt["1"].class_type, "TrustedNode");
       return Response.json({ prompt_id: "job" });
@@ -264,7 +267,12 @@ test("ComfyUI loads relative workflows from the user config directory, not the c
     assert.match(url, /\/view\?/);
     return new Response(png);
   });
-  assert.deepEqual((await PROVIDERS.comfyui.generate({ prompt: "draw", cwd }, cfg.providers.comfyui)).buffer, png);
+  await assert.rejects(() => PROVIDERS.comfyui.generate({ prompt: "draw", cwd, model: "ignored.safetensors" }, cfg.providers.comfyui),
+    (err) => err.code === "BAD_WORKFLOW" && err.message.includes("{model}"));
+  assert.equal(requests, 0);
+  const result = await PROVIDERS.comfyui.generate({ prompt: "draw", cwd }, cfg.providers.comfyui);
+  assert.deepEqual(result.buffer, png);
+  assert.equal(result.meta.model, undefined);
 });
 
 test("fal selects generation, edit and inpainting endpoints with appropriate reference fields", async (t) => {
