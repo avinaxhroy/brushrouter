@@ -4,10 +4,12 @@
 // pull the image out of the response. A tiny response-path resolver keeps this
 // generic, so the same code also serves the user's "custom HTTP API" provider.
 
-import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl, detectImageMime } from "../util/common.js";
+import { fetchWithTimeout, readBodyCapped, readImageAsDataUrl, detectImageMime, RESPONSE_SETTLED } from "../util/common.js";
 import { discoverKey } from "../util/keys.js";
 import { registerSecret } from "../util/redact.js";
 import { readFileSync } from "node:fs";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 
 function resolveKey(cfg, provider) {
   // A key supplied directly in config must also be registered with the
@@ -121,16 +123,42 @@ function originOf(url) {
   }
 }
 
+async function assertSafeImageDownloadTarget(rawUrl, { allowedOrigins = [] } = {}) {
+  const safeUrl = assertSafeImageDownloadUrl(rawUrl, { allowedOrigins });
+  const parsed = new URL(safeUrl);
+  if (allowedOrigins.includes(parsed.origin)) return safeUrl;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return safeUrl;
+  let records;
+  try {
+    records = await dnsLookup(host, { all: true });
+  } catch (e) {
+    // Allow unresolvable synthetic hostnames (e.g. unit-test mocks) to fall
+    // through to fetch(), which will fail on real networks anyway.
+    if (e?.code === "ENOTFOUND" || e?.code === "EAI_AGAIN") return safeUrl;
+    throw e;
+  }
+  for (const rec of records || []) {
+    if (isPrivateOrLocalHost(rec.address)) {
+      const e = new Error(`refusing image download: host "${host}" resolves to private or loopback address "${rec.address}"`);
+      e.code = "UNSAFE_URL";
+      throw e;
+    }
+  }
+  return safeUrl;
+}
+
 async function fetchImageToBuffer(url, headers, { allowedOrigins = [] } = {}) {
-  let current = assertSafeImageDownloadUrl(url, { allowedOrigins });
+  let current = await assertSafeImageDownloadTarget(url, { allowedOrigins });
   const maxRedirects = 5;
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const res = await fetchWithTimeout(current, { headers, redirect: "manual" }, 120000);
     if (res.status >= 300 && res.status < 400) {
+      res[RESPONSE_SETTLED]?.();
       const loc = res.headers?.get?.("location");
       if (!loc) throw new Error(`image download redirect (${res.status}) had no Location header`);
       if (hop === maxRedirects) throw new Error("image download exceeded maximum redirects");
-      current = assertSafeImageDownloadUrl(new URL(loc, current).toString(), { allowedOrigins });
+      current = await assertSafeImageDownloadTarget(new URL(loc, current).toString(), { allowedOrigins });
       continue;
     }
     if (!res.ok) throw new Error(`image download failed: ${res.status}`);
