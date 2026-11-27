@@ -29,7 +29,7 @@ import { saveImage, detectImageMime, assertImageFile, batchItemPath, pngSize } f
 import { redact, redactValue, registerSecret } from "../src/util/redact.js";
 import { discoverKey, saveKey, describeKey } from "../src/util/keys.js";
 import { findCodexCli, findGoogleClis, isOnPath } from "../src/util/discover.js";
-import { findRecipes, renderResult, listCategories, publicRecipe, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
+import { findRecipes, renderResult, listCategories, publicRecipe, composePrompt, MODES, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
 import { getKnownAgentConfigs, detectInstalledAgents, getBrushrouterMcpEntry, installMcpToAgent } from "../src/util/mcp-install.js";
 import { detectRuleFiles, injectRuleToFile } from "../src/util/rules.js";
 // NOTE: ../src/mcp.js is imported dynamically in the `serve` case below. A static
@@ -171,6 +171,11 @@ function parse(argv) {
         seed: { type: "string" },
         input: { type: "string" },
         shape: { type: "string" },
+        recipe: { type: "string" },
+        look: { type: "string" },
+        twist: { type: "string" },
+        diverse: { type: "boolean", default: false },
+        "no-negatives": { type: "boolean", default: false },
         set: { type: "string", multiple: true },
         prompt: { type: "string", multiple: true },
         concurrency: { type: "string" },
@@ -203,7 +208,8 @@ function parse(argv) {
 const VALUE_FLAGS = new Set([
   "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
   "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
-  "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape", "--set",
+  "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape",
+  "--recipe", "--look", "--twist", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
 ]);
 
@@ -333,6 +339,10 @@ ${paint(C.bold, "SECURITY")}
 async function cmdGenerate(args) {
   const { values, positionals } = args;
   if (values.prompt && values.prompt.length > 1) {
+    if (values.recipe || values.look) {
+      console.error(bad("error: --recipe/--look cannot be combined with multiple --prompt flags"));
+      return exitAfterFlush(2);
+    }
     return cmdBatch(args);
   }
   // Two bare prompts used to be glued together into one prompt ("a red fox a
@@ -344,10 +354,44 @@ async function cmdGenerate(args) {
     console.error(dim("  (to pass a prompt containing spaces, quote it as one argument)"));
     return exitAfterFlush(2);
   }
-  const prompt = values.prompt?.[0] || positionals.join(" ").trim();
+  let prompt = values.prompt?.[0] || positionals.join(" ").trim();
+  let autoSize = values.size;
+  if (values.recipe || values.look) {
+    const slotValues = {};
+    for (const pair of values.set || []) {
+      const eq = pair.indexOf("=");
+      if (eq < 1) {
+        console.error(bad(`--set expects key=value, got "${redact(pair)}"`));
+        return exitAfterFlush(2);
+      }
+      slotValues[pair.slice(0, eq).trim()] = pair.slice(eq + 1);
+    }
+    const extraTwist = [values.twist, prompt || null].filter((s) => s && String(s).trim()).join(" ");
+    let composed;
+    try {
+      composed = composePrompt({
+        recipeId: values.recipe || null,
+        lookId: values.look || null,
+        values: slotValues,
+        input: (values.images || []).length ? "image" : "text",
+        includeNegatives: !values["no-negatives"],
+        twist: extraTwist || null,
+      });
+    } catch (e) {
+      console.error(bad(`error: ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
+    if (composed.missing.length) {
+      console.error(bad(`error: recipe "${composed.recipeId}" is missing required slot(s): ${composed.missing.map((m) => `{${m}}`).join(", ")}`));
+      console.error(dim(`  pass them with: ${composed.missing.map((m) => `--set ${m}="..."`).join(" ")}`));
+      return exitAfterFlush(2);
+    }
+    prompt = composed.text;
+    if (!autoSize && composed.suggestedSize) autoSize = composed.suggestedSize;
+  }
   if (!prompt) {
     console.error(bad("error: no prompt given"));
-    console.error(dim('usage: brushrouter gen "your prompt" [-o out.png]'));
+    console.error(dim('usage: brushrouter gen "your prompt" [-o out.png]  (or --recipe <id> --set subject="...")'));
     return exitAfterFlush(2);
   }
   const cwd = process.cwd();
@@ -434,7 +478,7 @@ async function cmdGenerate(args) {
     result = await generate(
       {
         prompt,
-        size: values.size,
+        size: autoSize,
         quality: values.quality,
         background: values.background || undefined,
         images: imagePaths,
@@ -962,8 +1006,8 @@ function cmdPrompts(args) {
     else if (query || values.category || values.kind || values.shape || values.input === "image") mode = "related";
     else mode = "categories";
   }
-  if (!["categories", "related", "one"].includes(mode)) {
-    console.error(bad(`unknown --mode "${mode}" (use: categories | related | one)`));
+  if (!MODES.includes(mode)) {
+    console.error(bad(`unknown --mode "${mode}" (use: ${MODES.join(" | ")})`));
     return exitAfterFlush(2);
   }
 
@@ -1000,17 +1044,26 @@ function cmdPrompts(args) {
       offset: values.offset !== undefined ? Number(values.offset) : 0,
       id: values.id,
       seed: values.seed ? Number(values.seed) : 0,
+      diverse: values.diverse === true,
     });
   } catch (e) {
     console.error(bad(`error: ${e.message}`));
     return exitAfterFlush(1);
   }
+  const renderOpts = {
+    full: values.full,
+    values: slotValues,
+    input: result.input,
+    includeNegatives: !values["no-negatives"],
+    twist: values.twist || null,
+    lookId: values.look || null,
+  };
   if (values["prompt-only"] || values.raw) {
     if (!result.rows.length) {
       console.error(bad(result.matched ? `no recipes returned (limit ${result.limit})` : `nothing matched "${result.query || values.id || ""}"`));
       return exitAfterFlush(1);
     }
-    const pub = publicRecipe(result.rows[0], { full: true, values: slotValues, input: result.input });
+    const pub = publicRecipe(result.rows[0], { ...renderOpts, full: true });
     console.log(pub.prompt);
     return;
   }
@@ -1031,7 +1084,8 @@ function cmdPrompts(args) {
               offset: result.offset,
               hasMore: result.hasMore,
               available: result.available,
-              recipes: result.rows.map((r) => publicRecipe(r, { full: values.full, values: slotValues, input: result.input })),
+              ...(result.suggestions ? { suggestions: result.suggestions } : {}),
+              recipes: result.rows.map((r) => publicRecipe(r, renderOpts)),
             },
         null,
         2,
@@ -1039,7 +1093,7 @@ function cmdPrompts(args) {
     );
     return;
   }
-  console.log(renderResult(result, { full: values.full, values: slotValues, input: result.input }));
+  console.log(renderResult(result, renderOpts));
   if (result.mode !== "categories") {
     console.log(dim(`\nlibrary: ${RECIPES_DIR}${libCounts().look ? `  ·  looks: ${STYLES_FILE}` : ""}`));
     if (!values.full) console.log(dim("Add --full to get the whole skeleton, and --set key=value to fill slots."));

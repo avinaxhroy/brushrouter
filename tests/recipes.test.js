@@ -603,3 +603,99 @@ test("categoryIds matches loaded categories with or without pre-populated cache"
   assert.deepEqual(preJobCats, lib.categories.filter((c) => c.kind === "job").map((c) => c.id));
   assert.deepEqual(preLookCats, lib.categories.filter((c) => c.kind === "look").map((c) => c.id));
 });
+
+test("open aesthetic slots accept creative values while ratio stays strict", () => {
+  const f = fill(getRecipe("social-ad"), {
+    values: {
+      subject: "ceramic pour-over kettle",
+      text: "MORNING RITUAL",
+      lighting: "bioluminescent underglow with warm rim",
+      mood: "dreamy 1970s alpine nostalgia",
+      ratio: "16:9",
+    },
+    twist: "shot on expired Kodak Portra 400 with subtle halation",
+  });
+  assert.deepEqual(f.invalidValues, [], "creative aesthetic slot values should not be flagged invalid");
+  assert.equal(f.suggestedSize, "1536x864");
+  assert.ok(f.text.includes("bioluminescent underglow with warm rim"));
+  assert.ok(f.text.includes("CREATIVE DIRECTION — shot on expired Kodak Portra 400 with subtle halation"));
+  assert.ok(f.text.indexOf("CREATIVE DIRECTION —") < f.text.indexOf("AVOID —"));
+});
+
+test("composePrompt merges any job layout with any look's styleLock and attribution", async () => {
+  const { composePrompt, ratioToSize } = await import("../src/library.js");
+  const look = looks.find((r) => r.styleLock?.length && r.doNotClone?.length);
+  const composed = composePrompt({
+    recipeId: "logo-mark",
+    lookId: look.id,
+    values: { text: "NORTHWIND", ratio: "4:5" },
+    twist: "embossed foil stamp finish",
+  });
+  assert.equal(composed.recipeId, "logo-mark");
+  assert.equal(composed.lookId, look.id);
+  assert.equal(composed.suggestedSize, ratioToSize("4:5"));
+  assert.equal(composed.source?.license, "MIT");
+  assert.match(composed.text, /NORTHWIND/);
+  assert.match(composed.text, /CREATIVE DIRECTION — embossed foil stamp finish/);
+  assert.match(composed.text, /VISUAL LOOK —/);
+  assert.match(composed.text, /STYLE LOCK —/);
+  assert.match(composed.text, /DO NOT REPRODUCE —/);
+  assert.ok(composed.text.indexOf("VISUAL LOOK —") < composed.text.indexOf("STYLE LOCK —"));
+  assert.ok(composed.text.indexOf("STYLE LOCK —") < composed.text.indexOf("DO NOT REPRODUCE —"));
+});
+
+test("brainstorm mode diversifies across categories and kinds; zero-hit queries return suggestions", () => {
+  const res = findRecipes({ mode: "brainstorm", limit: 6, seed: 3 });
+  assert.equal(res.rows.length, 6);
+  const cats = new Set(res.rows.map((r) => r.category));
+  const kinds = new Set(res.rows.map((r) => r.kind));
+  assert.ok(cats.size >= 4, `expected diverse categories, got ${[...cats].join(", ")}`);
+  assert.equal(kinds.size, 2, "brainstorm should mix both job and look kinds");
+
+  const miss = findRecipes({ query: "qqzzxx flibbertigibbet" });
+  assert.equal(miss.matched, false);
+  assert.ok(miss.suggestions, "zero-hit should include suggestions");
+  assert.ok(Array.isArray(miss.suggestions.categories) && miss.suggestions.categories.length > 0);
+  const rendered = renderResult(miss);
+  assert.match(rendered, /Suggested categories to browse:/);
+});
+
+test("layered custom recipes load from BRUSHROUTER_EXTRA_RECIPES_DIRS on top of built-ins", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "br-custom-recipes-"));
+  const prev = process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS;
+  try {
+    writeFileSync(
+      join(dir, "brand-hero.json"),
+      JSON.stringify({
+        id: "acme-brand-hero",
+        goal: "Acme house brand hero visual",
+        when: "Launching an Acme feature",
+        text: "Hero shot of {subject} in {ratio} on {surface} with {lighting}.",
+        slots: ["subject", "ratio", "surface", "lighting"],
+        defaults: { ratio: "16:9", surface: "brushed titanium", lighting: "cyan rim light" },
+        styleLock: ["Acme electric blue accent"],
+      }),
+    );
+    writeFileSync(
+      join(dir, "malformed-stylelock.json"),
+      JSON.stringify({ id: "bad-lock", text: "Test {subject}", styleLock: "not-an-array" }),
+    );
+    process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = dir;
+    resetRecipesCache();
+    const custom = getRecipe("acme-brand-hero");
+    assert.equal(custom.custom, true);
+    assert.equal(custom.category, "custom");
+    assert.ok(recipeIds("job").length >= 28, "built-ins stay loaded alongside custom recipe");
+    // Malformed string styleLock does not crash the library
+    const badLock = getRecipe("bad-lock");
+    assert.deepEqual(badLock.styleLock, []);
+  } finally {
+    if (prev === undefined) delete process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS;
+    else process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = prev;
+    resetRecipesCache();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

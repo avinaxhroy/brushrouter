@@ -11,7 +11,7 @@ import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
 import { saveImage, detectImageMime, batchVariantPath, batchItemPath } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
-import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories } from "./library.js";
+import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, getRecipe, loadRecipes } from "./library.js";
 
 const PKG_VERSION = (() => {
   try {
@@ -39,7 +39,12 @@ const TOOL_SCHEMA = {
   inputSchema: {
     type: "object",
     properties: {
-      prompt: { type: "string", description: "Text description of the image to generate." },
+      prompt: { type: "string", description: "Text description of the image to generate. Optional when `recipe` or `look` is supplied (if also provided, appended as creative direction)." },
+      recipe: { type: "string", description: "Optional prompt-library recipe or look id (from find_image_prompts). Generates directly from the filled skeleton without a separate round-trip, and auto-maps `ratio` to `size` when `size` is omitted." },
+      look: { type: "string", description: "Optional visual look id to layer onto `recipe` (combining a job layout with a look's visual system, STYLE LOCK, and DO NOT REPRODUCE guards), or use standalone." },
+      values: { type: "object", description: "Slot values for `recipe`/`look`, e.g. {\"subject\":\"ceramic kettle\",\"ratio\":\"16:9\",\"lighting\":\"bioluminescent underglow\"}. Aesthetic slots accept any creative string.", additionalProperties: { type: "string" } },
+      twist: { type: "string", description: "Optional creative direction injected right before STYLE LOCK / AVOID when using `recipe` or `look`." },
+      includeNegatives: { type: "boolean", description: "Include DO NOT REPRODUCE and AVOID blocks when using `recipe`/`look` (default true). STYLE LOCK is always kept." },
       provider: {
         type: "string",
         description:
@@ -80,7 +85,6 @@ const TOOL_SCHEMA = {
         description: "Optional maximum concurrency across providers when count > 1. Defaults to count.",
       },
     },
-    required: ["prompt"],
   },
 };
 const BATCH_TOOL_SCHEMA = {
@@ -294,7 +298,28 @@ async function mapLimited(items, limit, fn) {
 }
 
 function assertGenerateArgs(args, cwd = process.cwd()) {
-  if (typeof args?.prompt !== "string" || args.prompt.trim() === "") {
+  const hasRecipe = typeof args?.recipe === "string" && args.recipe.trim() !== "";
+  const hasLook = typeof args?.look === "string" && args.look.trim() !== "";
+  let resolvedPrompt = typeof args?.prompt === "string" ? args.prompt : "";
+  let suggestedSize = null;
+  if (hasRecipe || hasLook) {
+    const extraTwist = [args.twist, resolvedPrompt.trim() || null].filter((s) => s && String(s).trim()).join(" ");
+    const composed = composePrompt({
+      recipeId: hasRecipe ? args.recipe.trim() : null,
+      lookId: hasLook ? args.look.trim() : null,
+      values: args.values && typeof args.values === "object" && !Array.isArray(args.values) ? args.values : {},
+      input: Array.isArray(args.images) && args.images.length ? "image" : "text",
+      includeNegatives: args.includeNegatives !== false,
+      twist: extraTwist || null,
+    });
+    if (composed.missing.length) {
+      throw new Error(
+        `generate_image recipe "${composed.recipeId}" is missing required slot(s): ${composed.missing.map((m) => `{${m}}`).join(", ")} — pass them in values:{...}`,
+      );
+    }
+    resolvedPrompt = composed.text;
+    suggestedSize = composed.suggestedSize;
+  } else if (typeof args?.prompt !== "string" || args.prompt.trim() === "") {
     throw new Error('generate_image requires a non-empty "prompt" string');
   }
   const count = positiveInt(args.count, "count", { max: MAX_COUNT });
@@ -308,7 +333,7 @@ function assertGenerateArgs(args, cwd = process.cwd()) {
       throw new Error(`generate_image "out" is a directory, not a file path: ${resolvedOut}`);
     }
   }
-  return { count, concurrency };
+  return { count, concurrency, prompt: resolvedPrompt, size: args.size || suggestedSize || undefined };
 }
 
 function validateBatchArgs(args) {
@@ -345,11 +370,12 @@ function validateBatchArgs(args) {
 // two can never drift.
 async function runGenerate(args, ctx, onProgress) {
   const { cwd = process.cwd() } = ctx;
-  const { count, concurrency } = assertGenerateArgs(args, cwd);
+  const { count, concurrency, prompt, size } = assertGenerateArgs(args, cwd);
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
+  const effectiveArgs = { ...args, prompt, ...(size ? { size } : {}) };
   if (count === 1) {
-    const result = await generate({ ...args, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
+    const result = await generate({ ...effectiveArgs, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
     const saved = saveImage(out, result.buffer, cwd);
     // SECURITY: every string handed back to the calling model passes through the
     // redactor, so a credential can never ride along inside a provider's message.
@@ -381,7 +407,7 @@ async function runGenerate(args, ctx, onProgress) {
     onProgress?.(`variation ${i + 1}/${count}...`, Math.round(((i + 1) / count) * 90));
     try {
       const result = await generate(
-        { ...args, out: target, count: undefined, cwd, fallback: args.fallback === true },
+        { ...effectiveArgs, out: target, count: undefined, cwd, fallback: args.fallback === true },
         cfg,
       );
       const saved = saveImage(target, result.buffer, cwd);
@@ -653,15 +679,19 @@ function promptToolSchema() {
         kind: { type: "string", enum: ["job", "look"], description: "'job' = a layout to fill in (a product shot, a character sheet). 'look' = a fixed visual system to borrow (a specific editorial or poster style). Omit to search both." },
         input: { type: "string", enum: ["text", "image"], description: "What the user brings. 'text' (default) = an idea only, everything applies. 'image' = they already have a reference photo, so return only entries that can use one." },
         shape: { type: "string", enum: ["single", "grid", "sheet", "document"], description: "What you want back: one image, one image of several panels, a reference sheet, or a designed page." },
-        mode: { type: "string", enum: ["categories", "related", "one"], description: "categories = the map of what exists; related = one best match + similar (default); one = exactly one." },
+        mode: { type: "string", enum: ["categories", "related", "one", "brainstorm"], description: "categories = the map of what exists; related = one best match + similar (default); one = exactly one; brainstorm = diverse contrasting directions across categories and kinds." },
+        diverse: { type: "boolean", description: "Diversify results across categories and kinds (same effect as mode:'brainstorm')." },
         limit: { type: "integer", minimum: 0, maximum: 10, description: "Rows in `related` mode, including the best match. Default 4, max 10. 0 means one row. Values above 10 are clamped; negative or non-integer values are rejected." },
         offset: { type: "integer", minimum: 0, description: "Rows to skip before the page, so results past the 10-row page cap are reachable. Default 0. Check `hasMore` in the response to tell whether another page exists." },
         full: { type: "boolean", description: "Return the finished prompt skeleton instead of a preview. Use it once you have picked an id." },
         id: { type: "string", description: "Fetch one exact entry by its id (returned on every result). Overrides query/mode." },
+        look: { type: "string", description: "Optional visual look id to compose onto the returned recipe(s), merging its visual system, STYLE LOCK, and DO NOT REPRODUCE guards." },
+        twist: { type: "string", description: "Optional creative direction injected right before STYLE LOCK / AVOID." },
+        includeNegatives: { type: "boolean", description: "Include DO NOT REPRODUCE and AVOID blocks (default true). STYLE LOCK is always kept." },
         format: { type: "string", enum: ["text", "json"], description: "Output format: 'text' (default human/terminal preview) or 'json' (structured JSON with publicRecipe objects, slotOptions, and clean prompt fields for programmatic agent access)." },
         values: {
           type: "object",
-          description: "Slot values to substitute into the skeleton, e.g. {\"ratio\":\"16:9\",\"text\":\"NORTHWIND\"}. Anything not supplied keeps its default, except the free slots ({subject}, {text}, {location}, ...), which you must provide.",
+          description: "Slot values to substitute into the skeleton, e.g. {\"ratio\":\"16:9\",\"text\":\"NORTHWIND\",\"lighting\":\"bioluminescent underglow\"}. Aesthetic slots accept any creative string; only `ratio` is strictly validated.",
           additionalProperties: { type: "string" },
         },
         seed: { type: "number", description: "Change this to get a different pick when the query is vague or empty. Same seed + same query = same result." },
@@ -683,8 +713,12 @@ export async function handlePromptToolCall(args = {}) {
     offset: args.offset,
     id: args.id,
     seed: Number(args.seed) || 0,
+    diverse: args.diverse === true,
   });
   const values = args.values && typeof args.values === "object" ? args.values : {};
+  const includeNegatives = args.includeNegatives !== false;
+  const twist = typeof args.twist === "string" ? args.twist : null;
+  const lookId = typeof args.look === "string" && args.look.trim() ? args.look.trim() : null;
   if (args.format === "json") {
     const payload = result.mode === "categories"
       ? { mode: "categories", total: result.total, categories: listCategories({ kind: result.kind }) }
@@ -700,7 +734,8 @@ export async function handlePromptToolCall(args = {}) {
           limit: result.limit,
           offset: result.offset,
           hasMore: result.hasMore,
-          recipes: result.rows.map((r) => publicRecipe(r, { full: args.full === true, values, input: result.input })),
+          ...(result.suggestions ? { suggestions: result.suggestions } : {}),
+          recipes: result.rows.map((r) => publicRecipe(r, { full: args.full === true, values, input: result.input, includeNegatives, twist, lookId })),
         };
     return {
       content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -708,7 +743,7 @@ export async function handlePromptToolCall(args = {}) {
     };
   }
   return {
-    content: [{ type: "text", text: renderResult(result, { full: args.full === true, values, input: result.input }) }],
+    content: [{ type: "text", text: renderResult(result, { full: args.full === true, values, input: result.input, includeNegatives, twist, lookId }) }],
     isError: false,
   };
 }
@@ -782,7 +817,7 @@ async function dispatchRequest(msg, ctx) {
         id,
         result: {
           protocolVersion: params?.protocolVersion || "2024-11-05",
-          capabilities: { tools: {} },
+          capabilities: { tools: {}, prompts: {}, resources: {} },
           serverInfo: { name: "brushrouter", version: PKG_VERSION },
           // Session-start guidance: tells the model when to reach for
           // brushrouter. Configurable (config `instructions`, or
@@ -795,6 +830,109 @@ async function dispatchRequest(msg, ctx) {
       return null;
     case "tools/list":
       return { jsonrpc: "2.0", id, result: { tools: [TOOL_SCHEMA, BATCH_TOOL_SCHEMA, promptToolSchema(), JOB_TOOL_SCHEMA] } };
+    case "prompts/list": {
+      const lib = loadRecipes();
+      const prompts = lib.recipes.map((r) => ({
+        name: r.id,
+        description: `[${r.kind}/${r.category}] ${r.goal}`,
+        arguments: (r.slots || []).map((s) => ({
+          name: s,
+          description: lib.slots?.[s]?.label || s,
+          required: !r._defaultValues?.[s],
+        })),
+      }));
+      return { jsonrpc: "2.0", id, result: { prompts } };
+    }
+    case "prompts/get": {
+      try {
+        const name = String(params?.name || "");
+        const rawArgs = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
+        const { _look, _twist, _input, _noNegatives, ...slotValues } = rawArgs;
+        const recipe = getRecipe(name);
+        const composed = composePrompt({
+          recipeId: recipe.id,
+          lookId: typeof _look === "string" && _look.trim() ? _look.trim() : null,
+          values: slotValues,
+          input: _input === "image" ? "image" : "text",
+          includeNegatives: _noNegatives !== "true" && _noNegatives !== true,
+          twist: typeof _twist === "string" ? _twist : null,
+        });
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            description: recipe.goal,
+            messages: [{ role: "user", content: { type: "text", text: composed.text } }],
+          },
+        };
+      } catch (e) {
+        return { jsonrpc: "2.0", id, error: { code: -32602, message: redact(e.message) } };
+      }
+    }
+    case "resources/list":
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          resources: [
+            {
+              uri: "brushrouter://categories",
+              name: "Prompt library categories",
+              description: "All job and look categories in brushrouter's prompt library.",
+              mimeType: "application/json",
+            },
+            {
+              uri: "brushrouter://slots",
+              name: "Prompt library slots & creative suggestions",
+              description: "Named slots, suggested creative options, and shape definitions.",
+              mimeType: "application/json",
+            },
+            {
+              uri: "brushrouter://recipes",
+              name: "Prompt library index",
+              description: "Compact index of all recipes and looks (id, kind, category, shape, slots, gist).",
+              mimeType: "application/json",
+            },
+          ],
+        },
+      };
+    case "resources/read": {
+      try {
+        const uri = String(params?.uri || "");
+        const lib = loadRecipes();
+        let data;
+        if (uri === "brushrouter://categories") {
+          data = { categories: listCategories(), counts: lib.counts };
+        } else if (uri === "brushrouter://slots") {
+          data = { slots: lib.slots, freeSlots: lib.freeSlots, shapes: lib.shapes };
+        } else if (uri === "brushrouter://recipes") {
+          data = {
+            counts: lib.counts,
+            recipes: lib.recipes.map((r) => ({
+              id: r.id,
+              kind: r.kind,
+              category: r.category,
+              shape: r.shape,
+              slots: r.slots,
+              acceptsImage: Boolean(r.image),
+              gist: r._gist200,
+            })),
+          };
+        } else if (uri.startsWith("brushrouter://recipes/")) {
+          const rid = decodeURIComponent(uri.slice("brushrouter://recipes/".length));
+          data = publicRecipe(getRecipe(rid), { full: true });
+        } else {
+          return { jsonrpc: "2.0", id, error: { code: -32002, message: `unknown resource URI: ${uri}` } };
+        }
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(data, null, 2) }] },
+        };
+      } catch (e) {
+        return { jsonrpc: "2.0", id, error: { code: -32002, message: redact(e.message) } };
+      }
+    }
     case "tools/call": {
       try {
         const result = await handleToolCall(params?.name, params?.arguments || {}, {

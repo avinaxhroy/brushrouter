@@ -39,8 +39,10 @@
 //               source image is a licensing problem, not a quality one.
 
 import { readFileSync, readdirSync, existsSync, openSync, readSync, closeSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getConfigDir } from "./config.js";
+import { redact, safeParseMessage } from "./util/redact.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -50,8 +52,36 @@ export const RECIPES_DIR = process.env.BRUSHROUTER_RECIPES_DIR || join(HERE, "..
 /** Vendored style file. Optional: without it the library serves jobs only. */
 export const STYLES_FILE = process.env.BRUSHROUTER_STYLES_FILE || join(HERE, "..", "data", "styles", "styles.json");
 
-/** The three shapes of result an agent can ask for. */
-export const MODES = ["categories", "related", "one"];
+/** The four shapes of result an agent can ask for. */
+export const MODES = ["categories", "related", "one", "brainstorm"];
+
+/** Slots whose option lists are structural and strictly validated. All other
+ *  slots with `options` are open creative suggestions so agents can invent
+ *  custom lighting, mood, surface, grading, or render styles without warnings. */
+export const STRICT_SLOTS = new Set(["ratio"]);
+
+/** Map a recipe ratio slot (e.g. "16:9") to exact aspect-ratio pixel dimensions
+ *  (multiples of 16 so sizeToAspectRatio() reduces back to the exact ratio). */
+export function ratioToSize(ratio) {
+  switch (String(ratio || "").trim()) {
+    case "1:1":
+      return "1024x1024";
+    case "16:9":
+      return "1536x864";
+    case "4:3":
+      return "1344x1008";
+    case "9:16":
+      return "864x1536";
+    case "2:3":
+      return "1024x1536";
+    case "3:4":
+      return "1008x1344";
+    case "4:5":
+      return "1024x1280";
+    default:
+      return null;
+  }
+}
 
 /** What the caller brings: a text idea, or a text idea plus a reference image. */
 export const INPUTS = ["text", "image"];
@@ -361,7 +391,153 @@ export function loadRecipes() {
     }
   }
 
-  const all = [...recipes, ...styles];
+  // Layer optional user & project custom recipes/looks on top of built-ins
+  // (pure prompt data only — no executables, endpoints, or credentials).
+  // Trusted dirs (user config & BRUSHROUTER_EXTRA_RECIPES_DIRS) may override
+  // built-in ids; project-local .brushrouter/recipes/ may only add NEW ids
+  // so an untrusted repo cannot hijack a built-in MCP prompt like `logo-mark`.
+  const customDirs = [];
+  if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES !== "1") {
+    customDirs.push({ dir: join(getConfigDir(), "recipes"), trusted: true });
+    if (process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS) {
+      for (const d of process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS.split(delimiter)) {
+        if (d.trim()) customDirs.push({ dir: d.trim(), trusted: true });
+      }
+    }
+    customDirs.push({ dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false });
+  }
+  const seenDirs = new Set();
+  const customRecipes = [];
+  const customCategories = new Map();
+  const protectedIds = new Set([...recipes, ...styles].map((r) => r.id));
+  const stringArray = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+  for (const { dir, trusted } of customDirs) {
+    if (!dir || seenDirs.has(dir) || !existsSync(dir)) continue;
+    seenDirs.add(dir);
+    let customFiles;
+    try {
+      customFiles = readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "slots.json").sort();
+    } catch {
+      continue;
+    }
+    for (const file of customFiles) {
+      let data;
+      try {
+        data = readJson(join(dir, file));
+      } catch (e) {
+        process.stderr.write(redact(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${safeParseMessage(e)})\n`));
+        continue;
+      }
+      if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+      // Support both category-bundle files ({ id, label, recipes: [...] }) and
+      // standalone single-recipe/look files ({ id, text, slots, ... }).
+      const isBundle = Array.isArray(data.recipes) || Array.isArray(data.styles);
+      const entries = isBundle ? (data.recipes || data.styles) : (data.id && typeof data.text === "string" ? [data] : []);
+      const bundleKind = data.kind === "look" || Array.isArray(data.styles) ? "look" : "job";
+      const bundleCatId = isBundle && data.id ? String(data.id) : null;
+      const bundleLabel = isBundle && data.label ? String(data.label) : null;
+      const bundleIntent = isBundle && data.intent ? String(data.intent) : "";
+      const bundleAliases = isBundle ? stringArray(data.aliases) : [];
+      for (const raw of entries) {
+        if (!raw || typeof raw !== "object" || !raw.id || typeof raw.text !== "string") continue;
+        const entryId = String(raw.id);
+        if (!trusted && protectedIds.has(entryId)) {
+          process.stderr.write(redact(`brushrouter: ignoring project-local override of built-in recipe "${entryId}" in ${join(dir, file)}\n`));
+          continue;
+        }
+        const entryKind = raw.kind === "look" ? "look" : bundleKind;
+        const catId = String(raw.category || bundleCatId || "custom");
+        const entrySlots = Array.isArray(raw.slots)
+          ? stringArray(raw.slots)
+          : [...new Set([...raw.text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]))];
+        const rawDefaults = raw.defaults && typeof raw.defaults === "object" && !Array.isArray(raw.defaults) ? raw.defaults : {};
+        const defaultValues = {};
+        for (const slot of entrySlots) {
+          const spec = slots[slot];
+          defaultValues[slot] = entryKind === "job" && spec?.options?.length ? rawDefaults[slot] ?? spec.options[0] : (rawDefaults[slot] ?? "");
+        }
+        const entryAliases = [...bundleAliases, ...stringArray(raw.aliases)];
+        const aliasData = parseAliases(entryAliases);
+        const normalized = {
+          shape: typeof raw.shape === "string" ? raw.shape : "single",
+          goal: typeof raw.goal === "string" ? raw.goal : entryId,
+          when: typeof raw.when === "string" ? raw.when : (typeof raw.goal === "string" ? raw.goal : entryId),
+          ...raw,
+          id: entryId,
+          kind: entryKind,
+          category: catId,
+          slots: entrySlots,
+          defaults: rawDefaults,
+          ...(raw.styleLock !== undefined ? { styleLock: stringArray(raw.styleLock) } : {}),
+          ...(raw.doNotClone !== undefined ? { doNotClone: stringArray(raw.doNotClone) } : {}),
+          ...(raw.negative !== undefined ? { negative: stringArray(raw.negative) } : {}),
+          custom: true,
+        };
+        let indexed;
+        try {
+          indexed = indexEntry(normalized, {
+            category: catId,
+            categoryLabel: bundleLabel || catId,
+            aliasData,
+            defaultValues,
+            allSlots: slots,
+          });
+        } catch (e) {
+          process.stderr.write(redact(`brushrouter: ignoring malformed custom recipe "${entryId}" in ${join(dir, file)} (${e.message})\n`));
+          continue;
+        }
+        customRecipes.push({ ...indexed, kind: entryKind, custom: true });
+        if (trusted) protectedIds.add(entryId);
+        if (!customCategories.has(catId)) {
+          customCategories.set(catId, {
+            id: catId,
+            kind: entryKind,
+            label: bundleLabel || (catId === "custom" ? "Custom recipes" : catId),
+            intent: bundleIntent || "User and project custom recipes and brand looks.",
+            aliases: entryAliases,
+            recipes: [],
+          });
+        }
+        const cObj = customCategories.get(catId);
+        if (!cObj.recipes.includes(indexed.id)) cObj.recipes.push(indexed.id);
+      }
+    }
+  }
+
+  // Merge custom recipes on top of built-ins (same id overrides built-in).
+  const byIdMerged = new Map();
+  for (const r of [...recipes, ...styles]) byIdMerged.set(r.id, r);
+  for (const r of customRecipes) byIdMerged.set(r.id, r);
+  const all = [...byIdMerged.values()];
+  const mergedJobs = all.filter((r) => r.kind === "job");
+  const mergedLooks = all.filter((r) => r.kind === "look");
+
+  const existingCatMap = new Map(categories.map((c) => [c.id, c]));
+  for (const [catId, cMeta] of customCategories.entries()) {
+    const existing = existingCatMap.get(catId);
+    if (existing) {
+      for (const rid of cMeta.recipes) {
+        if (!existing.recipes.includes(rid)) existing.recipes.push(rid);
+      }
+      existing.count = existing.recipes.length;
+    } else {
+      const aliasData = parseAliases(cMeta.aliases);
+      const catEntry = {
+        id: catId,
+        kind: cMeta.kind,
+        label: cMeta.label,
+        intent: cMeta.intent,
+        aliases: cMeta.aliases,
+        count: cMeta.recipes.length,
+        recipes: cMeta.recipes,
+        _phraseAliases: aliasData.phrase,
+        _wordAliases: aliasData.word,
+      };
+      categories.push(catEntry);
+      existingCatMap.set(catId, catEntry);
+    }
+  }
+
   const byCategory = new Map();
   for (const r of all) {
     let list = byCategory.get(r.category);
@@ -405,12 +581,12 @@ export function loadRecipes() {
     categories,
     recipes: all,
     recipesByKind: {
-      job: recipes,
-      look: styles,
+      job: mergedJobs,
+      look: mergedLooks,
     },
     recipesByCategory: byCategory,
     recipesWithImage: all.filter((r) => r.image),
-    counts: { job: recipes.length, look: styles.length },
+    counts: { job: mergedJobs.length, look: mergedLooks.length },
     categoryIds: {
       all: categories.map((c) => c.id),
       job: categories.filter((c) => c.kind === "job").map((c) => c.id),
@@ -418,8 +594,8 @@ export function loadRecipes() {
     },
     recipeIds: {
       all: all.map((r) => r.id),
-      job: recipes.map((r) => r.id),
-      look: styles.map((r) => r.id),
+      job: mergedJobs.map((r) => r.id),
+      look: mergedLooks.map((r) => r.id),
     },
     listCategories: precomputedListCategories,
     styleSource: stylesFile?.source || null,
@@ -660,6 +836,72 @@ function normalize(q) {
  *          `available` is the same count, kept for callers that predate `total`
  *          meaning that. Rows 11..N are reached with `offset`.
  */
+function diversifyScored(scored) {
+  // Round-robin across categories while alternating kinds (job vs look) so
+  // brainstorm results offer genuinely contrasting visual directions instead
+  // of clustering 4 near-identical picks from one category.
+  const buckets = new Map();
+  for (const item of scored) {
+    const key = `${item.row.kind}:${item.row.category}`;
+    let list = buckets.get(key);
+    if (!list) {
+      list = [];
+      buckets.set(key, list);
+    }
+    list.push(item);
+  }
+  const jobKeys = [...buckets.keys()].filter((k) => k.startsWith("job:"));
+  const lookKeys = [...buckets.keys()].filter((k) => k.startsWith("look:"));
+  const interleavedKeys = [];
+  const maxLen = Math.max(jobKeys.length, lookKeys.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < jobKeys.length) interleavedKeys.push(jobKeys[i]);
+    if (i < lookKeys.length) interleavedKeys.push(lookKeys[i]);
+  }
+  const out = [];
+  let added = true;
+  while (added) {
+    added = false;
+    for (const k of interleavedKeys) {
+      const list = buckets.get(k);
+      if (list && list.length) {
+        out.push(list.shift());
+        added = true;
+      }
+    }
+  }
+  return out;
+}
+
+function buildZeroHitSuggestions(pool, lib, queryTokens, seedBase) {
+  // 1. Style-lock fallback: entries whose styleLock tokens overlap the query.
+  const lockHits = [];
+  for (const row of pool) {
+    let hits = 0;
+    const idx = row._lockIndex;
+    for (const t of queryTokens) {
+      if (idx ? idx.matches(t) : anyTokenMatches(row._lock, t)) hits += 1;
+    }
+    if (hits > 0) lockHits.push({ row, hits, nudge: fnv1aFromBase(seedBase, row.id) });
+  }
+  lockHits.sort((a, b) => b.hits - a.hits || a.nudge - b.nudge);
+  const nearMatches = lockHits.slice(0, 3).map((h) => ({ id: h.row.id, kind: h.row.kind, category: h.row.category, gist: gistOf(h.row, 100) }));
+
+  // 2. Nearest categories by intent/label token overlap, or top categories.
+  const catHits = [];
+  for (const c of lib.categories) {
+    const cToks = tokens(`${c.id} ${c.label} ${c.intent} ${(c.aliases || []).join(" ")}`);
+    let hits = 0;
+    for (const t of queryTokens) {
+      if (anyTokenMatches(cToks, t)) hits += 1;
+    }
+    if (hits > 0) catHits.push({ id: c.id, kind: c.kind, label: c.label, hits });
+  }
+  catHits.sort((a, b) => b.hits - a.hits);
+  const categories = (catHits.length ? catHits : lib.categories.slice(0, 4)).slice(0, 4).map((c) => c.id);
+  return { nearMatches, categories };
+}
+
 export function findRecipes({
   query = null,
   category = null,
@@ -671,6 +913,7 @@ export function findRecipes({
   offset = 0,
   seed = 0,
   id = null,
+  diverse = false,
 } = {}) {
   const lib = loadRecipes();
 
@@ -801,10 +1044,15 @@ export function findRecipes({
     }
 
     if (scored.length === 0) {
-      return { mode, query, category, kind, input, shape, total: 0, available: 0, matched: false, limit: limitNum, offset: offsetNum, rows: [] };
+      const suggestions = buildZeroHitSuggestions(pool, lib, queryTokens, seedBase);
+      return { mode, query, category, kind, input, shape, total: 0, available: 0, matched: false, limit: limitNum, offset: offsetNum, hasMore: false, suggestions, rows: [] };
     }
 
     scored.sort((a, b) => b.score - a.score || a.nudge - b.nudge || (a.row.id < b.row.id ? -1 : (a.row.id > b.row.id ? 1 : 0)));
+  }
+
+  if (mode === "brainstorm" || diverse) {
+    scored = diversifyScored(scored);
   }
 
   // `mode: "one"` means exactly one row and ignores limit/offset — that is the
@@ -850,7 +1098,7 @@ export function findRecipes({
  *
  * @returns {{text:string, missing:string[], usedImage:boolean}}
  */
-export function fill(recipe, { values = {}, input = "text", includeNegatives = true } = {}) {
+export function fill(recipe, { values = {}, input = "text", includeNegatives = true, twist = null } = {}) {
   const lib = loadRecipes();
   const useImage = input === "image" && recipe.image;
   const rawSkeleton = useImage ? recipe.image.skeleton : recipe.text;
@@ -864,7 +1112,7 @@ export function fill(recipe, { values = {}, input = "text", includeNegatives = t
       resolved[k] = valStr;
       if (!recipe.slots.includes(k)) {
         invalidValues.push({ slot: k, value: valStr, reason: "unknown slot" });
-      } else {
+      } else if (STRICT_SLOTS.has(k)) {
         const spec = lib.slots?.[k];
         if (spec?.options?.length && !spec.options.includes(valStr)) {
           invalidValues.push({ slot: k, value: valStr, reason: `not in offered options (${spec.options.join(", ")})` });
@@ -882,6 +1130,9 @@ export function fill(recipe, { values = {}, input = "text", includeNegatives = t
     return v;
   });
 
+  const cleanTwist = twist && String(twist).trim() ? String(twist).trim() : null;
+  if (cleanTwist) text += `\n\nCREATIVE DIRECTION — ${cleanTwist}`;
+
   // The style lock is a positive instruction — the invariants that must survive
   // every generation — so it is never gated. Turning the avoid-lists off must
   // not silently drop a caller's style fidelity guarantees.
@@ -897,6 +1148,69 @@ export function fill(recipe, { values = {}, input = "text", includeNegatives = t
     missing: [...new Set(missing)],
     usedImage: Boolean(useImage),
     invalidValues,
+    ratio: resolved.ratio || null,
+    suggestedSize: ratioToSize(resolved.ratio),
+  };
+}
+
+/**
+ * Compose a prompt from a recipe, a look, or BOTH (applying a look's visual
+ * system, styleLock, and doNotClone guards onto any job recipe's layout).
+ */
+export function composePrompt({
+  recipeId = null,
+  lookId = null,
+  values = {},
+  input = "text",
+  includeNegatives = true,
+  twist = null,
+} = {}) {
+  if (!recipeId && !lookId) {
+    throw new Error("composePrompt requires at least one of recipeId or lookId");
+  }
+  const primary = recipeId ? getRecipe(recipeId) : getRecipe(lookId);
+  const secondary = recipeId && lookId && recipeId !== lookId ? getRecipe(lookId) : null;
+
+  if (!secondary) {
+    const filled = fill(primary, { values, input, includeNegatives, twist });
+    return {
+      ...filled,
+      recipeId: primary.id,
+      lookId: primary.kind === "look" ? primary.id : null,
+      source: primary.source || null,
+    };
+  }
+
+  // Merge: primary layout skeleton + secondary visual look (styleLock/doNotClone/negatives).
+  const base = fill(primary, { values, input, includeNegatives: false, twist });
+  // Strip primary's trailing STYLE LOCK so we can emit one unified, deduplicated block.
+  let body = base.text;
+  if (primary.styleLock?.length) {
+    const lockLine = `\n\nSTYLE LOCK — ${primary.styleLock.join("; ")}.`;
+    if (body.endsWith(lockLine)) body = body.slice(0, -lockLine.length);
+  }
+  const lookName = secondary.source?.styleName || secondary.id;
+  body += `\n\nVISUAL LOOK — Render in the "${lookName}" visual system: ${gistOf(secondary, 220)}`;
+
+  const mergedLock = [...new Set([...(secondary.styleLock || []), ...(primary.styleLock || [])])];
+  const mergedClone = [...new Set([...(secondary.doNotClone || []), ...(primary.doNotClone || [])])];
+  const mergedNeg = [...new Set([...(secondary.negatives || []), ...(primary.negatives || [])])];
+
+  if (mergedLock.length) body += `\n\nSTYLE LOCK — ${mergedLock.join("; ")}.`;
+  if (includeNegatives) {
+    if (mergedClone.length) body += `\n\nDO NOT REPRODUCE — ${mergedClone.join("; ")}.`;
+    if (mergedNeg.length) body += `\n\nAVOID — ${mergedNeg.join("; ")}.`;
+  }
+  return {
+    text: body,
+    missing: base.missing,
+    usedImage: base.usedImage,
+    invalidValues: base.invalidValues,
+    ratio: base.ratio,
+    suggestedSize: base.suggestedSize,
+    recipeId: primary.id,
+    lookId: secondary.id,
+    source: secondary.source || primary.source || null,
   };
 }
 
@@ -913,7 +1227,7 @@ export function gistOf(recipe, chars = 200) {
 }
 
 /** What an agent needs to decide whether to use an entry — no full bodies. */
-export function publicRecipe(recipe, { full = false, values = {}, input = "text" } = {}) {
+export function publicRecipe(recipe, { full = false, values = {}, input = "text", includeNegatives = true, twist = null, lookId = null } = {}) {
   const lib = loadRecipes();
   const slotOptions = {};
   for (const s of recipe.slots) {
@@ -931,6 +1245,7 @@ export function publicRecipe(recipe, { full = false, values = {}, input = "text"
     slots: recipe.slots,
     defaults: recipe.defaults || {},
     slotOptions,
+    strictSlots: recipe.slots.filter((s) => STRICT_SLOTS.has(s)),
     // Whether this entry can take a reference image, and what it would do with
     // one. Stated even on previews: knowing the upgrade exists changes what the
     // agent asks the user for.
@@ -948,10 +1263,14 @@ export function publicRecipe(recipe, { full = false, values = {}, input = "text"
     source: recipe.source || null,
   };
 
-  const text = fill(recipe, { values, input });
+  const text = lookId
+    ? composePrompt({ recipeId: recipe.id, lookId, values, input, includeNegatives, twist })
+    : fill(recipe, { values, input, includeNegatives, twist });
   out.missing = text.missing;
   out.fillMe = text.missing;
   out.usedImage = text.usedImage;
+  if (text.suggestedSize) out.suggestedSize = text.suggestedSize;
+  if (lookId && text.source && !out.source) out.source = text.source;
 
   if (full) {
     out.prompt = text.text;
@@ -1016,7 +1335,7 @@ export function renderCategories(kind = null) {
   return lines.join("\n");
 }
 
-export function renderRecipe(recipe, { full = false, values = {}, input = "text", index = null } = {}) {
+export function renderRecipe(recipe, { full = false, values = {}, input = "text", index = null, includeNegatives = true, twist = null, lookId = null } = {}) {
   const head = index === null ? "" : `${index + 1}. `;
   const tag = recipe.kind === "look" ? "look" : "recipe";
   // Preview mode is deliberately terse. The job here is to let an agent decide
@@ -1061,7 +1380,9 @@ export function renderRecipe(recipe, { full = false, values = {}, input = "text"
   if (recipe.styleLock?.length) lines.push(`   Style lock: ${recipe.styleLock.join("; ")}`);
   if (recipe.doNotClone?.length) lines.push(`   Do not reproduce: ${recipe.doNotClone.join("; ")}`);
   if (recipe.negatives?.length) lines.push(`   Avoid: ${recipe.negatives.join("; ")}`);
-  const f = fill(recipe, { values, input });
+  const f = lookId
+    ? composePrompt({ recipeId: recipe.id, lookId, values, input, includeNegatives, twist })
+    : fill(recipe, { values, input, includeNegatives, twist });
   lines.push("");
   lines.push(f.text);
   if (f.missing.length) {
@@ -1079,7 +1400,7 @@ export function renderRecipe(recipe, { full = false, values = {}, input = "text"
   return lines.join("\n");
 }
 
-export function renderResult(result, { full = false, values = {}, input = null } = {}) {
+export function renderResult(result, { full = false, values = {}, input = null, includeNegatives = true, twist = null, lookId = null } = {}) {
   const effInput = input || result.input || "text";
   if (result.mode === "categories") return renderCategories(result.kind || null);
   if (!result.rows.length) {
@@ -1099,14 +1420,22 @@ export function renderResult(result, { full = false, values = {}, input = null }
     if (result.matched) lines.push("Raise limit (or omit it) to see the matches.");
     else {
       lines.push("Nothing matched, so nothing is returned — a wrong prompt is worse than none.");
-      lines.push('Call again with mode:"categories" to see what exists, or try different words.');
+      if (result.suggestions?.nearMatches?.length) {
+        lines.push(`Closest style-lock matches: ${result.suggestions.nearMatches.map((m) => `${m.id} (${m.category})`).join(", ")}`);
+      }
+      if (result.suggestions?.categories?.length) {
+        lines.push(`Suggested categories to browse: ${result.suggestions.categories.join(", ")}`);
+      }
+      lines.push('Call again with mode:"categories" or mode:"brainstorm" to explore, or try different words.');
     }
     return lines.join("\n");
   }
-  const blocks = result.rows.map((r, i) => renderRecipe(r, { full, values, input: effInput, index: result.rows.length > 1 ? i : null }));
+  const blocks = result.rows.map((r, i) =>
+    renderRecipe(r, { full, values, input: effInput, index: result.rows.length > 1 ? i : null, includeNegatives, twist, lookId }),
+  );
   const tail = full
     ? ""
-    : `\n\nPreviews. Add full:true for the whole skeleton, or id:"<id>" for one entry.`;
+    : `\n\nPreviews. Add full:true for the whole skeleton, id:"<id>" for one entry, or pass recipe:"<id>" directly to generate_image.`;
   const more = result.available > result.rows.length ? `\n(${result.available} matched; showing ${result.rows.length}. Narrow with category, kind or shape.)` : "";
   return `${describeRows(result.rows, Boolean(result.query))}\n\n${blocks.join("\n\n")}${more}${tail}`;
 }
