@@ -324,8 +324,9 @@ function stripUntrusted(project, cfg) {
   for (const [k, v] of Object.entries(project)) {
     if (k === "providers") continue; // walked below, per leaf
     if ((k === "priority" || k === "order") && Array.isArray(v)) {
-      trusted[k] = v.filter((id) => typeof id === "string" && !PROJECT_METERED_ROUTES.has(id));
-      if (trusted[k].length !== v.length) dropped.push(`${k} metered routes or invalid entries`);
+      const usable = v.filter((id) => typeof id === "string" && /^[\w-]+$/.test(id) && !PROJECT_METERED_ROUTES.has(id));
+      if (usable.length) trusted[k] = usable;
+      if (!usable.length || usable.length !== v.length) dropped.push(`${k} metered routes or invalid entries`);
     } else if (k === "instructions") trusted[k] = v;
     else dropped.push(k);
   }

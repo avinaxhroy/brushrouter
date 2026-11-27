@@ -68,6 +68,16 @@ test("checkout config cannot activate or move metered routes ahead of user-confi
   assert.equal(loadConfig({ cwd, userConfig, overrides: { priority: ["openai"] } }).priority[0], "openai");
 });
 
+test("an empty, malformed, or metered-only checkout priority keeps the trusted priority", (t) => {
+  const { cwd } = fixture(t);
+  const project = join(cwd, "brushrouter.config.json");
+  const userConfig = { priority: ["codex", "openai"] };
+  for (const priority of [[], ["openai", "replicate"], [null, 12, " "], { codex: true }]) {
+    writeFileSync(project, JSON.stringify({ priority }));
+    assert.deepEqual(loadConfig({ cwd, userConfig }).priority, userConfig.priority);
+  }
+});
+
 test("OpenAI Images selects generation JSON or edits multipart with ordered references and a PNG mask", async (t) => {
   const request = fixture(t);
   const cfg = { apiKey, size: "1024x1024", quality: "medium" };
