@@ -797,11 +797,22 @@ async function cmdBatch(args) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, values.out || `brushrouter-batch-${timestamp}`);
 
+  let batchSeed;
+  if (values.seed !== undefined) {
+    const n = Number(values.seed);
+    if (!Number.isInteger(n)) {
+      console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
+      return exitAfterFlush(2);
+    }
+    batchSeed = n;
+  }
+
   const items = rawItems.map((item, idx) => ({
     ...item,
     size: item.size || values.size,
     quality: item.quality || values.quality,
     background: item.background || values.background,
+    seed: item.seed !== undefined ? item.seed : batchSeed,
     model: item.model || values.model,
     images: item.images || values.images || [],
     out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.prompt),
