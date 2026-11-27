@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { PROVIDERS, generate, batchGenerate, planAttemptOrder } from "../src/router.js";
 import { handleToolCall, handleRequest } from "../src/mcp.js";
 import { discoverKey } from "../src/util/keys.js";
+import { loadConfig } from "../src/config.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
 const b64 = png.toString("base64");
@@ -25,6 +26,27 @@ function mockFetch(t, fetch) {
   globalThis.fetch = fetch;
   t.after(() => { globalThis.fetch = original; });
 }
+
+test("checkout config cannot activate or move metered routes ahead of user-configured routes", (t) => {
+  const { cwd } = fixture(t);
+  const project = join(cwd, "brushrouter.config.json");
+  const paid = ["openrouter", "fal", "openai", "gemini-api", "replicate"];
+  const userConfig = { priority: ["codex", ...paid], providers: { openai: { apiKey, enabled: true } } };
+  writeFileSync(project, JSON.stringify({
+    priority: [...paid, "codex"],
+    providers: Object.fromEntries(paid.map((id) => [id, { enabled: true }])),
+  }));
+  const cfg = loadConfig({ cwd, userConfig });
+  assert.deepEqual(cfg.priority, ["codex"]);
+  assert.equal(cfg.providers.openai.enabled, true);
+  for (const id of ["openrouter", "gemini-api", "replicate"]) assert.equal(cfg.providers[id].enabled, false);
+
+  writeFileSync(project, JSON.stringify({ providers: { codex: { enabled: false }, openai: { enabled: [true] } } }));
+  const disabled = loadConfig({ cwd, userConfig });
+  assert.deepEqual(disabled.priority, ["codex"]);
+  assert.equal(disabled.providers.codex.enabled, false);
+  assert.equal(loadConfig({ cwd, userConfig, overrides: { priority: ["openai"] } }).priority[0], "openai");
+});
 
 test("OpenAI Images selects generation JSON or edits multipart with ordered references and a PNG mask", async (t) => {
   const request = fixture(t);
