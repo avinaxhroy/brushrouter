@@ -8,6 +8,7 @@ import { PROVIDERS, generate, batchGenerate, planAttemptOrder } from "../src/rou
 import { handleToolCall, handleRequest } from "../src/mcp.js";
 import { discoverKey } from "../src/util/keys.js";
 import { loadConfig } from "../src/config.js";
+import { saveImage } from "../src/util/common.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
 const b64 = png.toString("base64");
@@ -26,6 +27,20 @@ function mockFetch(t, fetch) {
   globalThis.fetch = fetch;
   t.after(() => { globalThis.fetch = original; });
 }
+
+test("saving provider output uses the detected format rather than a misleading default extension", (t) => {
+  const { cwd } = fixture(t);
+  const webp = Buffer.from("RIFF\x04\0\0\0WEBP", "latin1");
+  const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+  const first = saveImage("result.png", webp, cwd);
+  assert.equal(first.savedPath, join(cwd, "result.webp"));
+  assert.equal(first.requestedPath, join(cwd, "result.png"));
+  assert.equal(first.versioned, false);
+  assert.equal(existsSync(first.requestedPath), false);
+  assert.equal(saveImage("result.png", webp, cwd).savedPath, join(cwd, "result-v2.webp"));
+  assert.equal(saveImage("result.png", jpg, cwd, { force: true }).savedPath, join(cwd, "result.jpg"));
+  assert.equal(saveImage("result.jpeg", jpg, cwd).savedPath, join(cwd, "result.jpeg"));
+});
 
 test("checkout config cannot activate or move metered routes ahead of user-configured routes", (t) => {
   const { cwd } = fixture(t);

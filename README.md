@@ -117,6 +117,8 @@ br serve            # run as an MCP server on stdio
 
 Pass `--mask` with `--images` for inpainting. The first reference is the base image; use a same-size mask and check the selected model's mask polarity. A masked request never falls back to text-only or unmasked editing. CLI batch accepts a per-item `mask` in JSON, or `--mask` as a default for all items.
 
+If a provider returns a different image format, brushrouter adjusts standard image extensions to match the actual bytes. Check the returned path rather than assuming an output filename.
+
 ```bash
 brushrouter gen "replace the sky with clouds" --provider openai \
   --images photo.png --mask sky-mask.png -o edited.png

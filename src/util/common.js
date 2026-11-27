@@ -67,8 +67,10 @@ export function detectImageMime(buf) {
   return null;
 }
 
+const IMAGE_EXTENSIONS = { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif" };
+
 export function extForMime(mime) {
-  return { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif" }[mime] || ".png";
+  return IMAGE_EXTENSIONS[mime] || ".png";
 }
 
 // Never overwrite: out.png -> out-v2.png -> out-v3.png ...
@@ -86,21 +88,27 @@ export function freePath(requested) {
 
 export function saveImage(out, buf, cwd = process.cwd(), { force = false } = {}) {
   const requested = isAbsolute(out) ? out : resolve(cwd, out);
-  mkdirSync(dirname(requested), { recursive: true });
+  const requestedExt = extname(requested).toLowerCase();
+  const imageExt = IMAGE_EXTENSIONS[detectImageMime(buf)];
+  const path = imageExt && [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(requestedExt) &&
+      requestedExt !== imageExt && !(requestedExt === ".jpeg" && imageExt === ".jpg")
+    ? requested.slice(0, -requestedExt.length) + imageExt
+    : requested;
+  mkdirSync(dirname(path), { recursive: true });
   if (force) {
-    writeFileSync(requested, buf);
-    return { savedPath: requested, requestedPath: requested, versioned: false };
+    writeFileSync(path, buf);
+    return { savedPath: path, requestedPath: requested, versioned: false };
   }
   // Atomic exclusive create (`wx`) closes the TOCTOU window where two concurrent
   // saves both see !existsSync(candidate) and the second silently overwrites.
-  const ext = extname(requested);
-  const base = ext ? requested.slice(0, -ext.length) : requested;
+  const ext = extname(path);
+  const base = ext ? path.slice(0, -ext.length) : path;
   const candidateExt = ext || ".png";
   for (let v = 1; v <= 9999; v++) {
-    const candidate = v === 1 ? requested : `${base}-v${v}${candidateExt}`;
+    const candidate = v === 1 ? path : `${base}-v${v}${candidateExt}`;
     try {
       writeFileSync(candidate, buf, { flag: "wx" });
-      return { savedPath: candidate, requestedPath: requested, versioned: candidate !== requested };
+      return { savedPath: candidate, requestedPath: requested, versioned: v > 1 };
     } catch (e) {
       if (e?.code === "EEXIST") continue;
       throw e;
