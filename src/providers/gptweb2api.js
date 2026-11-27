@@ -154,7 +154,7 @@ async function trySourceInstall(dir, ref, onLog) {
   }
   const wanted = ref === "HEAD" ? "" : String(ref || "").trim();
   if (wanted) {
-    if (wanted.startsWith("-") || /[\s\0]/.test(wanted) || !/^[A-Za-z0-9._/@^~-]+$/.test(wanted)) {
+    if (wanted.startsWith("-") || /[\s\0]/.test(wanted) || !/^[A-Za-z0-9._/@^~+-]+$/.test(wanted)) {
       throw new Error(`invalid git ref for gptweb2api: "${wanted}"`);
     }
     await promisifiedExecFile("git", ["-C", srcDir, "checkout", "--detach", "--quiet", wanted]);
