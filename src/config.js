@@ -317,13 +317,13 @@ const PROJECT_TRUSTED_LEAVES = new Set([
 // the same way the provider leaves were.
 const PROJECT_METERED_ROUTES = new Set(["openrouter", "fal", "openai", "gemini-api", "replicate"]);
 
-function stripUntrusted(project, cfg, user) {
+function stripUntrusted(project, cfg, operator) {
   if (!project || typeof project !== "object" || Array.isArray(project)) return { project, dropped: [] };
   const dropped = [];
   const trusted = {};
   const basePriority = Array.isArray(cfg.priority) ? cfg.priority : [];
   const hasUserMeteredOrder = basePriority.some((id) => PROJECT_METERED_ROUTES.has(id) &&
-    (Array.isArray(user?.priority) || user?.providers?.[id]?.enabled === true));
+    (Array.isArray(operator.priority) || operator.providers?.[id]?.enabled === true));
   const lastEnabledMetered = basePriority.findLastIndex((id) => PROJECT_METERED_ROUTES.has(id) && cfg.providers?.[id]?.enabled !== false);
   for (const [k, v] of Object.entries(project)) {
     if (k === "providers") continue; // walked below, per leaf
@@ -332,7 +332,7 @@ function stripUntrusted(project, cfg, user) {
         dropped.push("priority (user-configured metered order)");
         continue;
       }
-      const usable = v.filter((id) => typeof id === "string" && /^[\w-]+$/.test(id) && !PROJECT_METERED_ROUTES.has(id));
+      const usable = v.filter((id) => typeof id === "string" && Object.hasOwn(DEFAULT_CONFIG.providers, id) && !PROJECT_METERED_ROUTES.has(id));
       if (usable.length) trusted[k] = usable;
       if (!usable.length || usable.length !== v.length) dropped.push(`${k} metered routes or invalid entries`);
     } else if (k === "instructions") trusted[k] = v;
@@ -357,7 +357,7 @@ function stripUntrusted(project, cfg, user) {
       }
       // A checkout must not skip an earlier route to reach an enabled metered fallback.
       const position = basePriority.indexOf(name);
-      if (k === "enabled" && v === false && !trusted.priority && position >= 0 &&
+      if (k === "enabled" && v === false && !PROJECT_METERED_ROUTES.has(name) && !trusted.priority && position >= 0 &&
           position < lastEnabledMetered && cfg.providers?.[name]?.enabled !== false) {
         dropped.push(`providers.${name}.enabled (before a metered fallback)`);
         continue;
@@ -466,13 +466,15 @@ export function loadConfig({ cwd = process.cwd(), overrides = {}, userConfig = n
   let cfg = DEFAULT_CONFIG;
   const user = userConfig !== null ? userConfig : readJson(getUserConfigPath());
   if (user) cfg = deepMerge(cfg, user);
+  const env = envOverrides();
   const project = readJson(resolve(cwd, PROJECT_CONFIG_NAME));
   if (project) {
-    const { project: trusted, dropped } = stripUntrusted(project, cfg, user);
+    const operator = deepMerge(deepMerge(user || {}, env), overrides);
+    const { project: trusted, dropped } = stripUntrusted(project, deepMerge(DEFAULT_CONFIG, operator), operator);
     warnUntrusted(dropped);
     cfg = deepMerge(cfg, trusted);
   }
-  cfg = deepMerge(cfg, envOverrides());
+  cfg = deepMerge(cfg, env);
   cfg = deepMerge(cfg, overrides);
   return cfg;
 }

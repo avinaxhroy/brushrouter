@@ -2352,7 +2352,7 @@ test("MCP rejects batch items without a prompt instead of generating a blank ima
     assert.deepEqual(prompts, [], "a promptless item reached a provider");
 
     // A bare string is a prompt, not an object to spread character by character.
-    const ok = await call(2, { items: ["a red fox"], outDir: join(dir, "out2") });
+    const ok = await call(2, { items: ["a red fox"], provider: "mock-norm", outDir: join(dir, "out2") });
     assert.equal(ok.result.isError, false, ok.result.content[0].text);
     assert.deepEqual(prompts, ["a red fox"]);
     assert.match(ok.result.content[0].text, /01-a-red-fox\.png/);

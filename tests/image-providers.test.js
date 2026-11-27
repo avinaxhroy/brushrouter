@@ -72,11 +72,35 @@ test("checkout config cannot activate or move metered routes ahead of user-confi
 test("an empty, malformed, or metered-only checkout priority keeps the trusted priority", (t) => {
   const { cwd } = fixture(t);
   const project = join(cwd, "brushrouter.config.json");
-  const userConfig = { priority: ["codex", "openai"] };
-  for (const priority of [[], ["openai", "replicate"], [null, 12, " "], { codex: true }]) {
+  const userConfig = { priority: ["codex", "gemini"] };
+  for (const priority of [[], ["openai", "replicate"], [null, 12, " "], ["typo", "openai"], { codex: true }]) {
     writeFileSync(project, JSON.stringify({ priority }));
     assert.deepEqual(loadConfig({ cwd, userConfig }).priority, userConfig.priority);
   }
+  writeFileSync(project, JSON.stringify({ priority: ["typo", "codex", "fal"] }));
+  assert.deepEqual(loadConfig({ cwd, userConfig }).priority, ["codex"]);
+});
+
+test("checkout cannot promote an environment-enabled metered fallback by disabling an earlier route", (t) => {
+  const { cwd } = fixture(t);
+  const enable = process.env.BRUSHROUTER_ENABLE;
+  const priority = process.env.BRUSHROUTER_PRIORITY;
+  t.after(() => {
+    if (enable === undefined) delete process.env.BRUSHROUTER_ENABLE;
+    else process.env.BRUSHROUTER_ENABLE = enable;
+    if (priority === undefined) delete process.env.BRUSHROUTER_PRIORITY;
+    else process.env.BRUSHROUTER_PRIORITY = priority;
+  });
+  process.env.BRUSHROUTER_ENABLE = "openai";
+  process.env.BRUSHROUTER_PRIORITY = "codex,openai";
+  writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({
+    priority: ["gemini"],
+    providers: { codex: { enabled: false } },
+  }));
+  const cfg = loadConfig({ cwd, userConfig: {} });
+  assert.deepEqual(cfg.priority, ["codex", "openai"]);
+  assert.equal(cfg.providers.codex.enabled, true);
+  assert.equal(cfg.providers.openai.enabled, true);
 });
 
 test("OpenAI Images selects generation JSON or edits multipart with ordered references and a PNG mask", async (t) => {

@@ -2577,7 +2577,7 @@ async function cmdSetup(args) {
         if (!res || !Buffer.isBuffer(res.buffer) || res.buffer.length === 0) {
           throw new Error(`${res?.provider || ready[0].id} returned no image data`);
         }
-        const saved = saveImage(testOut, res.buffer, cwd, { force: true });
+        const saved = saveImage(testOut, res.buffer, cwd, { force: true, matchExtension: true });
         const sec = ((Date.now() - start) / 1000).toFixed(1);
         const kb = Math.round(res.buffer.length / 1024);
         const mime = detectImageMime(res.buffer) || "image/png";
