@@ -10,10 +10,14 @@
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -266,13 +270,61 @@ function lockPermissions(filePath) {
   } catch {}
 }
 
+const LOCK_STALE_MS = 10_000;
+const LOCK_TIMEOUT_MS = 2_000;
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(ms) {
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
+
+// Advisory lockfile serializing concurrent history appends and prune/clear
+// rewrites so an append during pruneHistory is never lost to rename().
+function withHistoryLock(filePath, fn) {
+  ensureHistoryDir(filePath);
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      closeSync(fd);
+      acquired = true;
+    } catch (e) {
+      if (e?.code !== "EEXIST") throw e;
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) {
+        // Proceed without blocking indefinitely if a wedged process left a lock.
+        break;
+      }
+      sleepSyncMs(15);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (acquired) {
+      try {
+        unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+}
+
 export function recordHistory(entry, { path = getHistoryPath(), cfg = null, cwd = process.cwd() } = {}) {
   if (isHistoryDisabled(cfg)) return null;
   const record = buildHistoryRecord(entry, { cfg, cwd });
-  ensureHistoryDir(path);
-  appendFileSync(path, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
-  lockPermissions(path);
-  return record;
+  return withHistoryLock(path, () => {
+    appendFileSync(path, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
+    lockPermissions(path);
+    return record;
+  });
 }
 
 let warnedHistoryWrite = false;
@@ -513,43 +565,48 @@ function writeHistoryAtomic(filePath, entries) {
 }
 
 export function pruneHistory({ keep = null, beforeDays = null, dryRun = false, path = getHistoryPath(), now = Date.now() } = {}) {
-  const { entries } = readHistory({ path });
-  let kept = entries;
-  if (beforeDays != null) {
-    const days = Number(beforeDays);
-    if (!Number.isFinite(days) || days < 0) {
-      const e = new Error(`invalid beforeDays value: ${beforeDays}`);
-      e.code = "BAD_ARGS";
-      throw e;
+  const run = () => {
+    const { entries } = readHistory({ path });
+    let kept = entries;
+    if (beforeDays != null) {
+      const days = Number(beforeDays);
+      if (!Number.isFinite(days) || days < 0) {
+        const e = new Error(`invalid beforeDays value: ${beforeDays}`);
+        e.code = "BAD_ARGS";
+        throw e;
+      }
+      const cutoff = now - days * 86_400_000;
+      kept = kept.filter((entry) => {
+        const t = Date.parse(entry.ts);
+        return Number.isFinite(t) && t >= cutoff;
+      });
     }
-    const cutoff = now - days * 86_400_000;
-    kept = kept.filter((entry) => {
-      const t = Date.parse(entry.ts);
-      return Number.isFinite(t) && t >= cutoff;
-    });
-  }
-  if (keep != null) {
-    const k = Number(keep);
-    if (!Number.isInteger(k) || k < 0) {
-      const e = new Error(`invalid keep value: ${keep} (expected non-negative integer)`);
-      e.code = "BAD_ARGS";
-      throw e;
+    if (keep != null) {
+      const k = Number(keep);
+      if (!Number.isInteger(k) || k < 0) {
+        const e = new Error(`invalid keep value: ${keep} (expected non-negative integer)`);
+        e.code = "BAD_ARGS";
+        throw e;
+      }
+      if (kept.length > k) kept = kept.slice(kept.length - k);
     }
-    if (kept.length > k) kept = kept.slice(kept.length - k);
-  }
-  const removed = entries.length - kept.length;
-  if (!dryRun && removed > 0) {
-    writeHistoryAtomic(path, kept);
-  }
-  return { before: entries.length, after: kept.length, removed, dryRun, path };
+    const removed = entries.length - kept.length;
+    if (!dryRun && removed > 0) {
+      writeHistoryAtomic(path, kept);
+    }
+    return { before: entries.length, after: kept.length, removed, dryRun, path };
+  };
+  return dryRun ? run() : withHistoryLock(path, run);
 }
 
 export function clearHistory({ path = getHistoryPath() } = {}) {
-  const { entries } = readHistory({ path });
-  if (existsSync(path)) {
-    writeHistoryAtomic(path, []);
-  }
-  return { removed: entries.length, path };
+  return withHistoryLock(path, () => {
+    const { entries } = readHistory({ path });
+    if (existsSync(path)) {
+      writeHistoryAtomic(path, []);
+    }
+    return { removed: entries.length, path };
+  });
 }
 
 // Nearest-rank percentile on a pre-sorted ascending numeric array.
