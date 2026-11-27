@@ -10,7 +10,8 @@
 //   node scripts/check-recipes.mjs
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const RECIPES_DIR = fileURLToPath(new URL("../data/recipes/", import.meta.url));
 export const STYLES_FILE = fileURLToPath(new URL("../data/styles/styles.json", import.meta.url));
@@ -32,7 +33,7 @@ function readJson(path) {
 }
 
 export function validateRecipes(dir = RECIPES_DIR) {
-  const slots = readJson(`${dir}slots.json`);
+  const slots = readJson(join(dir, "slots.json"));
   const names = new Set(Object.keys(slots.slots));
   const problems = [];
   const stats = { categories: 0, recipes: 0, image: 0, shapes: {} };
@@ -40,7 +41,7 @@ export function validateRecipes(dir = RECIPES_DIR) {
   // Read every category first: duplicate ids can only be seen across files.
   const docs = readdirSync(dir)
     .filter((f) => f.endsWith(".json") && f !== "slots.json")
-    .map((f) => [f, readJson(`${dir}${f}`)]);
+    .map((f) => [f, readJson(join(dir, f))]);
   const seenRecipeIds = new Set();
 
   for (const [f, c] of docs) {
@@ -136,7 +137,7 @@ export function validateStyles(file = STYLES_FILE) {
   return { ok: problems.length === 0, problems, stats };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const recipes = validateRecipes();
   const looks = validateStyles();
   console.log(

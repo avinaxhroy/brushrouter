@@ -44,7 +44,7 @@ test("getKnownAgentConfigs includes standard agents and extra from env", () => {
   const custom1 = join(tmpdir(), "custom1.json");
   const custom2 = join(tmpdir(), "custom2.json");
   const env = { BRUSHROUTER_MCP_CONFIGS: `${custom1}:${custom2}` };
-  const configs = getKnownAgentConfigs({ env, platform: "darwin" });
+  const configs = getKnownAgentConfigs({ env, os: "darwin" });
   const names = configs.map((c) => c.name);
 
   assert.ok(names.includes("claude"));
@@ -238,7 +238,7 @@ test("installMcpToAgent handles DeepSeek Harness (dsh) YAML patch format", () =>
   }
 });
 
-test("install.sh script syntax and execution", () => {
+test("install.sh script syntax and execution", { skip: process.platform === "win32" }, () => {
   const check = spawnSync("bash", ["-n", "install.sh"]);
   assert.equal(check.status, 0);
   const home = mkdtempSync(join(tmpdir(), "br-install-test-"));
@@ -305,7 +305,7 @@ test("getKnownAgentConfigs adapts to Windows, Linux, and macOS platforms", () =>
   });
   const linuxClaudeDesktop = linuxConfigs.find((c) => c.name === "claude-desktop");
   assert.ok(linuxClaudeDesktop);
-  assert.equal(linuxClaudeDesktop.path, "/home/testuser/.config/Claude/claude_desktop_config.json");
+  assert.equal(linuxClaudeDesktop.path, join("/home/testuser", ".config", "Claude", "claude_desktop_config.json"));
 
   // macOS
   const macConfigs = getKnownAgentConfigs({
@@ -315,7 +315,7 @@ test("getKnownAgentConfigs adapts to Windows, Linux, and macOS platforms", () =>
   });
   const macClaudeDesktop = macConfigs.find((c) => c.name === "claude-desktop");
   assert.ok(macClaudeDesktop);
-  assert.equal(macClaudeDesktop.path, "/Users/testuser/Library/Application Support/Claude/claude_desktop_config.json");
+  assert.equal(macClaudeDesktop.path, join("/Users/testuser", "Library", "Application Support", "Claude", "claude_desktop_config.json"));
 });
 
 test("installMcpToAgent returns structured error for non-object JSON configs", () => {

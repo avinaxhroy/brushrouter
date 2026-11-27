@@ -20,8 +20,8 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = join(HERE, "..", "data", "styles");
@@ -327,7 +327,7 @@ async function main() {
   if (licenseNote) console.log(licenseNote);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().catch((e) => {
     console.error(`\nvendor failed: ${e.message}`);
     process.exit(1);
