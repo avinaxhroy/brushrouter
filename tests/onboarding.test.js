@@ -17,13 +17,13 @@ function fixture(t) {
   const config = join(configDir, "config.json");
   mkdirSync(home);
   const env = { HOME: home, USERPROFILE: home, PATH: "/usr/bin:/bin", BRUSHROUTER_CONFIG_DIR: configDir };
-  function run(args, { shim = "", extraEnv = {}, script = bin } = {}) {
+  function run(args, { shim = "", extraEnv = {}, script = bin, workingDir = cwd } = {}) {
     const argv = shim ? ["--input-type=module", "-e", `
       process.argv = [process.execPath, ${JSON.stringify(script)}, ...${JSON.stringify(args)}];
       ${shim}
       await import(${JSON.stringify(script)});
     `] : [script, ...args];
-    const result = spawnSync(process.execPath, argv, { cwd, env: { ...env, ...extraEnv }, timeout: 10000, encoding: "utf8", input: "" });
+    const result = spawnSync(process.execPath, argv, { cwd: workingDir, env: { ...env, ...extraEnv }, timeout: 10000, encoding: "utf8", input: "" });
     assert.ifError(result.error);
     return result;
   }
@@ -75,6 +75,18 @@ test("setup human dry-run redacts a credential-shaped MCP config path", (t) => {
   const preview = run(["setup", "--dry-run"], { extraEnv: { ...fal, BRUSHROUTER_MCP_CONFIGS: agent } });
   assert.equal(preview.status, 0, preview.stderr);
   assert.match(preview.stdout, /Dry run: would-update .*sk-\*\*\*\.json/);
+  assert.ok(!preview.stdout.includes(token));
+});
+
+test("setup human dry-run redacts a credential-shaped project rules path", (t) => {
+  const { cwd, run } = fixture(t);
+  const token = "sk-FIXTURERULES000000000000";
+  const project = join(cwd, token);
+  mkdirSync(join(project, ".git"), { recursive: true });
+  writeFileSync(join(project, "AGENTS.md"), "# Rules");
+  const preview = run(["setup", "--dry-run", "--skip-mcp"], { extraEnv: fal, workingDir: project });
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /Dry run: would-update .*sk-\*\*\*.*AGENTS\.md/);
   assert.ok(!preview.stdout.includes(token));
 });
 

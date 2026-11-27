@@ -2707,7 +2707,7 @@ async function cmdSetup(args) {
         if (res.status === "updated" || res.status === "created") {
           log(`  ${ok("✓")} ${rule.name.padEnd(25)} — injected clean rule block`);
         } else if (dry && res.status.startsWith("would-")) {
-          log(dim(`  Dry run: ${res.status} ${res.path}`));
+          log(dim(`  Dry run: ${res.status} ${redact(res.path)}`));
         } else if (res.status === "error") {
           log(`  ${bad("!")} ${rule.name.padEnd(25)} — ${bad(res.error)}`);
         }
