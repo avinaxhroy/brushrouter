@@ -938,41 +938,50 @@ export function serveMcp({ cwd = process.cwd() } = {}) {
 
   process.stdin.setEncoding("utf8");
   let discarding = false; // skipping the tail of an abandoned oversized line
+  let bufBytes = 0; // incremental UTF-8 byte count of `buf` (avoids O(N^2) rescanning)
   const oversizeError = () =>
     send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: request exceeds the ${MAX_REQUEST_BYTES / 1048576}MB input limit` } });
   process.stdin.on("data", (chunk) => {
     buf += chunk;
+    bufBytes += byteLength(chunk);
     if (discarding) {
       // Look ahead only for the newline that ends the abandoned line, then fall
       // through so whatever follows it is processed as normal requests.
       const nlIdx = buf.indexOf("\n");
       if (nlIdx < 0) {
         buf = "";
+        bufBytes = 0;
         return;
       }
       buf = buf.slice(nlIdx + 1);
+      bufBytes = byteLength(buf);
       discarding = false;
     }
-    // Measure BYTES, not UTF-16 code units: String.length counts a 3-byte
-    // character as 1, so a multi-byte line was admitted at up to ~3x the cap.
-    if (byteLength(buf) > MAX_REQUEST_BYTES && !buf.includes("\n")) {
-      // A request line has grown past the cap unfinished. Requests carry paths
-      // and prompts, never byte payloads, so this cannot be an actionable
-      // request: drop it and answer the client once.
-      buf = "";
-      discarding = true;
-      oversizeError();
-      return;
-    }
+    let start = 0;
     let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = idx + 1 < buf.length ? buf.slice(idx + 1) : "";
+    while ((idx = buf.indexOf("\n", start)) >= 0) {
+      const line = buf.slice(start, idx).trim();
+      start = idx + 1;
       if (byteLength(line) > MAX_REQUEST_BYTES) {
         oversizeError();
         continue;
       }
       void handleLine(line);
+    }
+    if (start > 0) {
+      buf = start < buf.length ? buf.slice(start) : "";
+      bufBytes = buf.length > 0 ? byteLength(buf) : 0;
+    }
+    // Measure BYTES, not UTF-16 code units: String.length counts a 3-byte
+    // character as 1, so a multi-byte line was admitted at up to ~3x the cap.
+    if (bufBytes > MAX_REQUEST_BYTES) {
+      // A request line has grown past the cap unfinished. Requests carry paths
+      // and prompts, never byte payloads, so this cannot be an actionable
+      // request: drop it and answer the client once.
+      buf = "";
+      bufBytes = 0;
+      discarding = true;
+      oversizeError();
     }
   });
   process.stdin.on("end", () => {

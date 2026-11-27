@@ -318,3 +318,22 @@ test("getKnownAgentConfigs adapts to Windows, Linux, and macOS platforms", () =>
   assert.equal(macClaudeDesktop.path, "/Users/testuser/Library/Application Support/Claude/claude_desktop_config.json");
 });
 
+test("installMcpToAgent returns structured error for non-object JSON configs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-mcp-nonobj-"));
+  try {
+    for (const [label, body] of [
+      ["null", "null"],
+      ["array", "[]"],
+      ["bad-key", '{"mcpServers": "nope"}'],
+    ]) {
+      const cfgPath = join(dir, `${label}.json`);
+      writeFileSync(cfgPath, body);
+      const res = installMcpToAgent({ name: "claude-desktop", path: cfgPath }, { dry: true });
+      assert.equal(res.status, "error", `${label} should return error status`);
+      assert.match(res.error, /invalid JSON:/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

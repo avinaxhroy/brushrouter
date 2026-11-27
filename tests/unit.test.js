@@ -3538,3 +3538,125 @@ test("openrouterProvider.probe strips trailing slash from baseUrl", async () => 
     globalThis.fetch = origFetch;
   }
 });
+
+test("runLogin binds the OAuth callback server BEFORE calling open() and skips open() on EADDRINUSE", async () => {
+  const { createServer } = await import("node:http");
+  const { runLogin, REDIRECT_PORT } = await import("../src/oauth.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-oauth-order-"));
+  const authPath = join(dir, "auth.json");
+  const origFetch = globalThis.fetch;
+  try {
+    // 1. Immediate callback from inside open() must succeed (server already listening).
+    const payload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_plan_type: "plus", chatgpt_account_id: "acct_order_test" },
+    })).toString("base64url");
+    const fakeIdToken = `eyJhbGciOiJub25lIn0.${payload}.sig`;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ access_token: "at_order_12345678", refresh_token: "rt_order_12345678", id_token: fakeIdToken }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    let callbackStatus = 0;
+    const res = await runLogin({
+      configDir: dir,
+      log: () => {},
+      open: async (authUrl) => {
+        const state = new URL(authUrl).searchParams.get("state");
+        const r = await origFetch(`http://127.0.0.1:${REDIRECT_PORT}/auth/callback?code=ok_code&state=${state}`);
+        callbackStatus = r.status;
+      },
+    });
+    assert.equal(callbackStatus, 200);
+    assert.equal(res.plan, "plus");
+    assert.equal(res.accountId, "acct_order_test");
+
+    // 2. If port 1455 is already busy, open() must NOT be called.
+    const blocker = createServer();
+    await new Promise((r) => blocker.listen(REDIRECT_PORT, "127.0.0.1", r));
+    let opened = false;
+    try {
+      await assert.rejects(
+        () => runLogin({ configDir: dir, log: () => {}, open: async () => { opened = true; } }),
+        /localhost:1455 is busy/,
+      );
+      assert.equal(opened, false, "browser should not open when callback port is busy");
+    } finally {
+      await new Promise((r) => blocker.close(r));
+    }
+  } finally {
+    globalThis.fetch = origFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("saveImage uses atomic exclusive create and versions collisions without overwriting", async () => {
+  const { saveImage } = await import("../src/util/common.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-save-wx-"));
+  try {
+    const a = saveImage("out.png", Buffer.from("img-1"), dir);
+    const b = saveImage("out.png", Buffer.from("img-2"), dir);
+    const c = saveImage("out.png", Buffer.from("img-3"), dir);
+    assert.equal(a.versioned, false);
+    assert.equal(b.versioned, true);
+    assert.ok(b.savedPath.endsWith("out-v2.png"));
+    assert.ok(c.savedPath.endsWith("out-v3.png"));
+    assert.equal(readFileSync(a.savedPath, "utf8"), "img-1");
+    assert.equal(readFileSync(b.savedPath, "utf8"), "img-2");
+    assert.equal(readFileSync(c.savedPath, "utf8"), "img-3");
+    const d = saveImage("out.png", Buffer.from("img-forced"), dir, { force: true });
+    assert.equal(d.savedPath, a.savedPath);
+    assert.equal(readFileSync(a.savedPath, "utf8"), "img-forced");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("batchGenerate does not sleep for cooldown on providers incompatible with pending items", async () => {
+  const { batchGenerate, PROVIDERS } = await import("../src/router.js");
+  const origGenerate = PROVIDERS.fal.generate;
+  const origProbe = PROVIDERS.fal.probe;
+  PROVIDERS.fal.probe = async () => ({ available: true });
+  PROVIDERS.fal.generate = async () => {
+    const e = new Error("429 Too Many Requests");
+    e.code = "QUOTA";
+    throw e;
+  };
+  try {
+    const t0 = Date.now();
+    const res = await batchGenerate({
+      items: [
+        { prompt: "text only" },
+        { prompt: "needs ref", images: ["/tmp/does-not-matter.png"] },
+      ],
+      provider: "fal",
+      fallback: false,
+      cooldownMs: 30000,
+      concurrency: 1,
+      cfg: { providers: { fal: { apiKey: "fal-key-test" } }, order: ["fal"] },
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(res.failed, 2);
+    assert.ok(elapsed < 2000, `expected immediate failure for incompatible item, took ${elapsed}ms`);
+  } finally {
+    PROVIDERS.fal.generate = origGenerate;
+    PROVIDERS.fal.probe = origProbe;
+  }
+});
+
+test("codexCliProvider.generate validates reference images before spawning CLI", async () => {
+  const { codexCliProvider } = await import("../src/providers/codex-cli.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-codexcli-ref-"));
+  const fakeCli = join(dir, "fake-codex");
+  const badRef = join(dir, "not-an-image.png");
+  writeFileSync(fakeCli, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex 0.1.0\"; exit 0; fi\nexit 99\n", { mode: 0o755 });
+  writeFileSync(badRef, "plain text, not png");
+  try {
+    await assert.rejects(
+      () => codexCliProvider.generate({ prompt: "edit", images: [badRef], cwd: dir }, { cli: fakeCli }),
+      /unsupported reference image type/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

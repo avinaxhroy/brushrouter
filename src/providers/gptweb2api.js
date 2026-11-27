@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { getConfigDir } from "../config.js";
-import { jwtExpiryMs } from "../util/common.js";
+import { appendTailed, fetchWithTimeout, jwtExpiryMs, readBodyCapped } from "../util/common.js";
 import { registerSecret } from "../util/redact.js";
 import { httpImageGenerate } from "./http.js";
 import { readAuth, appendSizeHint } from "./codex.js";
@@ -68,15 +68,15 @@ export function resolveBinaryPath(cfg) {
 // ---------------------------------------------------------------------------
 
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { "User-Agent": "brushrouter", Accept: "application/vnd.github+json" } });
+  const res = await fetchWithTimeout(url, { headers: { "User-Agent": "brushrouter", Accept: "application/vnd.github+json" } }, 15000);
   if (!res.ok) throw new Error(`GitHub API ${url} -> ${res.status}`);
   return res.json();
 }
 
 async function downloadFile(url, dest, headers = {}) {
-  const res = await fetch(url, { headers: { "User-Agent": "brushrouter", ...headers } });
+  const res = await fetchWithTimeout(url, { headers: { "User-Agent": "brushrouter", ...headers } }, 120000);
   if (!res.ok) throw new Error(`download failed: ${url} -> ${res.status}`);
-  const body = Buffer.from(await res.arrayBuffer());
+  const body = await readBodyCapped(res, 128 * 1024 * 1024);
   const fs = await import("node:fs/promises");
   await fs.writeFile(dest, body);
   return body;
@@ -188,6 +188,8 @@ export async function installSidecar({ onLog, dir, ref } = {}) {
 
 let live = null; // { child, port, key, bin, grantedAccess, idleTimer, stderrTail }
 let starting = null; // in-flight startSidecar promise (single-flight spawn)
+let startingChild = null; // child being started, so stopSidecar() can kill it mid-boot
+let startEpoch = 0; // bumped on stopSidecar() to cancel in-flight startups
 let exitHookInstalled = false;
 
 function freePort() {
@@ -202,6 +204,13 @@ function freePort() {
 }
 
 function stopSidecar() {
+  startEpoch++;
+  if (startingChild) {
+    const c = startingChild;
+    startingChild = null;
+    try { c.kill(); } catch {}
+    try { c.kill("SIGKILL"); } catch {}
+  }
   if (!live) return;
   const { child, idleTimer } = live;
   live = null;
@@ -226,7 +235,11 @@ async function healthWait(port, { timeoutMs = 10000, child, spawnErr } = {}) {
     if (se) throw new Error(`failed to start sidecar: ${se.message}`);
     if (child && child.exitCode !== null) throw new Error(lastErr || "sidecar exited during startup");
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      const res = await fetchWithTimeout(
+        `http://127.0.0.1:${port}/healthz`,
+        {},
+        Math.min(2000, Math.max(250, deadline - Date.now())),
+      );
       if (res.ok) return;
       lastErr = `healthz ${res.status}`;
     } catch {
@@ -278,8 +291,10 @@ function credentialMode(cfg) {
 }
 
 async function startSidecar(cfg, cred, onLog) {
+  const epoch = startEpoch;
   const bin = resolveBinaryPath(cfg);
   const port = await freePort();
+  if (epoch !== startEpoch) throw new Error("sidecar shutdown during startup");
   const apiKey = randomBytes(24).toString("hex");
   registerSecret(apiKey);
   const env = {
@@ -305,6 +320,7 @@ async function startSidecar(cfg, cred, onLog) {
     stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true,
   });
+  startingChild = child;
   let stderrTail = "";
   // Required: a failed spawn (ENOENT/EACCES on the vendored binary, or the file
   // vanishing between the existsSync check above and this call) emits "error" on
@@ -317,7 +333,7 @@ async function startSidecar(cfg, cred, onLog) {
     spawnErr = e;
   });
   child.stderr.on("data", (d) => {
-    stderrTail = (stderrTail + d.toString()).split("\n").slice(-6).join("\n");
+    stderrTail = appendTailed(stderrTail, d.toString(), 4096);
   });
   child.on("exit", (code) => {
     if (live?.child === child) {
@@ -332,9 +348,15 @@ async function startSidecar(cfg, cred, onLog) {
   try {
     await healthWait(port, { child, spawnErr: () => spawnErr });
   } catch (e) {
+    if (startingChild === child) startingChild = null;
     try { child.kill("SIGKILL"); } catch {}
     const reason = spawnErr ? `failed to start sidecar: ${spawnErr.message}` : e.message;
     throw new Error(`${reason}${stderrTail ? ` — ${stderrTail}` : ""}`);
+  }
+  if (startingChild === child) startingChild = null;
+  if (epoch !== startEpoch) {
+    try { child.kill("SIGKILL"); } catch {}
+    throw new Error("sidecar shutdown during startup");
   }
   live = {
     child,
