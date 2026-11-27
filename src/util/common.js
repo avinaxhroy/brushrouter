@@ -152,6 +152,11 @@ export function assertImageFile(filePath, cwd = process.cwd()) {
   const abs = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
   const fd = openSync(abs, "r");
   try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`not a regular file: ${abs}`);
+    if (st.size > MAX_REF_IMAGE_BYTES) {
+      throw new Error(`reference image too large (${Math.round(st.size / 1048576)}MB; limit ${MAX_REF_IMAGE_BYTES / 1048576}MB): ${abs}`);
+    }
     const n = readSync(fd, MAGIC_BUF, 0, 12, 0);
     const mime = detectImageMime(MAGIC_BUF.subarray(0, n));
     if (!mime) throw new Error(`unsupported reference image type: ${abs}`);

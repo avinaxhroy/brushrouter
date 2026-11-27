@@ -17,7 +17,7 @@
 // the prompt (same convention as the codex route), edits are multipart and
 // intentionally out of v1.
 
-import { spawn, exec } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
@@ -48,7 +48,7 @@ export const HIDE_CONVERSATIONS_PATCH = fileURLToPath(
   new URL("../../scripts/gptweb2api-hideconversations.patch", import.meta.url),
 );
 
-const promisifiedExec = promisify(exec);
+const promisifiedExecFile = promisify(execFile);
 
 // Sidecar install root lives in the user config dir, so `npm link` checkouts
 // and repository clones share one binary and it survives checkouts/updates.
@@ -127,24 +127,24 @@ async function trySourceInstall(dir, ref, onLog) {
   if (!existsSync(join(srcDir, ".git"))) {
     onLog?.(`cloning ${GITHUB_REPO} ...`);
     mkdirSync(dir, { recursive: true });
-    await promisifiedExec(`git clone --no-checkout https://github.com/${GITHUB_REPO} "${srcDir}"`);
+    await promisifiedExecFile("git", ["clone", "--no-checkout", `https://github.com/${GITHUB_REPO}`, srcDir]);
   }
   const wanted = ref === "HEAD" ? "" : ref;
   if (wanted) {
-    await promisifiedExec(`git -C "${srcDir}" checkout --detach --quiet ${wanted}`);
+    await promisifiedExecFile("git", ["-C", srcDir, "checkout", "--detach", "--quiet", wanted]);
   }
   // Cleanup patch: hide throwaway image conversations from account history
   // right after generation (see scripts/gptweb2api-hideconversations.patch).
   if (existsSync(HIDE_CONVERSATIONS_PATCH)) {
     let applied = false;
     try {
-      await promisifiedExec(`git -C "${srcDir}" apply "${HIDE_CONVERSATIONS_PATCH}"`);
+      await promisifiedExecFile("git", ["-C", srcDir, "apply", HIDE_CONVERSATIONS_PATCH]);
       applied = true;
       onLog?.("applied hide-conversations patch");
     } catch {}
     if (!applied) {
       try {
-        await promisifiedExec(`git -C "${srcDir}" apply --reverse --check "${HIDE_CONVERSATIONS_PATCH}"`);
+        await promisifiedExecFile("git", ["-C", srcDir, "apply", "--reverse", "--check", HIDE_CONVERSATIONS_PATCH]);
         onLog?.("hide-conversations patch already applied (upstream took it)");
       } catch {
         onLog?.("warning: hide-conversations patch did not apply — image chats will stay in account history");
@@ -157,8 +157,9 @@ async function trySourceInstall(dir, ref, onLog) {
   }
   onLog?.(`building with go (this downloads modules once) ...`);
   const binPath = join(dir, `gptweb2api${EXE}`);
-  await promisifiedExec(
-    `go build -trimpath -ldflags="-s -w" -o "${binPath}" ./cmd/gptweb2api`,
+  await promisifiedExecFile(
+    "go",
+    ["build", "-trimpath", "-ldflags=-s -w", "-o", binPath, "./cmd/gptweb2api"],
     { cwd: srcDir, timeout: 300000 },
   );
   if (EXE !== ".exe") chmodSync(binPath, 0o755);
@@ -250,7 +251,12 @@ function armIdle(idleMs) {
 //     the access token directly; web access tokens expire, so a changed token
 //     re-spawns the sidecar below instead of 401-ing forever.
 function credentialMode(cfg) {
-  const auth = readAuth(cfg);
+  let auth = null;
+  try {
+    auth = readAuth(cfg);
+  } catch {
+    auth = null;
+  }
   if (auth?.refresh && auth.format === "codex" && auth.filePath) {
     const accessToken = auth.access;
     registerSecret(accessToken);
@@ -286,7 +292,7 @@ async function startSidecar(cfg, cred, onLog) {
   if (cred.kind === "tokenFile") {
     env.GPTWEB_OAUTH_TOKEN_FILE = cred.file;
   } else {
-    env.GPTWEB_OAUTH_TOKEN = cred.access;
+    if (cred.access) env.GPTWEB_OAUTH_TOKEN = cred.access;
     if (cred.accountId) env.GPTWEB_ACCOUNT_ID = cred.accountId;
     if (cred.cookie) env.GPTWEB_COOKIE = cred.cookie;
   }

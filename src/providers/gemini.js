@@ -313,7 +313,12 @@ export const geminiProvider = {
     };
   },
 
-  async generate({ prompt, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, images = [], onProgress, model: requestedModel }, cfg) {
+    if (images?.length) {
+      const e = new Error("gemini does not support reference images; use codex, codex-cli, or openrouter");
+      e.code = "UNSUPPORTED";
+      throw e;
+    }
     const cli = await resolveCli(cfg);
     if (!cli) {
       const e = new Error("neither `agy` nor `gemini` is installed");

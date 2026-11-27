@@ -288,10 +288,17 @@ async function mapLimited(items, limit, fn) {
   return out;
 }
 
+function assertGeneratePrompt(args) {
+  if (typeof args?.prompt !== "string" || args.prompt.trim() === "") {
+    throw new Error('generate_image requires a non-empty "prompt" string');
+  }
+}
+
 // Runs the generation and returns the exact tools/call content the agent would
 // have received from a blocking call. Shared by the sync and async paths so the
 // two can never drift.
 async function runGenerate(args, ctx, onProgress) {
+  assertGeneratePrompt(args);
   const { cwd = process.cwd() } = ctx;
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
@@ -318,7 +325,7 @@ async function runGenerate(args, ctx, onProgress) {
       content: [{ type: "text", text }, block],
       isError: false,
     };
-    content[SAVED_PATH] = saved.savedPath;
+    content[SAVED_PATH] = [saved.savedPath];
     return content;
   }
 
@@ -354,7 +361,7 @@ async function runGenerate(args, ctx, onProgress) {
     // Zero images means the call failed; a partial set is still a usable answer.
     isError: good.length === 0,
   };
-  content[SAVED_PATH] = good.map((r) => r.savedPath).join("; ");
+  content[SAVED_PATH] = good.map((r) => r.savedPath);
   return content;
 }
 
@@ -449,7 +456,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
     content: [{ type: "text", text: redact(textLines.join("\n")) }, ...blocks],
     isError: batchRes.completed === 0 && batchRes.total > 0,
   };
-  content[SAVED_PATH] = completedResults.map((r) => r.savedPath).join("; ");
+  content[SAVED_PATH] = completedResults.map((r) => r.savedPath);
   return content;
 }
 
@@ -517,7 +524,9 @@ function startJob(argsIn, ctx, runner = runGenerate) {
 function rebuildContent(job) {
   let paths = [];
   try {
-    paths = (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
+    paths = Array.isArray(job.savedPath)
+      ? job.savedPath.filter(Boolean)
+      : (job.savedPath || "").split("; ").map((p) => p.trim()).filter(Boolean);
     const blocks = [];
     const missing = [];
     for (const p of paths) {
@@ -684,7 +693,10 @@ export async function handlePromptToolCall(args = {}) {
   };
 }
 
-export async function handleToolCall(name, args, ctx = {}) {
+export async function handleToolCall(name, args = {}, ctx = {}) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("tool arguments must be an object");
+  }
   if (name === PROMPT_TOOL_NAME) return handlePromptToolCall(args);
   if (name === JOB_TOOL_NAME) {
     pruneJobs();
@@ -711,6 +723,7 @@ export async function handleToolCall(name, args, ctx = {}) {
   }
   if (name !== TOOL_NAME) throw new Error(`unknown tool: ${name}`);
   if (args.async === true) {
+    assertGeneratePrompt(args);
     const job = startJob(args, ctx);
     return {
       content: [

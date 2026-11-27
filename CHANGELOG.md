@@ -2,6 +2,10 @@
 
 ## [0.2.5] - 2026-10-29
 
+- **Installer & CLI fixes:** fixed `install.sh` failing under `set -u` when invoked without arguments (`$1: unbound variable`), fixed unknown CLI commands printing `[object Object]`, wired `--images` into `gen --dry-run` ordering, made `batch --dry-run` enforce `--provider`/`--fallback` and configured per-provider concurrency, added `--offset` (and `limit`/`offset`/`hasMore` JSON fields) to `prompts`, and enabled free-plan `gptweb2api` routing in `brushrouter login`.
+- **Provider & router hardening:** fixed `gptweb2api` `credentialMode()` throwing instead of falling back to cookie-only auth or returning `auth: "needs-login"` from `probe()`, switched `gptweb2api` source-build `git`/`go` invocations from `exec` to `execFile`, fixed `codex` token refresh persistence for non-`openai` `pi`/`omp` auth keys, cleared `fetchWithTimeout` abort timers when `codex` SSE streams settle, added 401 token-refresh retry on the direct Codex images endpoint, made `fal` and `gemini` fail loudly with `UNSUPPORTED` when given reference images, stripped trailing slashes from OpenRouter `probe()` `baseUrl`, and applied the transparent-background prompt hint in `batchGenerate`.
+- **Validation & redaction:** added regular-file and size checks to `assertImageFile`, used `safeParseMessage` when reporting corrupt `keys.json` and JSONC MCP configs (removing the duplicate `invalid JSON:` prefix), validated non-empty `prompt` on MCP `generate_image` (sync and async), and stored MCP job `savedPath` entries as arrays instead of `"; "`-joined strings.
+
 - **Breaking — disabled routes:** `enabled: false` now also refuses an explicit `--provider` and `batch --provider`, with a `PROVIDER_DISABLED` error; `--fallback` cannot bypass it.
 - **Breaking — project config:** `brushrouter.config.json` is filtered by an allow-list (model, priority, size, timeout, concurrency). Endpoints, binaries, credentials, headers and bodies are dropped with a warning.
 - **MCP `count`:** implemented (max 8) — each variation gets its own file (`out-1.png`…), partial failures are reported, and `isError` is true only when none succeeded.

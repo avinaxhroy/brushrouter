@@ -340,7 +340,7 @@ export const openrouterProvider = {
   async probe(cfg) {
     const found = resolveKey(cfg, "openrouter");
     if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_OPENROUTER_KEY)" };
-    const base = cfg?.baseUrl || OPENROUTER_BASE;
+    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
     const headers = { Authorization: `Bearer ${found.key}` };
     try {
       // The count needs both catalogues, so request them together: this probe
@@ -467,12 +467,12 @@ export const falProvider = {
     if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_FAL_KEY)" };
     return { available: true, auth: "ok", detail: `key from ${found.source} (validated on first use)` };
   },
-  async generate({ prompt, size, quality, cwd, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, size, quality, images = [], cwd, onProgress, model: requestedModel }, cfg) {
     const found = resolveKey(cfg, "fal");
     const model = requestedModel || cfg?.model || "fal-ai/flux/schnell";
     const base = (cfg?.baseUrl || "https://fal.run").replace(/\/$/, "");
     const n = String(size || "1024x1024").match(/(\d+)\s*[xX]\s*(\d+)/);
-    return httpImageGenerate({ prompt, size, quality, cwd, onProgress }, cfg, {
+    return httpImageGenerate({ prompt, size, quality, images, cwd, onProgress }, cfg, {
       id: "fal",
       name: "fal.ai",
       url: `${base}/${model}`,

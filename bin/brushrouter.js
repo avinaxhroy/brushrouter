@@ -163,6 +163,7 @@ function parse(argv) {
         kind: { type: "string" },
         mode: { type: "string" },
         limit: { type: "string", short: "n" },
+        offset: { type: "string" },
         full: { type: "boolean", default: false },
         "prompt-only": { type: "boolean", default: false },
         raw: { type: "boolean", default: false },
@@ -202,7 +203,7 @@ function parse(argv) {
 const VALUE_FLAGS = new Set([
   "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
   "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
-  "--mode", "--limit", "-n", "--id", "--seed", "--input", "--shape", "--set",
+  "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
 ]);
 
@@ -401,7 +402,7 @@ async function cmdGenerate(args) {
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback });
+      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback, images: imagePaths });
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -656,11 +657,25 @@ async function cmdBatch(args) {
     : null;
 
   if (values["dry-run"]) {
+    let order;
+    try {
+      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback });
+    } catch (e) {
+      console.error(bad(`error: ${redact(e.message)}`));
+      return exitAfterFlush(1);
+    }
     const probes = await probeAll(cfg);
-    const readyProbes = probes.filter((p) => p.enabled && p.available);
+    const byId = new Map(probes.map((p) => [p.id, p]));
+    const readyProbes = order
+      .map((id) => byId.get(id))
+      .filter((p) => p && (values.provider === p.id ? p.enabled : p.enabled && p.available));
+    const perProviderLimit = (id) => {
+      const configured = cfg.providers?.[id]?.concurrency;
+      return typeof configured === "number" && configured >= 1 ? configured : DEFAULT_PROVIDER_CONCURRENCY[id] || 1;
+    };
     const concurrency = values.concurrency
       ? Number(values.concurrency)
-      : readyProbes.reduce((sum, p) => sum + (DEFAULT_PROVIDER_CONCURRENCY[p.id] || 1), 0);
+      : readyProbes.reduce((sum, p) => sum + perProviderLimit(p.id), 0);
 
     if (values.json) {
       console.log(
@@ -670,7 +685,7 @@ async function cmdBatch(args) {
             totalItems: items.length,
             outDir,
             concurrency,
-            readyProviders: readyProbes.map((p) => ({ id: p.id, concurrency: DEFAULT_PROVIDER_CONCURRENCY[p.id] || 1 })),
+            readyProviders: readyProbes.map((p) => ({ id: p.id, concurrency: perProviderLimit(p.id) })),
             items: items.map((it, idx) => ({ index: idx + 1, prompt: it.prompt, out: it.out })),
           }),
           null,
@@ -685,7 +700,7 @@ async function cmdBatch(args) {
     console.log(`  concurrency:    ${concurrency} worker(s) across ready backends`);
     console.log(dim("  ready backends:"));
     for (const p of readyProbes) {
-      console.log(`    ${p.id.padEnd(12)} (concurrency limit: ${DEFAULT_PROVIDER_CONCURRENCY[p.id] || 1})`);
+      console.log(`    ${p.id.padEnd(12)} (concurrency limit: ${perProviderLimit(p.id)})`);
     }
     console.log(dim("\n  items to process:"));
     for (let i = 0; i < Math.min(items.length, 10); i++) {
@@ -965,7 +980,7 @@ function cmdPrompts(args) {
 
   // Reject a typo'd number instead of coercing it to NaN, which used to make a
   // matching query report "Nothing matched".
-  for (const [flag, raw] of [["--limit", values.limit], ["--seed", values.seed]]) {
+  for (const [flag, raw] of [["--limit", values.limit], ["--offset", values.offset], ["--seed", values.seed]]) {
     if (raw !== undefined && !Number.isFinite(Number(raw))) {
       console.error(bad(`error: ${flag} expects a number, got "${raw}"`));
       return exitAfterFlush(2);
@@ -981,7 +996,8 @@ function cmdPrompts(args) {
       input: values.input || "text",
       shape: values.shape,
       mode,
-      limit: values.limit ? Number(values.limit) : undefined,
+      limit: values.limit !== undefined ? Number(values.limit) : undefined,
+      offset: values.offset !== undefined ? Number(values.offset) : 0,
       id: values.id,
       seed: values.seed ? Number(values.seed) : 0,
     });
@@ -1011,6 +1027,9 @@ function cmdPrompts(args) {
               input: result.input,
               matched: result.matched,
               total: result.total,
+              limit: result.limit,
+              offset: result.offset,
+              hasMore: result.hasMore,
               available: result.available,
               recipes: result.rows.map((r) => publicRecipe(r, { full: values.full, values: slotValues, input: result.input })),
             },
@@ -1823,7 +1842,12 @@ async function main() {
         const { path, plan, accountId } = await runLogin({ configDir: getConfigDir(), log: (l) => console.log(l) });
         console.log(`✓ logged in — plan ${plan || "unknown"}, account ${accountId}`);
         console.log(`credentials: ${path}`);
-        console.log(`try: brushrouter gen "test" --provider codex -o /tmp/t.png`);
+        if (applyFreePlanRouting(plan)) {
+          console.log(`✓ free plan detected — enabled gptweb2api route`);
+          console.log(`try: brushrouter vendor && brushrouter gen "test" -p gptweb2api -o /tmp/t.png`);
+        } else {
+          console.log(`try: brushrouter gen "test" --provider codex -o /tmp/t.png`);
+        }
       } catch (e) {
         // OAuth failures quote request/response bodies, which can carry a token
         // or client secret — every sibling branch redacts, and this one did not.
@@ -1851,7 +1875,7 @@ async function main() {
     case "mcp":
       return (await import("../src/mcp.js")).serveMcp({ cwd: process.cwd() });
     default:
-      console.error(bad(`unknown command: ${command}`));
+      console.error(bad(`unknown command: ${command.token}`));
       console.error(dim("run `brushrouter --help` for usage"));
       return exitAfterFlush(2);
   }

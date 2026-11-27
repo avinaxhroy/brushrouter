@@ -250,8 +250,37 @@ test("install.sh script syntax and execution", () => {
     assert.equal(run.status, 0);
     assert.match(run.stdout, /brushrouter installer/);
     assert.match(run.stdout, /provider-agnostic image generation router/);
+
+    // Regression: running install.sh with no args used to abort under `set -u`
+    // at `if [ "$1" == "--update" ]` with "$1: unbound variable".
+    const noArgs = spawnSync("./install.sh", [], {
+      encoding: "utf8",
+      input: "",
+      env: {
+        ...process.env,
+        HOME: home,
+        BRUSHROUTER_CONFIG_DIR: join(home, ".config", "brushrouter"),
+      },
+    });
+    assert.doesNotMatch(noArgs.stderr || "", /unbound variable/i);
+    assert.match(noArgs.stdout || "", /brushrouter installer/);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("installMcpToAgent reports corrupt JSON cleanly without double prefix", () => {
+  const dir = mkdtempSync(join(tmpdir(), "br-bad-json-"));
+  try {
+    const configPath = join(dir, "mcp.json");
+    writeFileSync(configPath, '{ "mcpServers": { "secret": "super-secret-value-12345" bad } }');
+    const res = installMcpToAgent({ name: "test", path: configPath, key: "mcpServers" }, { command: "brushrouter", args: ["serve"] });
+    assert.equal(res.status, "error");
+    assert.match(res.error, /^invalid JSON:/);
+    assert.doesNotMatch(res.error, /invalid JSON:\s*invalid JSON:/);
+    assert.doesNotMatch(res.error, /super-secret-value-12345/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 test("getKnownAgentConfigs adapts to Windows, Linux, and macOS platforms", () => {

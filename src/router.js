@@ -133,6 +133,14 @@ async function attemptOrder(cfg, { provider, fallback, images }) {
   return enabled;
 }
 
+function promptForBackground(prompt, background, providerId) {
+  // codex takes background as an API field; every other route can only put it
+  // in the prompt, so say it there rather than drop the request.
+  return background === "transparent" && providerId !== "codex"
+    ? `${prompt} Generate the image with a fully transparent background (no scene behind the subject, RGBA output).`
+    : prompt;
+}
+
 export async function generate({ prompt, size, quality, background, images, out, cwd = process.cwd(), provider, model, fallback = false, onProgress }, cfgIn) {
   const cfg = cfgIn || loadConfig({ cwd });
   const order = await attemptOrder(cfg, { provider, fallback, images });
@@ -156,12 +164,7 @@ export async function generate({ prompt, size, quality, background, images, out,
       }
     }
     notify(onProgress, `using ${id}...`, 10);
-    // codex takes background as an API field; every other route can only put it
-    // in the prompt, so say it there rather than drop the request.
-    const promptForProvider =
-      background === "transparent" && id !== "codex"
-        ? `${prompt} Generate the image with a fully transparent background (no scene behind the subject, RGBA output).`
-        : prompt;
+    const promptForProvider = promptForBackground(prompt, background, id);
     try {
       const result = await p.generate({ prompt: promptForProvider, size, quality, background, images, out, cwd, model, onProgress }, pcfg);
       // Contract check: a provider must return actual image bytes. A provider
@@ -393,7 +396,7 @@ export async function batchGenerate(
       try {
         const res = await p.generate(
           {
-            prompt: item.prompt,
+            prompt: promptForBackground(item.prompt, item.background, pId),
             size: item.size,
             quality: item.quality,
             background: item.background,
