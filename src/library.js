@@ -60,19 +60,24 @@ export const MODES = ["categories", "related", "one", "brainstorm"];
  *  custom lighting, mood, surface, grading, or render styles without warnings. */
 export const STRICT_SLOTS = new Set(["ratio"]);
 
-/** Map a recipe ratio slot (e.g. "16:9") to a standard provider pixel size. */
+/** Map a recipe ratio slot (e.g. "16:9") to exact aspect-ratio pixel dimensions
+ *  (multiples of 16 so sizeToAspectRatio() reduces back to the exact ratio). */
 export function ratioToSize(ratio) {
   switch (String(ratio || "").trim()) {
     case "1:1":
       return "1024x1024";
     case "16:9":
+      return "1536x864";
     case "4:3":
-      return "1536x1024";
+      return "1344x1008";
     case "9:16":
+      return "864x1536";
     case "2:3":
-    case "3:4":
-    case "4:5":
       return "1024x1536";
+    case "3:4":
+      return "1008x1344";
+    case "4:5":
+      return "1024x1280";
     default:
       return null;
   }

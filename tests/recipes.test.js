@@ -616,7 +616,7 @@ test("open aesthetic slots accept creative values while ratio stays strict", () 
     twist: "shot on expired Kodak Portra 400 with subtle halation",
   });
   assert.deepEqual(f.invalidValues, [], "creative aesthetic slot values should not be flagged invalid");
-  assert.equal(f.suggestedSize, "1536x1024");
+  assert.equal(f.suggestedSize, "1536x864");
   assert.ok(f.text.includes("bioluminescent underglow with warm rim"));
   assert.ok(f.text.includes("CREATIVE DIRECTION — shot on expired Kodak Portra 400 with subtle halation"));
   assert.ok(f.text.indexOf("CREATIVE DIRECTION —") < f.text.indexOf("AVOID —"));
