@@ -1047,6 +1047,7 @@ async function cmdBatch(args) {
     const concurrency = values.concurrency
       ? Number(values.concurrency)
       : readyProbes.reduce((sum, p) => sum + perProviderLimit(p.id), 0);
+    const allFailed = plans.length > 0 && plans.every((plan) => plan.error);
 
     if (values.json) {
       console.log(
@@ -1075,6 +1076,7 @@ async function cmdBatch(args) {
           2,
         ),
       );
+      if (allFailed) return exitAfterFlush(1);
       return;
     }
 
@@ -1095,6 +1097,7 @@ async function cmdBatch(args) {
     }
     if (items.length > 10) console.log(dim(`    ... and ${items.length - 10} more`));
     console.log("");
+    if (allFailed) return exitAfterFlush(1);
     return;
   }
 
