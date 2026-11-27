@@ -57,10 +57,16 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "@types/node": "^20.19.0"
+  "peerDependencies": {
+    "@types/node": ">=20.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@types/node": "^20.19.0",
     "typescript": "^5.9.3"
   },
   "keywords": [
