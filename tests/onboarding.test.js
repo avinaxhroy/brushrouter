@@ -361,3 +361,23 @@ test("custom recipe validation reports file errors without breaking valid runtim
   assert.equal(bundled.status, 2);
   assert.match(bundled.stderr, /only checks bundled recipes/);
 });
+
+test("explicit trusted recipe directories can override bundled IDs with auto-scan disabled", (t) => {
+  const { cwd, configDir, run } = fixture(t);
+  const trusted = join(configDir, "recipes");
+  const extra = join(cwd, "extra");
+  const project = join(cwd, ".brushrouter", "recipes");
+  for (const dir of [trusted, extra, project]) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "override.json"), '{"id":"logo-mark","text":"Fixture override"}');
+  }
+  const extraEnv = { BRUSHROUTER_NO_CUSTOM_RECIPES: "1", BRUSHROUTER_EXTRA_RECIPES_DIRS: extra };
+  const automatic = run(["recipes", "validate", "--json"], { extraEnv });
+  assert.deepEqual(JSON.parse(automatic.stdout).files, []);
+  const explicit = run(["recipes", "validate", trusted, extra, "--json"], { extraEnv });
+  assert.equal(explicit.status, 0, explicit.stdout + explicit.stderr);
+  assert.equal(JSON.parse(explicit.stdout).files.length, 2);
+  const untrusted = run(["recipes", "validate", project, "--json"], { extraEnv });
+  assert.equal(untrusted.status, 1);
+  assert.match(untrusted.stdout, /untrusted directory cannot override/);
+});

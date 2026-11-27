@@ -386,8 +386,8 @@ function loadBuiltInRecipes() {
   return { slotsFile, slots, categories, recipes, styles, stylesFile };
 }
 
-function customRecipeDirs() {
-  if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES === "1") return [];
+function customRecipeDirs({ explicit = false } = {}) {
+  if (!explicit && process.env.BRUSHROUTER_NO_CUSTOM_RECIPES === "1") return [];
   return [
     { dir: join(getConfigDir(), "recipes"), trusted: true, optional: true },
     ...(process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS || "").split(delimiter).map((dir) => dir.trim()).filter(Boolean)
@@ -549,7 +549,7 @@ function scanCustomRecipes(dirs, { slots, recipes, styles }, preceding = []) {
 }
 
 export function validateCustomRecipes(paths = []) {
-  const configured = customRecipeDirs();
+  const configured = customRecipeDirs({ explicit: paths.length > 0 });
   const dirs = paths.length ? paths.map((dir) => ({
     dir, trusted: configured.some((entry) => entry.trusted && resolve(entry.dir) === resolve(dir)),
   })) : configured;
