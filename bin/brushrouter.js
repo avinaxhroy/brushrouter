@@ -2268,6 +2268,22 @@ function commandFailure(command, result) {
   return `${command} failed: ${detail}`;
 }
 
+function diagnoseUpdatedInstall() {
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "doctor", "--json"], {
+    encoding: "utf8",
+    timeout: 90000,
+    killSignal: "SIGKILL",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (child.status === 0 || child.status === 1) {
+    try {
+      const result = JSON.parse(child.stdout);
+      if (Array.isArray(result?.providers) && Array.isArray(result.agents) && Array.isArray(result.fixes) && result.config) return result;
+    } catch {}
+  }
+  return { ok: false, providers: [], agents: [], fixes: [], error: commandFailure("post-update doctor", child) };
+}
+
 async function cmdUpdate({ values }) {
   const dry = values["dry-run"];
   const isGit = existsSync(join(PACKAGE_ROOT, ".git"));
@@ -2316,7 +2332,7 @@ async function cmdUpdate({ values }) {
     try {
       result.version = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")).version;
     } catch {}
-    result.doctor = await diagnose();
+    result.doctor = diagnoseUpdatedInstall();
     if (!values.json) {
       console.log(`\n${ok("✓")} Current version: ${paint(C.bold, `v${result.version}`)}`);
       console.log("\nVerifying providers and routing after update:");

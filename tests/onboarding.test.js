@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, cpSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -262,6 +262,36 @@ test("update invokes Windows npm.cmd through a shell", (t) => {
   const result = run(["update", "--json"], { shim, extraEnv: fal });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.equal(JSON.parse(result.stdout).steps.at(-1).status, "applied");
+});
+
+test("post-update doctor loads providers from the newly updated files", (t) => {
+  const { cwd, run } = fixture(t);
+  const copy = join(cwd, "install");
+  mkdirSync(join(copy, ".git"), { recursive: true });
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  for (const file of ["bin", "src", "package.json"]) cpSync(join(root, file), join(copy, file), { recursive: true });
+  const shim = `
+    const { createRequire, syncBuiltinESMExports } = await import("node:module");
+    const require = createRequire(process.argv[1]);
+    const child = require("node:child_process");
+    const fs = require("node:fs");
+    const { join } = require("node:path");
+    const original = child.spawnSync;
+    child.spawnSync = (command, args, opts) => {
+      if (command === "git") {
+        const file = join(opts.cwd, "src", "providers", "http.js");
+        fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("Fast hosted models", "UPDATED PROVIDER FIXTURE"));
+        return { status: 0 };
+      }
+      if (command === "npm" && args[0] === "link") return { status: 0 };
+      return original(command, args, opts);
+    };
+    syncBuiltinESMExports();
+  `;
+  const result = run(["update", "--json"], { shim, extraEnv: fal, script: join(copy, "bin", "brushrouter.js") });
+  assert.equal(result.status, 0, result.stderr);
+  const provider = JSON.parse(result.stdout).doctor.providers.find(({ id }) => id === "fal");
+  assert.match(provider.note, /UPDATED PROVIDER FIXTURE/);
 });
 
 test("custom recipe validation reports file errors without breaking valid runtime entries", (t) => {
