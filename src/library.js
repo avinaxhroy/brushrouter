@@ -399,12 +399,12 @@ export function loadRecipes() {
   const customDirs = [];
   if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES !== "1") {
     customDirs.push({ dir: join(getConfigDir(), "recipes"), trusted: true });
-    customDirs.push({ dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false });
     if (process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS) {
       for (const d of process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS.split(delimiter)) {
         if (d.trim()) customDirs.push({ dir: d.trim(), trusted: true });
       }
     }
+    customDirs.push({ dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false });
   }
   const seenDirs = new Set();
   const customRecipes = [];
@@ -425,7 +425,7 @@ export function loadRecipes() {
       try {
         data = readJson(join(dir, file));
       } catch (e) {
-        process.stderr.write(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${safeParseMessage(e)})\n`);
+        process.stderr.write(redact(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${safeParseMessage(e)})\n`));
         continue;
       }
       if (!data || typeof data !== "object" || Array.isArray(data)) continue;
@@ -442,7 +442,7 @@ export function loadRecipes() {
         if (!raw || typeof raw !== "object" || !raw.id || typeof raw.text !== "string") continue;
         const entryId = String(raw.id);
         if (!trusted && protectedIds.has(entryId)) {
-          process.stderr.write(`brushrouter: ignoring project-local override of built-in recipe "${redact(entryId)}" in ${join(dir, file)}\n`);
+          process.stderr.write(redact(`brushrouter: ignoring project-local override of built-in recipe "${entryId}" in ${join(dir, file)}\n`));
           continue;
         }
         const entryKind = raw.kind === "look" ? "look" : bundleKind;
@@ -483,7 +483,7 @@ export function loadRecipes() {
             allSlots: slots,
           });
         } catch (e) {
-          process.stderr.write(`brushrouter: ignoring malformed custom recipe "${redact(entryId)}" in ${join(dir, file)} (${redact(e.message)})\n`);
+          process.stderr.write(redact(`brushrouter: ignoring malformed custom recipe "${entryId}" in ${join(dir, file)} (${e.message})\n`));
           continue;
         }
         customRecipes.push({ ...indexed, kind: entryKind, custom: true });
