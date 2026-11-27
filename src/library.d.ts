@@ -143,21 +143,51 @@ export interface RecipeSuggestions {
   categories: string[];
 }
 
-interface RecipeSearchPage {
-  mode: RecipeMode;
+interface RecipeSearchFilters {
   query: string | null;
   category: string | null;
   kind: RecipeKind | null;
   input: RecipeInput;
   shape: string | null;
-  limit: number;
-  offset: number;
 }
 
-export type FindRecipesResult = RecipeSearchPage & (
-  | { matched: true; total: number; available: number; hasMore: boolean; rows: IndexedRecipe[]; suggestions?: never }
-  | { matched: false; total: 0; available: 0; hasMore: false; rows: []; suggestions: RecipeSuggestions }
+export interface RecipeCategoriesResult extends RecipeSearchFilters {
+  mode: "categories";
+  matched: true;
+  total: number;
+  available: number;
+  limit: null;
+  offset: 0;
+  rows: [];
+  hasMore?: never;
+  suggestions?: never;
+}
+
+type RecipeMatchResult = {
+  matched: true;
+  total: number;
+  available: number;
+  rows: IndexedRecipe[];
+  suggestions?: never;
+} & (
+  | { mode: "one"; limit: 1; hasMore: false }
+  | { mode: "related" | "brainstorm"; limit: number; hasMore: boolean }
 );
+
+type RecipeMissResult = {
+  mode: Exclude<RecipeMode, "categories">;
+  matched: false;
+  total: 0;
+  available: 0;
+  limit: number;
+  hasMore: false;
+  rows: [];
+  suggestions: RecipeSuggestions;
+};
+
+export type FindRecipesResult =
+  | RecipeCategoriesResult
+  | (RecipeSearchFilters & { offset: number } & (RecipeMatchResult | RecipeMissResult));
 
 export interface FillOptions {
   values?: Record<string, unknown>;

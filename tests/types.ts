@@ -91,6 +91,16 @@ if (!results.matched) {
 }
 const display: string = renderResult(results);
 const sameSearch: typeof findRecipes = findRecipesFromRoot;
+const categories = findRecipes({ mode: "categories" });
+if (categories.mode === "categories") {
+  const limit: null = categories.limit;
+  const offset: 0 = categories.offset;
+  const hasMore: undefined = categories.hasMore;
+  const rows: [] = categories.rows;
+} else if (categories.mode === "one" && categories.matched) {
+  const limit: 1 = categories.limit;
+  const hasMore: false = categories.hasMore;
+}
 
 // @ts-expect-error A generation must include a prompt.
 generate({ provider: "codex" });
