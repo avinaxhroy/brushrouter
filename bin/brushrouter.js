@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG, DEFAULT_OPENAI_IMAGE_MODEL } from "../src/config.js";
-import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
+import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, batchProbeAllowsModel, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
 import {
   tryRecordHistory,
   listHistory,
@@ -1049,7 +1049,8 @@ async function cmdBatch(args) {
     const byId = new Map(probes.map((p) => [p.id, p]));
     const readyProbes = [...new Set(plans.flatMap((plan) => plan.order))]
       .map((id) => byId.get(id))
-      .filter((p) => p && (values.provider === p.id ? p.enabled : p.enabled && p.available));
+      .filter((p) => p && (values.provider === p.id ? p.enabled
+        : plans.some((plan, index) => plan.order.includes(p.id) && batchProbeAllowsModel(p, items[index].model))));
     const perProviderLimit = (id) => {
       const configured = cfg.providers?.[id]?.concurrency;
       return typeof configured === "number" && configured >= 1 ? configured : DEFAULT_PROVIDER_CONCURRENCY[id] || 1;

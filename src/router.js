@@ -82,6 +82,10 @@ export async function probeAll(cfg, { skipDisabled = false } = {}) {
   );
 }
 
+export function batchProbeAllowsModel(probe, model) {
+  return Boolean(probe?.enabled && (probe.available || (probe.acceptsPinnedModel && typeof model === "string" && model.trim())));
+}
+
 // Exported so the CLI's `gen --dry-run` reports the exact order the router
 // would use instead of re-deriving it.
 export async function planAttemptOrder(cfg, { provider, fallback, images = [], mask } = {}) {
@@ -352,6 +356,7 @@ export async function batchGenerate(
   for (const item of items) requireMaskImage(item?.mask, item?.images);
 
   let allowedProviders = [];
+  let autoProbes;
   if (provider) {
     if (!PROVIDERS[provider]) throw new Error(`unknown provider "${provider}" (known: ${listProviderIds().join(", ")})`);
     // Same gate as attemptOrder: a batch naming a disabled route would otherwise
@@ -365,11 +370,8 @@ export async function batchGenerate(
     }
   } else {
     const probes = await probeAll(cfg);
-    const probeMap = new Map(probes.map((p) => [p.id, p]));
-    allowedProviders = cfg.priority.filter((p) => {
-      const pr = probeMap.get(p);
-      return pr && pr.enabled && pr.available;
-    });
+    autoProbes = new Map(probes.map((p) => [p.id, p]));
+    allowedProviders = cfg.priority.filter((p) => items.some((item) => batchProbeAllowsModel(autoProbes.get(p), item?.model)));
   }
 
   if (!allowedProviders.length) {
@@ -429,11 +431,14 @@ export async function batchGenerate(
   let completedCount = 0;
   let failedCount = 0;
   let retryTimer = null;
+  function compatible(item, id) {
+    return acceptsItem(id, item) && (!autoProbes || batchProbeAllowsModel(autoProbes.get(id), item.model));
+  }
   function findFreeProvider(item) {
     const now = Date.now();
     for (const id of allowedProviders) {
       if (item.failedProviders.has(id)) continue;
-      if (!acceptsItem(id, item)) continue;
+      if (!compatible(item, id)) continue;
       const until = cooldownUntil.get(id) || 0;
       if (until > now) continue;
       const active = activeCount.get(id) || 0;
@@ -485,7 +490,7 @@ export async function batchGenerate(
         for (const item of pendingQueue) {
           for (const id of allowedProviders) {
             if (item.failedProviders.has(id)) continue;
-            if (!acceptsItem(id, item)) continue;
+            if (!compatible(item, id)) continue;
             const until = cooldownUntil.get(id) || 0;
             if (until > now) nextExpiry = Math.min(nextExpiry, until - now);
           }
@@ -602,7 +607,7 @@ export async function batchGenerate(
         }
 
         const hasCandidate = allowedProviders.some(
-          (cand) => !item.failedProviders.has(cand) && acceptsItem(cand, item),
+          (cand) => !item.failedProviders.has(cand) && compatible(item, cand),
         );
 
         if (hasCandidate && (!provider || fallback)) {

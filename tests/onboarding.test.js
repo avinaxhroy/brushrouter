@@ -198,6 +198,34 @@ test("model results distinguish invalid providers, rejected keys, transient erro
   assert.equal(JSON.parse(verified.stdout).providers.find(({ id }) => id === "openrouter").verification, "verified");
 });
 
+test("batch still tries pinned OpenRouter models when the model catalogue is empty", (t) => {
+  const { cwd, run } = fixture(t);
+  const extraEnv = { ...openrouter, BRUSHROUTER_ENABLE: "openrouter" };
+  const shim = `
+    globalThis.fetch = async () => new Response('{"data":[]}');
+    const { pathToFileURL } = await import("node:url");
+    const { PROVIDERS } = await import(new URL("../src/router.js", pathToFileURL(process.argv[1])));
+    PROVIDERS.openrouter.generate = async ({ model }) => {
+      if (model !== "fixture/pinned") throw Error("unpinned item reached OpenRouter");
+      return { buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jA5cAAAAASUVORK5CYII=", "base64") };
+    };
+  `;
+  const configured = run(["batch", "fixture", "--dry-run", "--json"], {
+    shim, extraEnv: { ...extraEnv, BRUSHROUTER_OPENROUTER_MODEL: "fixture/pinned" },
+  });
+  assert.equal(configured.status, 0, configured.stderr);
+  assert.deepEqual(JSON.parse(configured.stdout).readyProviders.map(({ id }) => id), ["openrouter"]);
+  const items = join(cwd, "items.json");
+  writeFileSync(items, JSON.stringify([{ prompt: "Pinned", model: "fixture/pinned" }, { prompt: "Unpinned" }]));
+  const batch = run(["batch", items, "--json"], { shim, extraEnv });
+  assert.equal(batch.status, 0, batch.stdout + batch.stderr);
+  const { completed, failed, results, manifest } = JSON.parse(batch.stdout);
+  assert.deepEqual([completed, failed], [1, 1]);
+  assert.equal(results[0].provider, "openrouter");
+  const failedItem = readFileSync(manifest, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find(({ ok }) => !ok);
+  assert.deepEqual(failedItem.attempts, []);
+});
+
 test("models JSON redacts a credential echoed as a gateway model ID", (t) => {
   const { run } = fixture(t);
   const id = openrouter.BRUSHROUTER_OPENROUTER_KEY;

@@ -495,6 +495,15 @@ export const openrouterProvider = {
   defaultModels: ["google/gemini-3.1-flash-image", "google/gemini-3-pro-image", "google/gemini-2.5-flash-image"],
   async probe(cfg) {
     const { models, error, warnings, source } = await openrouterListModels(cfg);
+    if (error?.code === "empty") {
+      const pinned = typeof cfg?.model === "string" && cfg.model.trim().length > 0;
+      return {
+        available: pinned,
+        acceptsPinnedModel: true,
+        auth: pinned ? "ok" : "empty",
+        detail: pinned ? `${error.message}; configured model ${cfg.model} is not verified` : error.message,
+      };
+    }
     if (error) {
       const auth = error.code === "auth" ? "invalid" : ["http", "response", "config"].includes(error.code) ? "error" : error.code;
       return { available: false, auth, detail: error.message };
