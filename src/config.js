@@ -317,13 +317,21 @@ const PROJECT_TRUSTED_LEAVES = new Set([
 // the same way the provider leaves were.
 const PROJECT_METERED_ROUTES = new Set(["openrouter", "fal", "openai", "gemini-api", "replicate"]);
 
-function stripUntrusted(project, cfg) {
+function stripUntrusted(project, cfg, user) {
   if (!project || typeof project !== "object" || Array.isArray(project)) return { project, dropped: [] };
   const dropped = [];
   const trusted = {};
+  const basePriority = Array.isArray(cfg.priority) ? cfg.priority : [];
+  const hasUserMeteredOrder = basePriority.some((id) => PROJECT_METERED_ROUTES.has(id) &&
+    (Array.isArray(user?.priority) || user?.providers?.[id]?.enabled === true));
+  const lastEnabledMetered = basePriority.findLastIndex((id) => PROJECT_METERED_ROUTES.has(id) && cfg.providers?.[id]?.enabled !== false);
   for (const [k, v] of Object.entries(project)) {
     if (k === "providers") continue; // walked below, per leaf
     if ((k === "priority" || k === "order") && Array.isArray(v)) {
+      if (k === "priority" && hasUserMeteredOrder) {
+        dropped.push("priority (user-configured metered order)");
+        continue;
+      }
       const usable = v.filter((id) => typeof id === "string" && /^[\w-]+$/.test(id) && !PROJECT_METERED_ROUTES.has(id));
       if (usable.length) trusted[k] = usable;
       if (!usable.length || usable.length !== v.length) dropped.push(`${k} metered routes or invalid entries`);
@@ -334,7 +342,6 @@ function stripUntrusted(project, cfg) {
     return { project: trusted, dropped };
   }
   const providers = {};
-  let disabledNonMeteredRoute = false;
   for (const [name, pcfg] of Object.entries(project.providers)) {
     // A non-object provider entry, or an unknown provider name, is not a leaf
     // we can check — drop it rather than hand deepMerge something arbitrary.
@@ -348,8 +355,12 @@ function stripUntrusted(project, cfg) {
         dropped.push(`providers.${name}.enabled`);
         continue;
       }
-      if (k === "enabled" && v === false && !PROJECT_METERED_ROUTES.has(name) && cfg.providers?.[name]?.enabled !== false) {
-        disabledNonMeteredRoute = true;
+      // A checkout must not skip an earlier route to reach an enabled metered fallback.
+      const position = basePriority.indexOf(name);
+      if (k === "enabled" && v === false && !trusted.priority && position >= 0 &&
+          position < lastEnabledMetered && cfg.providers?.[name]?.enabled !== false) {
+        dropped.push(`providers.${name}.enabled (before a metered fallback)`);
+        continue;
       }
       // Object.hasOwn, not `in`: an inherited `__proto__`/`constructor` key must
       // not be mistaken for an allowed leaf.
@@ -357,10 +368,6 @@ function stripUntrusted(project, cfg) {
       else dropped.push(`providers.${name}.${k}`);
     }
     providers[name] = kept;
-  }
-  // Disabling a subscription or local route must not move paid fallback up.
-  if (disabledNonMeteredRoute && !trusted.priority) {
-    trusted.priority = cfg.priority.filter((id) => !PROJECT_METERED_ROUTES.has(id));
   }
   return { project: { ...trusted, providers }, dropped };
 }
@@ -461,7 +468,7 @@ export function loadConfig({ cwd = process.cwd(), overrides = {}, userConfig = n
   if (user) cfg = deepMerge(cfg, user);
   const project = readJson(resolve(cwd, PROJECT_CONFIG_NAME));
   if (project) {
-    const { project: trusted, dropped } = stripUntrusted(project, cfg);
+    const { project: trusted, dropped } = stripUntrusted(project, cfg, user);
     warnUntrusted(dropped);
     cfg = deepMerge(cfg, trusted);
   }

@@ -57,14 +57,15 @@ test("checkout config cannot activate or move metered routes ahead of user-confi
     providers: Object.fromEntries(paid.map((id) => [id, { enabled: true }])),
   }));
   const cfg = loadConfig({ cwd, userConfig });
-  assert.deepEqual(cfg.priority, ["codex"]);
+  assert.deepEqual(cfg.priority, userConfig.priority);
   assert.equal(cfg.providers.openai.enabled, true);
   for (const id of ["openrouter", "gemini-api", "replicate"]) assert.equal(cfg.providers[id].enabled, false);
 
-  writeFileSync(project, JSON.stringify({ providers: { codex: { enabled: false }, openai: { enabled: [true] } } }));
+  writeFileSync(project, JSON.stringify({ providers: { codex: { enabled: false }, gemini: { enabled: false }, openai: { enabled: [true] } } }));
   const disabled = loadConfig({ cwd, userConfig });
-  assert.deepEqual(disabled.priority, ["codex"]);
-  assert.equal(disabled.providers.codex.enabled, false);
+  assert.deepEqual(disabled.priority, userConfig.priority);
+  assert.equal(disabled.providers.codex.enabled, true);
+  assert.equal(disabled.providers.gemini.enabled, false);
   assert.equal(loadConfig({ cwd, userConfig, overrides: { priority: ["openai"] } }).priority[0], "openai");
 });
 

@@ -214,6 +214,8 @@ codex-cli → codex → gemini → comfyui → openrouter → fal → openai →
 
 `openrouter`, `openai`, `gemini-api`, `replicate`, `comfyui`, `gptweb2api`, and `custom-http` are off by default. The `priority` list is authoritative — anything not listed is never auto-selected. If you already customized it, add the new routes you want auto-selected.
 
+Set metered routes and their priority in your user config or environment. A checkout's config cannot enable a metered route or move it ahead of the routes you configured.
+
 A route that is off is off for **every** path, including an explicit `--provider`: naming one is refused with a `PROVIDER_DISABLED` error that says how to turn it on. That matters most for the metered routes — `enabled: false` is the only thing between an agent holding a key and your credits, so it is not a preference a caller can talk its way past. Opt in once, deliberately:
 
 ```bash
