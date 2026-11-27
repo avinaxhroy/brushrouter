@@ -1017,19 +1017,26 @@ async function cmdBatch(args) {
     : null;
 
   if (values["dry-run"]) {
-    let order;
+    let plans;
     try {
-      const plans = await Promise.all(items.map((item) => planAttemptOrder(cfg, {
-        provider: values.provider, fallback: values.fallback, images: item.images, mask: item.mask,
-      })));
-      order = [...new Set(plans.flat())];
+      plans = await Promise.all(items.map(async (item) => {
+        try {
+          const order = await planAttemptOrder(cfg, {
+            provider: values.provider, fallback: values.fallback, images: item.images, mask: item.mask,
+          });
+          return { order };
+        } catch (error) {
+          if (!item.mask || error.code !== "UNSUPPORTED") throw error;
+          return { order: [], code: error.code, error: error.message };
+        }
+      }));
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
     }
     const probes = await probeAll(cfg);
     const byId = new Map(probes.map((p) => [p.id, p]));
-    const readyProbes = order
+    const readyProbes = [...new Set(plans.flatMap((plan) => plan.order))]
       .map((id) => byId.get(id))
       .filter((p) => p && (values.provider === p.id ? p.enabled : p.enabled && p.available));
     const perProviderLimit = (id) => {
@@ -1054,6 +1061,8 @@ async function cmdBatch(args) {
               index: idx + 1,
               prompt: it.prompt,
               out: it.out,
+              code: plans[idx].code,
+              error: plans[idx].error,
               ...(it.mask !== undefined ? { mask: it.mask } : {}),
               ...(it.size ? { size: it.size } : {}),
               ...(it.recipe ? { recipe: it.recipe } : {}),
@@ -1080,7 +1089,8 @@ async function cmdBatch(args) {
       const it = items[i];
       const tagParts = [it.recipe, it.look && it.look !== it.recipe ? it.look : null].filter(Boolean);
       const tag = tagParts.length ? `[${tagParts.join(" + ")}] ` : "";
-      console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${it.out}`);
+      const destination = plans[i].error ? warn(redact(plans[i].error)) : it.out;
+      console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${destination}`);
     }
     if (items.length > 10) console.log(dim(`    ... and ${items.length - 10} more`));
     console.log("");

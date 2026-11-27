@@ -401,6 +401,17 @@ test("CLI batch uses a per-item mask or the flag default and rejects a masked it
   assert.deepEqual(plan.items.map(({ mask }) => mask), [request.mask, "extra.png"]);
   assert.deepEqual(plan.readyProviders.map(({ id }) => id), ["openai"]);
 
+  writeFileSync(input, JSON.stringify([
+    { prompt: "masked edit", images: request.images, mask: request.mask },
+    { prompt: "text generation" },
+  ]));
+  const mixed = spawnSync(process.execPath, [cli, "batch", input, "--provider", "gemini-api", "--dry-run", "--json"], options);
+  assert.equal(mixed.status, 0, mixed.stderr);
+  const mixedPlan = JSON.parse(mixed.stdout);
+  assert.equal(mixedPlan.items[0].code, "UNSUPPORTED");
+  assert.equal(mixedPlan.items[1].error, undefined);
+  assert.deepEqual(mixedPlan.readyProviders.map(({ id }) => id), ["gemini-api"]);
+
   writeFileSync(input, JSON.stringify([{ prompt: "missing base image" }]));
   const invalid = spawnSync(process.execPath, args, options);
   assert.equal(invalid.status, 2);
