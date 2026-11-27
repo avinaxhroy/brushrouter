@@ -208,7 +208,8 @@ function parse(argv) {
 const VALUE_FLAGS = new Set([
   "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
   "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
-  "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape", "--set",
+  "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape",
+  "--recipe", "--look", "--twist", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
 ]);
 
@@ -338,6 +339,10 @@ ${paint(C.bold, "SECURITY")}
 async function cmdGenerate(args) {
   const { values, positionals } = args;
   if (values.prompt && values.prompt.length > 1) {
+    if (values.recipe || values.look) {
+      console.error(bad("error: --recipe/--look cannot be combined with multiple --prompt flags"));
+      return exitAfterFlush(2);
+    }
     return cmdBatch(args);
   }
   // Two bare prompts used to be glued together into one prompt ("a red fox a
@@ -356,7 +361,7 @@ async function cmdGenerate(args) {
     for (const pair of values.set || []) {
       const eq = pair.indexOf("=");
       if (eq < 1) {
-        console.error(bad(`--set expects key=value, got "${pair}"`));
+        console.error(bad(`--set expects key=value, got "${redact(pair)}"`));
         return exitAfterFlush(2);
       }
       slotValues[pair.slice(0, eq).trim()] = pair.slice(eq + 1);
@@ -373,7 +378,7 @@ async function cmdGenerate(args) {
         twist: extraTwist || null,
       });
     } catch (e) {
-      console.error(bad(`error: ${e.message}`));
+      console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(2);
     }
     if (composed.missing.length) {

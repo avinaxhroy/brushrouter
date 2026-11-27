@@ -3932,15 +3932,16 @@ test("MCP exposes native prompts/resources and direct recipe+look generate_image
     /missing required slot/,
   );
 
-  // CLI gen --recipe --set --twist --dry-run --json resolves composed prompt cleanly
-  const { execFileSync } = await import("node:child_process");
+  // CLI gen --recipe --set --twist --dry-run --json resolves composed prompt cleanly,
+  // including when --recipe appears BEFORE the `gen` subcommand
+  const { execFileSync, spawnSync } = await import("node:child_process");
   const cliOut = execFileSync(
     process.execPath,
     [
       join(process.cwd(), "bin/brushrouter.js"),
-      "gen",
       "--recipe",
       "logo-mark",
+      "gen",
       "--set",
       "text=ACME",
       "--twist",
@@ -3954,4 +3955,13 @@ test("MCP exposes native prompts/resources and direct recipe+look generate_image
   assert.equal(cliJson.dryRun, true);
   assert.match(cliJson.prompt, /ACME/);
   assert.match(cliJson.prompt, /brass finish/);
+
+  // Combining --recipe with multiple --prompt flags is rejected instead of bypassing composition
+  const multiRes = spawnSync(
+    process.execPath,
+    [join(process.cwd(), "bin/brushrouter.js"), "gen", "--recipe", "logo-mark", "--prompt", "one", "--prompt", "two"],
+    { encoding: "utf8" },
+  );
+  assert.equal(multiRes.status, 2);
+  assert.match(multiRes.stderr, /cannot be combined/);
 });
