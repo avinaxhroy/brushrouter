@@ -168,7 +168,7 @@ async function fetchImageToBuffer(url, headers, { allowedOrigins = [] } = {}) {
 }
 
 // Shared implementation for any "POST json -> get url|b64|raw" image API.
-export async function httpImageGenerate({ prompt, size, quality, images = [], cwd, onProgress }, cfg, preset) {
+export async function httpImageGenerate({ prompt, size, quality, seed, images = [], cwd, onProgress }, cfg, preset) {
   const { url, method, headers, body, responsePath, defaultModel, apiKey, keyHeader, keyPrefix } = preset;
   // Per-call --model beats the configured model, which beats the preset default.
   const model = preset.model || cfg?.model || defaultModel;
@@ -221,6 +221,7 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
     prompt,
     size: size || "1024x1024",
     quality: quality || "standard",
+    seed: seed != null ? String(seed) : "",
     model,
     apiKey: key || "",
     image: imageUrls[0] || "",
@@ -232,7 +233,7 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
   // A body builder receives the raw prompt, so it can build structured content
   // (e.g. multimodal message parts) that a flat string template cannot express.
   const finalBody = preset.buildBody
-    ? JSON.stringify(preset.buildBody({ prompt, size, quality, model, imageUrls }))
+    ? JSON.stringify(preset.buildBody({ prompt, size, quality, seed, model, imageUrls }))
     : applyTemplate(template, vars);
   onProgress?.(`generating via ${preset.name}...`, 25);
   const res = await fetchWithTimeout(
@@ -283,7 +284,21 @@ export async function httpImageGenerate({ prompt, size, quality, images = [], cw
   // that is really an error message decodes to bytes that are not any image
   // format, and the file would be written as a valid-looking .png.
   assertImageBytes(buffer, { provider: preset.name, value, locator });
-  return { buffer, meta: { provider: preset.id, model, imagesUsed: imageUrls.length > 0, sourceUrl } };
+  const usage = json?.usage && typeof json.usage === "object" ? json.usage : null;
+  const costUsd = usage?.cost != null && Number.isFinite(Number(usage.cost)) ? Number(usage.cost) : null;
+  const returnedSeed = Number.isInteger(json?.seed) ? json.seed : Number.isInteger(seed) ? seed : null;
+  return {
+    buffer,
+    meta: {
+      provider: preset.id,
+      model,
+      imagesUsed: imageUrls.length > 0,
+      sourceUrl,
+      ...(returnedSeed != null ? { seed: returnedSeed } : {}),
+      ...(usage ? { usage } : {}),
+      ...(costUsd != null ? { costUsd } : {}),
+    },
+  };
 }
 
 // OpenRouter exposes TWO generation surfaces, and the right one depends on the
@@ -342,12 +357,13 @@ function isUrlConfigError(message) {
 }
 
 // Shared helper: POST /images and pull b64_json|url out of data[0].
-export async function openrouterImagesGenerate({ prompt, size, quality, images = [], cwd, onProgress }, cfg, model, apiKey) {
+export async function openrouterImagesGenerate({ prompt, size, quality, seed, images = [], cwd, onProgress }, cfg, model, apiKey) {
   const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
   const body = { model, prompt, n: 1 };
   const aspect = sizeToAspectRatio(size);
   if (aspect) body.aspect_ratio = aspect;
   if (quality && quality !== "auto") body.quality = quality;
+  if (Number.isInteger(seed)) body.seed = seed;
   if (cfg?.resolution) body.resolution = cfg.resolution;
   // input_references are fetched by OpenRouter's servers, so they must be URLs.
   // A local filesystem path is meaningless to them — send data URLs instead.
@@ -391,9 +407,24 @@ export async function openrouterImagesGenerate({ prompt, size, quality, images =
     buffer = await fetchImageToBuffer(value, { "User-Agent": "brushrouter/0.1" }, { allowedOrigins: epOrigin ? [epOrigin] : [] });
   } else buffer = Buffer.from(value, "base64");
   assertImageBytes(buffer, { provider: "OpenRouter /images", value, locator: "data[0]" });
+  const usage = json?.usage && typeof json.usage === "object" ? json.usage : null;
+  const costUsd = usage?.cost != null && Number.isFinite(Number(usage.cost)) ? Number(usage.cost) : null;
+  const returnedSeed = Number.isInteger(json?.seed) ? json.seed : Number.isInteger(seed) ? seed : null;
   // imagesUsed reports what was actually sent (input_references went out above),
   // not what the caller asked for.
-  return { buffer, meta: { provider: "openrouter", model, endpoint: "/images", imagesUsed: images.length > 0, sourceUrl } };
+  return {
+    buffer,
+    meta: {
+      provider: "openrouter",
+      model,
+      endpoint: "/images",
+      imagesUsed: images.length > 0,
+      sourceUrl,
+      ...(returnedSeed != null ? { seed: returnedSeed } : {}),
+      ...(usage ? { usage } : {}),
+      ...(costUsd != null ? { costUsd } : {}),
+    },
+  };
 }
 
 // Live model catalogue for `brushrouter models` — the image-capable models the
@@ -469,7 +500,7 @@ export const openrouterProvider = {
       return { available: false, auth: "error", detail: e.message };
     }
   },
-  async generate({ prompt, size, quality, images, cwd, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, size, quality, seed, images, cwd, onProgress, model: requestedModel }, cfg) {
     const found = resolveKey(cfg, "openrouter");
     if (!found) {
       const e = new Error("OpenRouter needs an API key");
@@ -491,7 +522,7 @@ export const openrouterProvider = {
     for (const model of candidates) {
       try {
         try {
-          return await generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, cfg, model, found.key);
+          return await generateOpenRouter({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, model, found.key);
         } catch (e) {
           // A wrong host/path is not a modality signal: report it as config and
           // stop, or every remaining model pays for the same 404.
@@ -507,7 +538,7 @@ export const openrouterProvider = {
           // Image-only models are rejected by chat/completions; retry /images.
           if (!isChatModalityError(e.message)) throw e;
           onProgress?.(`${model} is not a chat model; retrying via /images...`, 25);
-          return await openrouterImagesGenerate({ prompt, size, quality, images, cwd, onProgress }, cfg, model, found.key);
+          return await openrouterImagesGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, model, found.key);
         }
       } catch (e) {
         lastErr = e;
@@ -524,8 +555,8 @@ export const openrouterProvider = {
   },
 };
 
-function generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, cfg, model, apiKey) {
-  return httpImageGenerate({ prompt, size, quality, images, cwd, onProgress }, cfg, {
+function generateOpenRouter({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, model, apiKey) {
+  return httpImageGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, {
     id: "openrouter",
     name: "OpenRouter",
     url: `${(cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "")}/chat/completions`,
@@ -540,7 +571,7 @@ function generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, 
     supportsRefImages: true,
     // Reference images have to travel as multimodal content parts; a flat
     // string template cannot express an array, so this provider builds the body.
-    buildBody: ({ prompt, imageUrls }) => ({
+    buildBody: ({ prompt, seed: s, imageUrls }) => ({
       model,
       messages: [
         {
@@ -551,6 +582,7 @@ function generateOpenRouter({ prompt, size, quality, images, cwd, onProgress }, 
         },
       ],
       modalities: ["image", "text"],
+      ...(Number.isInteger(s) ? { seed: s } : {}),
     }),
     responsePath: "json:choices.0.message.images.0.image_url.url",
     defaultModel: model,
@@ -568,12 +600,12 @@ export const falProvider = {
     if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_FAL_KEY)" };
     return { available: true, auth: "ok", detail: `key from ${found.source} (validated on first use)` };
   },
-  async generate({ prompt, size, quality, images = [], cwd, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, size, quality, seed, images = [], cwd, onProgress, model: requestedModel }, cfg) {
     const found = resolveKey(cfg, "fal");
     const model = requestedModel || cfg?.model || "fal-ai/flux/schnell";
     const base = (cfg?.baseUrl || "https://fal.run").replace(/\/$/, "");
     const n = String(size || "1024x1024").match(/(\d+)\s*[xX]\s*(\d+)/);
-    return httpImageGenerate({ prompt, size, quality, images, cwd, onProgress }, cfg, {
+    return httpImageGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, {
       id: "fal",
       name: "fal.ai",
       url: `${base}/${model}`,
@@ -586,7 +618,12 @@ export const falProvider = {
       model,
       // Text-to-image only: the vendor route takes a prompt, no image inputs.
       supportsRefImages: false,
-      body: JSON.stringify({ prompt: "{prompt}", image_size: n ? { width: Number(n[1]), height: Number(n[2]) } : "square_hd", num_images: 1 }),
+      body: JSON.stringify({
+        prompt: "{prompt}",
+        image_size: n ? { width: Number(n[1]), height: Number(n[2]) } : "square_hd",
+        num_images: 1,
+        ...(Number.isInteger(seed) ? { seed } : {}),
+      }),
       responsePath: "json:images.0.url",
       defaultModel: model,
     });
@@ -604,9 +641,9 @@ export const customHttpProvider = {
     const found = resolveKey(cfg, "custom");
     return { available: true, auth: found ? "key" : "none", detail: cfg.url };
   },
-  async generate({ prompt, size, quality, images = [], cwd, onProgress, model: requestedModel }, cfg) {
+  async generate({ prompt, size, quality, seed, images = [], cwd, onProgress, model: requestedModel }, cfg) {
     const found = resolveKey(cfg, "custom");
-    return httpImageGenerate({ prompt, size, quality, images, cwd, onProgress }, cfg, {
+    return httpImageGenerate({ prompt, size, quality, seed, images, cwd, onProgress }, cfg, {
       id: "custom-http",
       name: cfg?.name || "custom-http",
       url: cfg?.url,

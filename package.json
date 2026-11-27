@@ -12,7 +12,8 @@
     ".": "./src/router.js",
     "./config": "./src/config.js",
     "./redact": "./src/util/redact.js",
-    "./library": "./src/library.js"
+    "./library": "./src/library.js",
+    "./history": "./src/history.js"
   },
   "scripts": {
     "test": "node --test tests/*.test.js",

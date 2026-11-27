@@ -294,7 +294,15 @@ test("MCP server flushes async work before exiting on stdin close", async () => 
   const tools = lines.find((l) => l.id === 1)?.result?.tools || [];
   assert.deepEqual(
     tools.map((t) => t.name),
-    ["generate_image", "batch_generate_images", "find_image_prompts", "image_result"],
+    [
+      "generate_image",
+      "batch_generate_images",
+      "find_image_prompts",
+      "image_result",
+      "generation_history",
+      "replay_generation",
+      "usage_stats",
+    ],
   );
   // Every advertised tool must declare a usable schema, or an agent cannot call it.
   for (const t of tools) {

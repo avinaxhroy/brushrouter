@@ -9,9 +9,20 @@ import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
-import { saveImage, detectImageMime, batchVariantPath, batchItemPath } from "./util/common.js";
+import { saveImage, detectImageMime, batchVariantPath, batchItemPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, getRecipe, loadRecipes } from "./library.js";
+import {
+  tryRecordHistory,
+  listHistory,
+  getHistoryEntry,
+  buildReplayRequest,
+  computeStats,
+  generateBatchId,
+  renderHistoryList,
+  renderHistoryDetail,
+  renderStats,
+} from "./history.js";
 
 const PKG_VERSION = (() => {
   try {
@@ -26,6 +37,9 @@ export const TOOL_NAME = "generate_image";
 export const PROMPT_TOOL_NAME = "find_image_prompts";
 export const JOB_TOOL_NAME = "image_result";
 export const BATCH_TOOL_NAME = "batch_generate_images";
+export const HISTORY_TOOL_NAME = "generation_history";
+export const REPLAY_TOOL_NAME = "replay_generation";
+export const STATS_TOOL_NAME = "usage_stats";
 
 const TOOL_SCHEMA = {
   name: TOOL_NAME,
@@ -58,6 +72,7 @@ const TOOL_SCHEMA = {
       fallback: { type: "boolean", description: "When an explicit provider is given, allow falling back to others if it fails." },
       size: { type: "string", description: "Image size, e.g. 1024x1024, 1536x1024, or auto." },
       quality: { type: "string", description: "Quality hint, e.g. low | medium | high | auto." },
+      seed: { type: "integer", description: "Optional integer seed for reproducible generation on providers that support seeds (fal, openrouter, custom-http). Always recorded in history for replay." },
       background: {
         type: "string",
         enum: ["opaque", "transparent"],
@@ -169,6 +184,70 @@ const JOB_TOOL_SCHEMA = {
       jobId: { type: "string", description: "The jobId returned by generate_image or batch_generate_images with async:true." },
     },
     required: ["jobId"],
+  },
+};
+
+const HISTORY_TOOL_SCHEMA = {
+  name: HISTORY_TOOL_NAME,
+  description:
+    "Inspect or search the persistent generation history & manifest log. Returns recent generations (newest first) with ids, prompts, seeds, providers, models, latencies, costs, and saved file paths, or full detail for one entry when `id` is supplied.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Fetch full detail for one generation by id, unique prefix, 'last', '~N', or saved file path." },
+      query: { type: "string", description: "Case-insensitive substring search across prompt, id, provider, model, recipe, look, and output path." },
+      provider: { type: "string", description: "Filter by provider id (e.g. codex, openrouter, fal)." },
+      model: { type: "string", description: "Filter by model id (substring match)." },
+      status: { type: "string", enum: ["ok", "failed"], description: "Filter by generation outcome." },
+      source: { type: "string", enum: ["cli", "mcp", "batch", "replay", "api"], description: "Filter by invocation source." },
+      since: { type: "string", description: "Filter entries newer than a relative window (e.g. '24h', '7d', '30d') or ISO date." },
+      until: { type: "string", description: "Filter entries older than an ISO date." },
+      limit: { type: "integer", minimum: 0, description: "Max entries to return (default 20; 0 returns all)." },
+      offset: { type: "integer", minimum: 0, description: "Entries to skip for pagination (default 0)." },
+      format: { type: "string", enum: ["text", "json"], description: "Output format: 'text' (default) or 'json'." },
+    },
+  },
+};
+
+const REPLAY_TOOL_SCHEMA = {
+  name: REPLAY_TOOL_NAME,
+  description:
+    "Replay a previous generation from history using its recorded prompt, seed, size, quality, background, model, and provider — with optional overrides (e.g. test the same prompt+seed on another provider or with a new twist). Supports async:true.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "History entry id, prefix, 'last' (default), '~N', or saved file path." },
+      provider: { type: "string", description: "Override the provider id." },
+      model: { type: "string", description: "Override the model id." },
+      seed: { type: "integer", description: "Override the integer seed (omit to reuse the recorded seed)." },
+      size: { type: "string", description: "Override the image size." },
+      quality: { type: "string", description: "Override the quality hint." },
+      background: { type: "string", enum: ["opaque", "transparent"], description: "Override background." },
+      prompt: { type: "string", description: "Override the prompt text." },
+      twist: { type: "string", description: "Append extra creative direction to the original prompt." },
+      images: { type: "array", items: { type: "string" }, description: "Override reference image paths." },
+      noImages: { type: "boolean", description: "Drop the original entry's reference images." },
+      out: { type: "string", description: "Output file path for the replayed image." },
+      fallback: { type: "boolean", description: "Allow falling back to other providers if the chosen provider fails." },
+      async: { type: "boolean", description: "Return a jobId immediately and poll image_result when ready." },
+    },
+  },
+};
+
+const STATS_TOOL_SCHEMA = {
+  name: STATS_TOOL_NAME,
+  description:
+    "Return aggregated observability stats from generation history: overall & per-provider latency (avg/p50/p95/min/max), success rates (generation and attempt level), top error codes, model breakdown, daily trends, token usage, and USD spend (provider-reported vs configured vs estimated vs subscription).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      since: { type: "string", description: "Time window (e.g. '24h', '7d', '30d', or ISO date)." },
+      until: { type: "string", description: "Upper bound ISO date." },
+      provider: { type: "string", description: "Restrict stats to one provider id." },
+      model: { type: "string", description: "Restrict stats to one model id (substring match)." },
+      source: { type: "string", enum: ["cli", "mcp", "batch", "replay", "api"], description: "Restrict stats to one source." },
+      format: { type: "string", enum: ["text", "json"], description: "Output format: 'text' (default) or 'json'." },
+    },
   },
 };
 
@@ -324,6 +403,12 @@ function assertGenerateArgs(args, cwd = process.cwd()) {
   }
   const count = positiveInt(args.count, "count", { max: MAX_COUNT });
   const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
+  if (args.seed !== undefined && args.seed !== null) {
+    const s = Number(args.seed);
+    if (!Number.isFinite(s) || !Number.isInteger(s)) {
+      throw new Error(`seed must be an integer (got ${JSON.stringify(args.seed)})`);
+    }
+  }
   if (args.out != null) {
     if (typeof args.out !== "string" || args.out.trim() === "") {
       throw new Error('generate_image "out" must be a non-empty file path string');
@@ -374,16 +459,86 @@ async function runGenerate(args, ctx, onProgress) {
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
   const effectiveArgs = { ...args, prompt, ...(size ? { size } : {}) };
+  const source = args._replayOf ? "replay" : "mcp";
+  const recipeMeta = {
+    recipe: args.recipe || args._recipeMeta?.recipe || null,
+    look: args.look || args._recipeMeta?.look || null,
+    values: args.values || args._recipeMeta?.values || null,
+    twist: args.twist || args._recipeMeta?.twist || null,
+  };
   if (count === 1) {
-    const result = await generate({ ...effectiveArgs, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
+    let result;
+    try {
+      result = await generate({ ...effectiveArgs, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
+    } catch (e) {
+      tryRecordHistory(
+        {
+          source,
+          ok: false,
+          prompt,
+          provider: args.provider || null,
+          requestedProvider: args.provider || null,
+          model: args.model || null,
+          requestedModel: args.model || null,
+          size: size || null,
+          quality: args.quality || null,
+          background: args.background || null,
+          seed: args.seed ?? null,
+          images: Array.isArray(args.images) ? args.images : [],
+          ...recipeMeta,
+          out: resolve(cwd, out),
+          durationMs: e.durationMs ?? null,
+          attempts: e.attempts || [],
+          replayOf: args._replayOf || null,
+          error: redact(String(e?.message || e)),
+          errorCode: e.code || null,
+        },
+        { cfg },
+      );
+      throw e;
+    }
     const saved = saveImage(out, result.buffer, cwd);
+    const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
+    const dims = pngSize(result.buffer);
+    const histRec = tryRecordHistory(
+      {
+        source,
+        ok: true,
+        prompt,
+        provider: result.provider,
+        requestedProvider: args.provider || null,
+        model: result.meta?.model || null,
+        requestedModel: args.model || null,
+        size: size || null,
+        actualSize: dims ? `${dims.width}x${dims.height}` : null,
+        quality: args.quality || null,
+        background: args.background || null,
+        seed: result.meta?.seed ?? args.seed ?? null,
+        images: Array.isArray(args.images) ? args.images : [],
+        imagesUsed: result.meta?.imagesUsed,
+        ...recipeMeta,
+        out: saved.savedPath,
+        bytes: result.buffer.length,
+        mime,
+        durationMs: result.durationMs ?? null,
+        attempts: result.attempts || [],
+        usage: result.meta?.usage || null,
+        costUsd: result.meta?.costUsd,
+        replayOf: args._replayOf || null,
+      },
+      { cfg },
+    );
     // SECURITY: every string handed back to the calling model passes through the
     // redactor, so a credential can never ride along inside a provider's message.
     const text = redact(
       [
-        `Image generated successfully.`,
+        args._replayOf ? `Replayed generation ${args._replayOf} successfully.` : `Image generated successfully.`,
+        histRec?.id ? `id: ${histRec.id}` : null,
         `provider: ${result.provider}${result.meta?.model ? ` (${result.meta.model})` : ""}`,
         `saved: ${saved.savedPath}`,
+        result.meta?.seed != null || args.seed != null ? `seed: ${result.meta?.seed ?? args.seed}` : null,
+        result.durationMs != null ? `duration: ${(result.durationMs / 1000).toFixed(1)}s` : null,
+        histRec?.costUsd != null ? `cost: $${histRec.costUsd.toFixed(4)} (${histRec.costSource})` : null,
         result.attempts?.length ? `attempts: ${result.attempts.map((a) => `${a.provider}=${a.outcome}`).join(", ")}` : null,
       ]
         .filter(Boolean)
@@ -402,6 +557,7 @@ async function runGenerate(args, ctx, onProgress) {
   // Several variations: each needs its own file. batchVariantPath suffixes the
   // index before the extension (fox.png -> fox-1.png), and saveImage still
   // refuses to overwrite, so two callers cannot collide.
+  const batchId = generateBatchId();
   const targets = Array.from({ length: count }, (_, i) => batchVariantPath(out, i + 1, count));
   const settled = await mapLimited(targets, concurrency, async (target, i) => {
     onProgress?.(`variation ${i + 1}/${count}...`, Math.round(((i + 1) / count) * 90));
@@ -411,11 +567,68 @@ async function runGenerate(args, ctx, onProgress) {
         cfg,
       );
       const saved = saveImage(target, result.buffer, cwd);
+      const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
+      const dims = pngSize(result.buffer);
+      const histRec = tryRecordHistory(
+        {
+          source,
+          ok: true,
+          prompt,
+          provider: result.provider,
+          requestedProvider: args.provider || null,
+          model: result.meta?.model || null,
+          requestedModel: args.model || null,
+          size: size || null,
+          actualSize: dims ? `${dims.width}x${dims.height}` : null,
+          quality: args.quality || null,
+          background: args.background || null,
+          seed: result.meta?.seed ?? args.seed ?? null,
+          images: Array.isArray(args.images) ? args.images : [],
+          imagesUsed: result.meta?.imagesUsed,
+          ...recipeMeta,
+          out: saved.savedPath,
+          bytes: result.buffer.length,
+          mime,
+          durationMs: result.durationMs ?? null,
+          attempts: result.attempts || [],
+          usage: result.meta?.usage || null,
+          costUsd: result.meta?.costUsd,
+          replayOf: args._replayOf || null,
+          batchId,
+        },
+        { cfg },
+      );
       const block = imageBlock(result);
       result.buffer = null;
-      return { ok: true, savedPath: saved.savedPath, provider: result.provider, model: result.meta?.model, block };
+      return { ok: true, id: histRec?.id || null, savedPath: saved.savedPath, provider: result.provider, model: result.meta?.model, block };
     } catch (e) {
-      return { ok: false, error: redact(String(e?.message || e)) };
+      const msg = redact(String(e?.message || e));
+      tryRecordHistory(
+        {
+          source,
+          ok: false,
+          prompt,
+          provider: args.provider || null,
+          requestedProvider: args.provider || null,
+          model: args.model || null,
+          requestedModel: args.model || null,
+          size: size || null,
+          quality: args.quality || null,
+          background: args.background || null,
+          seed: args.seed ?? null,
+          images: Array.isArray(args.images) ? args.images : [],
+          ...recipeMeta,
+          out: resolve(cwd, target),
+          durationMs: e.durationMs ?? null,
+          attempts: e.attempts || [],
+          replayOf: args._replayOf || null,
+          batchId,
+          error: msg,
+          errorCode: e.code || null,
+        },
+        { cfg },
+      );
+      return { ok: false, error: msg };
     }
   });
 
@@ -464,6 +677,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
   }));
 
   const shouldEmbed = args.embedImages === true || (!("embedImages" in args) && rawItems.length <= 3);
+  const batchId = generateBatchId();
   const batchRes = await batchGenerate(
     {
       items,
@@ -477,6 +691,62 @@ async function runBatchGenerate(args, ctx, onProgress) {
     },
     cfg,
   );
+
+  for (const r of batchRes.results) {
+    if (r.ok) {
+      tryRecordHistory(
+        {
+          source: "mcp",
+          ok: true,
+          prompt: r.item.prompt,
+          provider: r.provider,
+          requestedProvider: r.item.provider || args.provider || null,
+          model: r.meta?.model || null,
+          requestedModel: r.item.model || null,
+          size: r.item.size || null,
+          actualSize: r.actualSize || null,
+          quality: r.item.quality || null,
+          background: r.item.background || null,
+          seed: r.meta?.seed ?? r.item.seed ?? null,
+          images: r.item.images || [],
+          imagesUsed: r.meta?.imagesUsed,
+          out: r.savedPath,
+          bytes: r.bytes ?? null,
+          mime: r.mime || null,
+          durationMs: r.durationMs ?? null,
+          attempts: r.attempts || [],
+          usage: r.meta?.usage || null,
+          costUsd: r.meta?.costUsd,
+          batchId,
+        },
+        { cfg },
+      );
+    } else {
+      tryRecordHistory(
+        {
+          source: "mcp",
+          ok: false,
+          prompt: r.item.prompt,
+          provider: r.item.provider || args.provider || null,
+          requestedProvider: r.item.provider || args.provider || null,
+          model: r.item.model || null,
+          requestedModel: r.item.model || null,
+          size: r.item.size || null,
+          quality: r.item.quality || null,
+          background: r.item.background || null,
+          seed: r.item.seed ?? null,
+          images: r.item.images || [],
+          out: r.item.out || null,
+          durationMs: r.durationMs ?? null,
+          attempts: r.attempts || [],
+          batchId,
+          error: redact(r.error),
+          errorCode: r.code || null,
+        },
+        { cfg },
+      );
+    }
+  }
 
   const completedResults = batchRes.results.filter((r) => r.ok);
   const blocks = shouldEmbed
@@ -748,11 +1018,109 @@ export async function handlePromptToolCall(args = {}) {
   };
 }
 
+export async function handleHistoryToolCall(args = {}, ctx = {}) {
+  const cwd = ctx?.cwd || process.cwd();
+  if (args.id) {
+    const entry = getHistoryEntry(String(args.id), { cwd });
+    const text = args.format === "json"
+      ? JSON.stringify(redactValue(entry), null, 2)
+      : renderHistoryDetail(entry, { color: false });
+    return { content: [{ type: "text", text }], isError: false };
+  }
+  const res = listHistory({
+    provider: args.provider,
+    model: args.model,
+    status: args.status,
+    source: args.source,
+    query: args.query,
+    since: args.since,
+    until: args.until,
+    limit: args.limit ?? 20,
+    offset: args.offset ?? 0,
+  });
+  const text = args.format === "json"
+    ? JSON.stringify(redactValue(res), null, 2)
+    : renderHistoryList(res, { color: false });
+  return { content: [{ type: "text", text }], isError: false };
+}
+
+export async function handleStatsToolCall(args = {}) {
+  const stats = computeStats({
+    since: args.since,
+    until: args.until,
+    provider: args.provider,
+    model: args.model,
+    source: args.source,
+  });
+  const text = args.format === "json"
+    ? JSON.stringify(redactValue(stats), null, 2)
+    : renderStats(stats, { color: false });
+  return { content: [{ type: "text", text }], isError: false };
+}
+
+function resolveReplayArgs(args = {}, ctx = {}) {
+  const cwd = ctx?.cwd || process.cwd();
+  const selector = args.id ? String(args.id) : "last";
+  const entry = getHistoryEntry(selector, { cwd });
+  const req = buildReplayRequest(entry, {
+    provider: args.provider,
+    model: args.model,
+    size: args.size,
+    quality: args.quality,
+    background: args.background,
+    seed: args.seed,
+    out: args.out,
+    fallback: args.fallback,
+    images: args.images,
+    noImages: args.noImages === true,
+    prompt: args.prompt,
+    twist: args.twist,
+  });
+  return {
+    prompt: req.prompt,
+    provider: req.provider,
+    model: req.model,
+    size: req.size,
+    quality: req.quality,
+    background: req.background,
+    seed: req.seed,
+    images: req.images,
+    out: req.out,
+    fallback: req.fallback,
+    _replayOf: entry.id,
+    _recipeMeta: {
+      recipe: req.recipe,
+      look: req.look,
+      values: req.values,
+      twist: req.twist,
+    },
+  };
+}
+
 export async function handleToolCall(name, args = {}, ctx = {}) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new Error("tool arguments must be an object");
   }
   if (name === PROMPT_TOOL_NAME) return handlePromptToolCall(args);
+  if (name === HISTORY_TOOL_NAME) return handleHistoryToolCall(args, ctx);
+  if (name === STATS_TOOL_NAME) return handleStatsToolCall(args);
+  if (name === REPLAY_TOOL_NAME) {
+    const replayArgs = resolveReplayArgs(args, ctx);
+    if (args.async === true) {
+      assertGenerateArgs(replayArgs, ctx?.cwd || process.cwd());
+      const job = startJob(replayArgs, ctx);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Replay of ${replayArgs._replayOf} started as job ${job.id} (out: ${job.out}). Do not wait — continue with other work and call ${JOB_TOOL_NAME} with {"jobId":"${job.id}"} to collect the image when it is ready.`,
+          },
+        ],
+        isError: false,
+      };
+    }
+    return runGenerate(replayArgs, ctx);
+  }
   if (name === JOB_TOOL_NAME) {
     pruneJobs();
     const job = jobs.get(String(args.jobId || ""));
@@ -829,7 +1197,21 @@ async function dispatchRequest(msg, ctx) {
     case "notifications/initialized":
       return null;
     case "tools/list":
-      return { jsonrpc: "2.0", id, result: { tools: [TOOL_SCHEMA, BATCH_TOOL_SCHEMA, promptToolSchema(), JOB_TOOL_SCHEMA] } };
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: [
+            TOOL_SCHEMA,
+            BATCH_TOOL_SCHEMA,
+            promptToolSchema(),
+            JOB_TOOL_SCHEMA,
+            HISTORY_TOOL_SCHEMA,
+            REPLAY_TOOL_SCHEMA,
+            STATS_TOOL_SCHEMA,
+          ],
+        },
+      };
     case "prompts/list": {
       const lib = loadRecipes();
       const prompts = lib.recipes.map((r) => ({
@@ -893,36 +1275,54 @@ async function dispatchRequest(msg, ctx) {
               description: "Compact index of all recipes and looks (id, kind, category, shape, slots, gist).",
               mimeType: "application/json",
             },
+            {
+              uri: "brushrouter://history",
+              name: "Recent generation history",
+              description: "Most recent 50 image generation records (id, prompt, seed, provider, model, latency, cost, output path).",
+              mimeType: "application/json",
+            },
+            {
+              uri: "brushrouter://stats",
+              name: "Provider latency, success-rate & spend stats",
+              description: "Aggregated observability stats across generation history (latency percentiles, success rates, spend, models).",
+              mimeType: "application/json",
+            },
           ],
         },
       };
     case "resources/read": {
       try {
         const uri = String(params?.uri || "");
-        const lib = loadRecipes();
         let data;
-        if (uri === "brushrouter://categories") {
-          data = { categories: listCategories(), counts: lib.counts };
-        } else if (uri === "brushrouter://slots") {
-          data = { slots: lib.slots, freeSlots: lib.freeSlots, shapes: lib.shapes };
-        } else if (uri === "brushrouter://recipes") {
-          data = {
-            counts: lib.counts,
-            recipes: lib.recipes.map((r) => ({
-              id: r.id,
-              kind: r.kind,
-              category: r.category,
-              shape: r.shape,
-              slots: r.slots,
-              acceptsImage: Boolean(r.image),
-              gist: r._gist200,
-            })),
-          };
-        } else if (uri.startsWith("brushrouter://recipes/")) {
-          const rid = decodeURIComponent(uri.slice("brushrouter://recipes/".length));
-          data = publicRecipe(getRecipe(rid), { full: true });
+        if (uri === "brushrouter://history") {
+          data = redactValue(listHistory({ limit: 50 }));
+        } else if (uri === "brushrouter://stats") {
+          data = redactValue(computeStats());
         } else {
-          return { jsonrpc: "2.0", id, error: { code: -32002, message: `unknown resource URI: ${uri}` } };
+          const lib = loadRecipes();
+          if (uri === "brushrouter://categories") {
+            data = { categories: listCategories(), counts: lib.counts };
+          } else if (uri === "brushrouter://slots") {
+            data = { slots: lib.slots, freeSlots: lib.freeSlots, shapes: lib.shapes };
+          } else if (uri === "brushrouter://recipes") {
+            data = {
+              counts: lib.counts,
+              recipes: lib.recipes.map((r) => ({
+                id: r.id,
+                kind: r.kind,
+                category: r.category,
+                shape: r.shape,
+                slots: r.slots,
+                acceptsImage: Boolean(r.image),
+                gist: r._gist200,
+              })),
+            };
+          } else if (uri.startsWith("brushrouter://recipes/")) {
+            const rid = decodeURIComponent(uri.slice("brushrouter://recipes/".length));
+            data = publicRecipe(getRecipe(rid), { full: true });
+          } else {
+            return { jsonrpc: "2.0", id, error: { code: -32002, message: `unknown resource URI: ${uri}` } };
+          }
         }
         return {
           jsonrpc: "2.0",

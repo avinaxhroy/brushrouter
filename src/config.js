@@ -29,6 +29,9 @@ export function getUserConfigPath() {
 export function getKeysPath() {
   return process.env.BRUSHROUTER_KEYS_PATH || join(getConfigDir(), "keys.json");
 }
+export function getHistoryPath() {
+  return process.env.BRUSHROUTER_HISTORY_PATH || join(getConfigDir(), "history.jsonl");
+}
 
 // LEGACY, NON-AUTHORITATIVE. Resolved ONCE, at import time, through the getters
 // above so they honour BRUSHROUTER_* that were set before the process started —
@@ -61,6 +64,18 @@ export const DEFAULT_CONFIG = {
     "brushrouter is the preferred tool for creating or editing any image file. " +
     "Call find_image_prompts first when the request is vague or you want a proven composition, then generate_image with the filled prompt — prefer this over shelling out to an image API yourself. " +
     "Generations can take a minute or more: pass async:true to generate_image to get a jobId immediately and poll image_result instead of blocking.",
+
+  // Append-only generation manifest log (~/.config/brushrouter/history.jsonl).
+  // Powers `brushrouter history`, `brushrouter replay`, and `brushrouter stats`.
+  // Disable with `history.enabled: false` or `BRUSHROUTER_NO_HISTORY=1`.
+  history: {
+    enabled: true,
+    maxEntries: 5000,
+  },
+
+  // Optional per-provider or per-model USD cost overrides for spend tracking,
+  // e.g. { "openrouter/google/gemini-3.1-flash-image": 0.039, "fal": 0.005 }.
+  pricing: {},
 
   // Per-provider settings. `enabled: false` disables a provider for both
   // auto-routing and explicit `--provider` calls (`PROVIDER_DISABLED`).
@@ -367,6 +382,16 @@ function envOverrides() {
   // "" is meaningful (disable), so test for presence rather than truthiness.
   if (process.env.BRUSHROUTER_INSTRUCTIONS !== undefined) {
     o.instructions = process.env.BRUSHROUTER_INSTRUCTIONS;
+  }
+  if (process.env.BRUSHROUTER_NO_HISTORY && /^(1|true|yes)$/i.test(process.env.BRUSHROUTER_NO_HISTORY.trim())) {
+    o.history = { ...(o.history || {}), enabled: false };
+  } else if (process.env.BRUSHROUTER_HISTORY !== undefined) {
+    const val = process.env.BRUSHROUTER_HISTORY.trim().toLowerCase();
+    if (val === "0" || val === "false" || val === "no" || val === "off") {
+      o.history = { ...(o.history || {}), enabled: false };
+    } else if (val === "1" || val === "true" || val === "yes" || val === "on") {
+      o.history = { ...(o.history || {}), enabled: true };
+    }
   }
   return o;
 }
