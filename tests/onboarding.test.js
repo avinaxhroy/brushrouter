@@ -175,6 +175,16 @@ test("model results distinguish invalid providers, rejected keys, transient erro
   assert.equal(JSON.parse(verified.stdout).providers.find(({ id }) => id === "openrouter").verification, "verified");
 });
 
+test("models JSON redacts a credential echoed as a gateway model ID", (t) => {
+  const { run } = fixture(t);
+  const id = openrouter.BRUSHROUTER_OPENROUTER_KEY;
+  const shim = `globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ id: ${JSON.stringify(id)} }] }));`;
+  const result = run(["models", "openrouter", "--json"], { shim, extraEnv: openrouter });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!result.stdout.includes(id));
+  assert.deepEqual(JSON.parse(result.stdout).openrouter.endpoints, [{ id: "***", endpoint: "/images" }]);
+});
+
 test("update JSON reports bounded git and npm steps, and runs doctor only after success", (t) => {
   const { run } = fixture(t);
   for (const failed of ["git", "npm", null]) {

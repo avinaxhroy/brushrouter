@@ -1881,7 +1881,7 @@ async function cmdModels(args) {
       const { openrouterListModels } = await import("../src/providers/http.js");
       const { models, error, warnings } = await openrouterListModels(provider || {});
       entry.models = models.map((m) => m.id);
-      if (models.length) entry.endpoints = Object.fromEntries(models.map((m) => [m.id, m.endpoint]));
+      if (models.length) entry.endpoints = models.map(({ id, endpoint }) => ({ id, endpoint }));
       if (error) entry.error = error;
       if (warnings?.length) entry.warnings = warnings;
     }
@@ -1891,9 +1891,13 @@ async function cmdModels(args) {
     console.log(paint(C.bold, "Models per provider") + "\n");
     for (const [id, entry] of Object.entries(out)) {
       const { configured, models, endpoints, error, warnings } = entry;
+      const endpointByModel = new Map(endpoints?.map(({ id, endpoint }) => [id, endpoint]));
       const enabled = cfg.providers?.[id]?.enabled !== false;
       console.log(`${paint(C.bold, id)}${enabled ? "" : warn(" (disabled)")}${configured ? dim(`  (pinned: ${redact(configured)})`) : ""}`);
-      for (const m of models) console.log(`  ${redact(m)}${endpoints?.[m] ? dim(`  [${endpoints[m]}]`) : ""}`);
+      for (const m of models) {
+        const endpoint = endpointByModel.get(m);
+        console.log(`  ${redact(m)}${endpoint ? dim(`  [${endpoint}]`) : ""}`);
+      }
       if (error) console.error(bad(redact(`  ${error.message}`)));
       for (const warning of warnings || []) console.error(warn(redact(`  ${warning.message}`)));
       console.log("");
