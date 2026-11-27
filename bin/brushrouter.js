@@ -2292,6 +2292,7 @@ async function cmdUpdate({ values }) {
       encoding: "utf8",
       timeout,
       killSignal: "SIGKILL",
+      shell: command === "npm" && process.platform === "win32",
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,

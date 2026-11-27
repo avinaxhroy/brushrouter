@@ -243,6 +243,27 @@ test("update JSON reports bounded git and npm steps, and runs doctor only after 
   assert.deepEqual(JSON.parse(dry.stdout).steps.map(({ status }) => status), ["planned", "planned"]);
 });
 
+test("update invokes Windows npm.cmd through a shell", (t) => {
+  const { run } = fixture(t);
+  const shim = `
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const { createRequire, syncBuiltinESMExports } = await import("node:module");
+    const child = createRequire(process.argv[1])("node:child_process");
+    const original = child.spawnSync;
+    child.spawnSync = (command, args, options) => {
+      if (command === "git") return { status: 0 };
+      if (command === "npm" && args[0] === "link") {
+        return options.shell ? { status: 0 } : { status: null, error: new Error("npm.cmd needs a shell") };
+      }
+      return original(command, args, options);
+    };
+    syncBuiltinESMExports();
+  `;
+  const result = run(["update", "--json"], { shim, extraEnv: fal });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(JSON.parse(result.stdout).steps.at(-1).status, "applied");
+});
+
 test("custom recipe validation reports file errors without breaking valid runtime entries", (t) => {
   const { cwd, configDir, run } = fixture(t);
   const project = join(cwd, ".brushrouter", "recipes");
