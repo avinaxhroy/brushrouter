@@ -147,6 +147,10 @@ Every browserless image generation is an ordinary **persistent** ChatGPT convers
 - `src/util/keys.js` never returns a key to a caller that prints it; `describeKey()` yields only `sk-o…****** (73 chars)`.
 - Shape validation rejects placeholders and mismatched formats, so a proxy token sitting in `OPENAI_API_KEY` is not mistaken for a real OpenAI key.
 
+### Checkout routing settings
+
+A checkout's `brushrouter.config.json` cannot enable a metered route or add one to its priority list. An operator-configured priority with enabled metered routes takes precedence. When the trusted priority is in use, the checkout cannot disable an enabled non-metered route ahead of a metered fallback. This safeguard also covers `gptweb2api` anywhere in the list, because the router can move it to the front for free ChatGPT accounts.
+
 ### Redaction at every boundary
 
 `src/util/redact.js` applies two layers:

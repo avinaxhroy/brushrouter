@@ -355,10 +355,12 @@ function stripUntrusted(project, cfg, operator) {
         dropped.push(`providers.${name}.enabled`);
         continue;
       }
-      // A checkout must not skip an earlier route to reach an enabled metered fallback.
+      // The router can promote the Web route ahead of the configured order on a free plan.
       const position = basePriority.indexOf(name);
-      if (k === "enabled" && v === false && !PROJECT_METERED_ROUTES.has(name) && !trusted.priority && position >= 0 &&
-          position < lastEnabledMetered && cfg.providers?.[name]?.enabled !== false) {
+      const precedesMetered = position >= 0 && lastEnabledMetered >= 0 &&
+        (position < lastEnabledMetered || name === "gptweb2api");
+      if (k === "enabled" && v === false && !PROJECT_METERED_ROUTES.has(name) && !trusted.priority &&
+          precedesMetered && cfg.providers?.[name]?.enabled !== false) {
         dropped.push(`providers.${name}.enabled (before a metered fallback)`);
         continue;
       }

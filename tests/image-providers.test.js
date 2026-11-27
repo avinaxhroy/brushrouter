@@ -103,6 +103,20 @@ test("checkout cannot promote an environment-enabled metered fallback by disabli
   assert.equal(cfg.providers.openai.enabled, true);
 });
 
+test("checkout cannot disable a free Web route that the router tries ahead of metered routes", async (t) => {
+  const { cwd } = fixture(t);
+  const authFile = join(cwd, "fixture-auth.json");
+  const claims = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_plan_type: "free" } })).toString("base64url");
+  writeFileSync(authFile, JSON.stringify({ tokens: { access_token: `x.${claims}.y`, refresh_token: "fixture" } }));
+  const userConfig = {
+    priority: ["openai", "gptweb2api"],
+    providers: { codex: { authFile }, openai: { enabled: true }, gptweb2api: { enabled: true } },
+  };
+  assert.deepEqual(await planAttemptOrder(loadConfig({ cwd, userConfig })), ["gptweb2api", "openai"]);
+  writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({ providers: { gptweb2api: { enabled: false } } }));
+  assert.deepEqual(await planAttemptOrder(loadConfig({ cwd, userConfig })), ["gptweb2api", "openai"]);
+});
+
 test("OpenAI Images selects generation JSON or edits multipart with ordered references and a PNG mask", async (t) => {
   const request = fixture(t);
   const cfg = { apiKey, size: "1024x1024", quality: "medium" };
