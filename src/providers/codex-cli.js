@@ -218,8 +218,9 @@ export const codexCliProvider = {
         timeoutMs: Number(cfg?.timeoutMs) || 300000,
       });
 
-      // 1. Prefer the exact file we asked for.
-      let found = existsSync(outFile) ? outFile : null;
+      // 1. Prefer the exact file we asked for (still verify containment in case
+      // the CLI wrote a symlink pointing outside the scratch dir).
+      let found = existsSync(outFile) && isPathInside(outFile, work) ? outFile : null;
 
       // 2. Otherwise read --json for a savedPath / image item.
       if (!found) {
