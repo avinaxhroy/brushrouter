@@ -679,12 +679,19 @@ test("layered custom recipes load from BRUSHROUTER_EXTRA_RECIPES_DIRS on top of 
         styleLock: ["Acme electric blue accent"],
       }),
     );
+    writeFileSync(
+      join(dir, "malformed-stylelock.json"),
+      JSON.stringify({ id: "bad-lock", text: "Test {subject}", styleLock: "not-an-array" }),
+    );
     process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = dir;
     resetRecipesCache();
     const custom = getRecipe("acme-brand-hero");
     assert.equal(custom.custom, true);
     assert.equal(custom.category, "custom");
     assert.ok(recipeIds("job").length >= 28, "built-ins stay loaded alongside custom recipe");
+    // Malformed string styleLock does not crash the library
+    const badLock = getRecipe("bad-lock");
+    assert.deepEqual(badLock.styleLock, []);
   } finally {
     if (prev === undefined) delete process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS;
     else process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = prev;

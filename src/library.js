@@ -42,6 +42,7 @@ import { readFileSync, readdirSync, existsSync, openSync, readSync, closeSync } 
 import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getConfigDir } from "./config.js";
+import { redact, safeParseMessage } from "./util/redact.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -387,20 +388,25 @@ export function loadRecipes() {
 
   // Layer optional user & project custom recipes/looks on top of built-ins
   // (pure prompt data only — no executables, endpoints, or credentials).
+  // Trusted dirs (user config & BRUSHROUTER_EXTRA_RECIPES_DIRS) may override
+  // built-in ids; project-local .brushrouter/recipes/ may only add NEW ids
+  // so an untrusted repo cannot hijack a built-in MCP prompt like `logo-mark`.
   const customDirs = [];
   if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES !== "1") {
-    customDirs.push(join(getConfigDir(), "recipes"));
-    customDirs.push(join(process.cwd(), ".brushrouter", "recipes"));
+    customDirs.push({ dir: join(getConfigDir(), "recipes"), trusted: true });
+    customDirs.push({ dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false });
     if (process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS) {
       for (const d of process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS.split(delimiter)) {
-        if (d.trim()) customDirs.push(d.trim());
+        if (d.trim()) customDirs.push({ dir: d.trim(), trusted: true });
       }
     }
   }
   const seenDirs = new Set();
   const customRecipes = [];
   const customCategories = new Map();
-  for (const dir of customDirs) {
+  const protectedIds = new Set([...recipes, ...styles].map((r) => r.id));
+  const stringArray = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+  for (const { dir, trusted } of customDirs) {
     if (!dir || seenDirs.has(dir) || !existsSync(dir)) continue;
     seenDirs.add(dir);
     let customFiles;
@@ -414,7 +420,7 @@ export function loadRecipes() {
       try {
         data = readJson(join(dir, file));
       } catch (e) {
-        process.stderr.write(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${e.message})\n`);
+        process.stderr.write(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${safeParseMessage(e)})\n`);
         continue;
       }
       if (!data || typeof data !== "object" || Array.isArray(data)) continue;
@@ -426,40 +432,57 @@ export function loadRecipes() {
       const bundleCatId = isBundle && data.id ? String(data.id) : null;
       const bundleLabel = isBundle && data.label ? String(data.label) : null;
       const bundleIntent = isBundle && data.intent ? String(data.intent) : "";
-      const bundleAliases = isBundle && Array.isArray(data.aliases) ? data.aliases : [];
+      const bundleAliases = isBundle ? stringArray(data.aliases) : [];
       for (const raw of entries) {
         if (!raw || typeof raw !== "object" || !raw.id || typeof raw.text !== "string") continue;
+        const entryId = String(raw.id);
+        if (!trusted && protectedIds.has(entryId)) {
+          process.stderr.write(`brushrouter: ignoring project-local override of built-in recipe "${redact(entryId)}" in ${join(dir, file)}\n`);
+          continue;
+        }
         const entryKind = raw.kind === "look" ? "look" : bundleKind;
         const catId = String(raw.category || bundleCatId || "custom");
         const entrySlots = Array.isArray(raw.slots)
-          ? raw.slots
+          ? stringArray(raw.slots)
           : [...new Set([...raw.text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]))];
+        const rawDefaults = raw.defaults && typeof raw.defaults === "object" && !Array.isArray(raw.defaults) ? raw.defaults : {};
         const defaultValues = {};
         for (const slot of entrySlots) {
           const spec = slots[slot];
-          defaultValues[slot] = entryKind === "job" && spec?.options?.length ? raw.defaults?.[slot] ?? spec.options[0] : (raw.defaults?.[slot] ?? "");
+          defaultValues[slot] = entryKind === "job" && spec?.options?.length ? rawDefaults[slot] ?? spec.options[0] : (rawDefaults[slot] ?? "");
         }
-        const entryAliases = Array.isArray(raw.aliases) ? [...bundleAliases, ...raw.aliases] : bundleAliases;
+        const entryAliases = [...bundleAliases, ...stringArray(raw.aliases)];
         const aliasData = parseAliases(entryAliases);
         const normalized = {
-          shape: "single",
-          goal: raw.goal || raw.id,
-          when: raw.when || raw.goal || raw.id,
+          shape: typeof raw.shape === "string" ? raw.shape : "single",
+          goal: typeof raw.goal === "string" ? raw.goal : entryId,
+          when: typeof raw.when === "string" ? raw.when : (typeof raw.goal === "string" ? raw.goal : entryId),
           ...raw,
-          id: String(raw.id),
+          id: entryId,
           kind: entryKind,
           category: catId,
           slots: entrySlots,
+          defaults: rawDefaults,
+          ...(raw.styleLock !== undefined ? { styleLock: stringArray(raw.styleLock) } : {}),
+          ...(raw.doNotClone !== undefined ? { doNotClone: stringArray(raw.doNotClone) } : {}),
+          ...(raw.negative !== undefined ? { negative: stringArray(raw.negative) } : {}),
           custom: true,
         };
-        const indexed = indexEntry(normalized, {
-          category: catId,
-          categoryLabel: bundleLabel || catId,
-          aliasData,
-          defaultValues,
-          allSlots: slots,
-        });
+        let indexed;
+        try {
+          indexed = indexEntry(normalized, {
+            category: catId,
+            categoryLabel: bundleLabel || catId,
+            aliasData,
+            defaultValues,
+            allSlots: slots,
+          });
+        } catch (e) {
+          process.stderr.write(`brushrouter: ignoring malformed custom recipe "${redact(entryId)}" in ${join(dir, file)} (${redact(e.message)})\n`);
+          continue;
+        }
         customRecipes.push({ ...indexed, kind: entryKind, custom: true });
+        if (trusted) protectedIds.add(entryId);
         if (!customCategories.has(catId)) {
           customCategories.set(catId, {
             id: catId,
