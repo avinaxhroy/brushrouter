@@ -57,7 +57,7 @@ test("OpenAI Images selects generation JSON or edits multipart with ordered refe
     assert.equal(init.headers.Authorization, `Bearer ${apiKey}`);
     if (calls++ === 0) {
       assert.equal(url, "https://api.openai.com/v1/images/generations");
-      assert.deepEqual(JSON.parse(init.body), { model: "gpt-image-1", prompt: request.prompt, size: "1024x1024", quality: "medium" });
+      assert.deepEqual(JSON.parse(init.body), { model: "gpt-image-2.6-sunburst", prompt: request.prompt, size: "1024x1024", quality: "medium" });
     } else {
       assert.equal(url, "https://api.openai.com/v1/images/edits");
       assert.equal(init.headers["Content-Type"], undefined);

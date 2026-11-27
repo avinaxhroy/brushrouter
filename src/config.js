@@ -45,6 +45,7 @@ export const CONFIG_DIR = getConfigDir();
 export const USER_CONFIG_PATH = getUserConfigPath();
 export const KEYS_PATH = getKeysPath();
 export const PROJECT_CONFIG_NAME = "brushrouter.config.json";
+export const DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2.6-sunburst";
 
 export const DEFAULT_CONFIG = {
   // Ordered preference used when --provider is not given. The router walks this
@@ -160,7 +161,7 @@ export const DEFAULT_CONFIG = {
       enabled: false,
       apiKey: null,
       baseUrl: "https://api.openai.com/v1",
-      model: "gpt-image-1",
+      model: DEFAULT_OPENAI_IMAGE_MODEL,
       timeoutMs: 180000,
     },
     "gemini-api": {

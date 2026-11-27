@@ -198,7 +198,7 @@ The `codex` and `codex-cli` routes use ChatGPT browser login — **no API key an
 | `comfyui` | ComfyUI running locally | Off by default. Runs a built-in Flux Schnell workflow or a custom workflow. |
 | `openrouter` | `sk-or-...` key | Off by default. Key auto-discovered from env or existing agent stores. |
 | `fal` | fal.ai key | Defaults to Flux Schnell for text, Flux 2 for edits, and Flux LoRA for inpainting. |
-| `openai` | `OPENAI_API_KEY` | Off by default. Direct Images API, default model `gpt-image-1`; billed separately from ChatGPT. |
+| `openai` | `OPENAI_API_KEY` | Off by default. Direct Images API, default model `gpt-image-2.6-sunburst`; billed separately from ChatGPT. |
 | `gemini-api` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Off by default. Google AI Studio, default model `gemini-2.5-flash-image`; separate from the Google CLI route. |
 | `replicate` | `REPLICATE_API_TOKEN` | Off by default. Defaults to `black-forest-labs/flux-schnell`. |
 | `gptweb2api` | ChatGPT login (free plans work) + vendored gateway — `brushrouter vendor gptweb2api` | Off by default. Browserless web-session route, separate quota bucket (~2-3 free-plan images/day; see `docs/TECHNICAL.md`). |

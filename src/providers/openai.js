@@ -1,3 +1,4 @@
+import { DEFAULT_OPENAI_IMAGE_MODEL } from "../config.js";
 import { normalizeSize } from "../util/common.js";
 import { apiRequest, imageResult, jsonPost, keyStatus, multipartImage, providerError, requireKey, requireMaskImage } from "./image-api.js";
 
@@ -17,7 +18,7 @@ export const openAIProvider = {
   async generate({ prompt, size, quality, background, images = [], mask, cwd, model: requestedModel, onProgress }, cfg) {
     requireMaskImage(mask, images);
     const key = requireKey(cfg, id, env);
-    const model = requestedModel || cfg?.model || "gpt-image-1";
+    const model = requestedModel || cfg?.model || DEFAULT_OPENAI_IMAGE_MODEL;
     const baseUrl = (cfg?.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
     const headers = { Authorization: `Bearer ${key}` };
     const isGPTImage = model.startsWith("gpt-image-") || model === "chatgpt-image-latest";

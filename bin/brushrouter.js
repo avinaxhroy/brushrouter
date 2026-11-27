@@ -23,7 +23,7 @@ import { resolve, join, dirname, extname, basename, isAbsolute } from "node:path
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG } from "../src/config.js";
+import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG, DEFAULT_OPENAI_IMAGE_MODEL } from "../src/config.js";
 import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
 import {
   tryRecordHistory,
@@ -1727,7 +1727,7 @@ async function cmdModels(args) {
     ],
     openrouter: [],
     fal: ["fal-ai/flux/schnell", "fal-ai/flux/dev", "fal-ai/flux-pro/v1.1", "fal-ai/flux-2/edit", "fal-ai/flux-lora/inpainting"],
-    openai: ["gpt-image-1", "gpt-image-1.5", "gpt-image-1-mini"],
+    openai: [DEFAULT_OPENAI_IMAGE_MODEL, "gpt-image-2.6-flare"],
     "gemini-api": ["gemini-2.5-flash-image"],
     replicate: ["black-forest-labs/flux-schnell"],
     comfyui: ["flux1-schnell.safetensors"],
