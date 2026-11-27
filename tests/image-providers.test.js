@@ -288,3 +288,34 @@ test("CLI mask flag and MCP mask schemas forward inputs and reject missing bases
   assert.ok(existsSync(join(request.cwd, "out", "batch.png")));
   await assert.rejects(() => handleToolCall("generate_image", { ...request, images: [] }, ctx), { code: "INVALID_MASK" });
 });
+
+test("CLI batch uses a per-item mask or the flag default and rejects a masked item without a base", (t) => {
+  const request = fixture(t);
+  const cfg = join(request.cwd, "config.json");
+  writeFileSync(cfg, JSON.stringify({
+    priority: ["gemini-api", "openai"],
+    providers: { "gemini-api": { enabled: true, apiKey }, openai: { enabled: true, apiKey } },
+  }));
+  const input = join(request.cwd, "items.json");
+  const cli = resolve("bin/brushrouter.js");
+  const options = {
+    cwd: request.cwd,
+    encoding: "utf8",
+    env: { ...process.env, BRUSHROUTER_USER_CONFIG: cfg, BRUSHROUTER_CONFIG_DIR: request.cwd, BRUSHROUTER_ENABLE: "", BRUSHROUTER_DISABLE: "", BRUSHROUTER_PRIORITY: "" },
+  };
+  const args = [cli, "batch", input, "--mask", request.mask, "--dry-run", "--json"];
+  writeFileSync(input, JSON.stringify([
+    { prompt: "use the default mask", images: request.images },
+    { prompt: "use the item mask", images: request.images, mask: "extra.png" },
+  ]));
+  const dry = spawnSync(process.execPath, args, options);
+  assert.equal(dry.status, 0, dry.stderr);
+  const plan = JSON.parse(dry.stdout);
+  assert.deepEqual(plan.items.map(({ mask }) => mask), [request.mask, "extra.png"]);
+  assert.deepEqual(plan.readyProviders.map(({ id }) => id), ["openai"]);
+
+  writeFileSync(input, JSON.stringify([{ prompt: "missing base image" }]));
+  const invalid = spawnSync(process.execPath, args, options);
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /batch item 1 mask: requires a mask file path and a base image/);
+});
