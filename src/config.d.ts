@@ -77,6 +77,26 @@ export interface LoadConfigOptions {
   userConfig?: ConfigOverrides | null;
 }
 
+type UndefinedOverride<Overrides, Key extends PropertyKey> = Overrides extends unknown
+  ? Key extends keyof Overrides
+    ? undefined extends Overrides[Key] ? undefined : never
+    : never
+  : never;
+
+type PresentValue<Input, Key extends PropertyKey> = Input extends unknown
+  ? Key extends keyof Input ? NonNullable<Input[Key]> : never
+  : never;
+
+type ResolvedConfig<Overrides> = ConfigOverrides & {
+  priority: string[] | UndefinedOverride<Overrides, "priority">;
+  instructions: string | UndefinedOverride<Overrides, "instructions">;
+  providers: ({
+    [Id in ProviderId]: ProviderConfigs[Id]
+      | UndefinedOverride<PresentValue<Overrides, "providers">, Id>
+      | UndefinedOverride<Overrides, "providers">;
+  } & Record<string, ProviderConfig | undefined>) | UndefinedOverride<Overrides, "providers">;
+};
+
 export function getConfigDir(): string;
 export function getUserConfigPath(): string;
 export function getKeysPath(): string;
@@ -87,6 +107,8 @@ export const KEYS_PATH: string;
 export const PROJECT_CONFIG_NAME: "brushrouter.config.json";
 export const DEFAULT_CONFIG: LoadedConfig;
 
-export function loadConfig(options?: LoadConfigOptions): LoadedConfig;
+export function loadConfig<Options extends LoadConfigOptions = {}>(
+  options?: Options,
+): ResolvedConfig<PresentValue<Options, "overrides" | "userConfig">>;
 export function providerConfig<Id extends ProviderId>(config: Pick<Config, "providers">, name: Id): ProviderConfigs[Id];
 export function providerConfig(config: Pick<Config, "providers">, name: string): ProviderConfig;

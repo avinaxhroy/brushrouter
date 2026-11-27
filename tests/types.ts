@@ -28,6 +28,16 @@ const config = loadConfig({
   },
 });
 const url: string | undefined = providerConfig(config, "custom-http").url;
+const defaultsPriority: string[] = loadConfig().priority;
+const clearedPriority = loadConfig({ overrides: { priority: undefined } }).priority;
+// @ts-expect-error An explicit undefined can overwrite an existing priority.
+const requiredPriority: string[] = clearedPriority;
+const clearedFal = loadConfig({ userConfig: { providers: { fal: undefined } } }).providers.fal;
+// @ts-expect-error An explicit undefined can also overwrite a provider entry.
+clearedFal.enabled;
+const clearedProviders = loadConfig({ userConfig: { providers: undefined } }).providers;
+// @ts-expect-error The provider map may no longer include the default entries.
+clearedProviders?.fal.enabled;
 const ids: ProviderId[] = await planAttemptOrder(config, { images: ["reference.png"] });
 const models: string[] = PROVIDERS.openrouter.defaultModels;
 const generated = await generate({
