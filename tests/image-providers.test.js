@@ -438,6 +438,19 @@ test("CLI mask flag and MCP mask schemas forward inputs and reject missing bases
   await assert.rejects(() => handleToolCall("generate_image", { ...request, images: [] }, ctx), { code: "INVALID_MASK" });
 });
 
+test("MCP variations detect the format if the caller supplied no extension", async (t) => {
+  const { cwd } = fixture(t);
+  const webp = Buffer.from("RIFF\x04\0\0\0WEBP", "latin1");
+  t.mock.method(PROVIDERS.codex, "generate", async () => ({ buffer: webp }));
+  for (const [out, ext] of [["detected", ".webp"], ["explicit.png", ".png"]]) {
+    const result = await handleToolCall("generate_image", { prompt: "test", provider: "codex", out, count: 2 }, { cwd });
+    assert.equal(result.isError, false, result.content[0].text);
+    for (const index of [1, 2]) {
+      assert.ok(existsSync(join(cwd, `${out.split(".")[0]}-${index}${ext}`)), result.content[0].text);
+    }
+  }
+});
+
 test("CLI batch uses a per-item mask or the flag default and rejects a masked item without a base", (t) => {
   const request = fixture(t);
   const cfg = join(request.cwd, "config.json");

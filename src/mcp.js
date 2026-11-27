@@ -6,7 +6,7 @@
 // so the calling agent can make an informed choice (or let auto-routing decide).
 
 import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { requireMaskImage } from "./providers/image-api.js";
 import { loadConfig } from "./config.js";
@@ -672,6 +672,7 @@ async function runGenerate(args, ctx, onProgress) {
   // refuses to overwrite, so two callers cannot collide.
   const batchId = generateBatchId();
   const targets = Array.from({ length: count }, (_, i) => batchVariantPath(out, i + 1, count));
+  const matchExtension = !args.out || !extname(out);
   const settled = await mapLimited(targets, concurrency, async (target, i) => {
     onProgress?.(`variation ${i + 1}/${count}...`, Math.round(((i + 1) / count) * 90));
     try {
@@ -679,7 +680,7 @@ async function runGenerate(args, ctx, onProgress) {
         { ...effectiveArgs, out: target, count: undefined, cwd, fallback: args.fallback === true },
         cfg,
       );
-      const saved = saveImage(target, result.buffer, cwd, { matchExtension: !args.out });
+      const saved = saveImage(target, result.buffer, cwd, { matchExtension });
       const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
       const dims = pngSize(result.buffer);
       const histRec = tryRecordHistory(
