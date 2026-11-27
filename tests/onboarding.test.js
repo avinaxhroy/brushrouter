@@ -381,3 +381,17 @@ test("explicit trusted recipe directories can override bundled IDs with auto-sca
   assert.equal(untrusted.status, 1);
   assert.match(untrusted.stdout, /untrusted directory cannot override/);
 });
+
+test("custom recipe validation flags unknown shapes and unsupported default ratios", (t) => {
+  const { cwd, run } = fixture(t);
+  const dir = join(cwd, "recipes");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "invalid.json"), '{"id":"invalid","text":"Fixture {ratio}","shape":"toString","defaults":{"ratio":"7:3"}}');
+  writeFileSync(join(dir, "valid.json"), '{"id":"valid","text":"Fixture {ratio}","shape":"grid","defaults":{"ratio":"16:9"}}');
+  const result = run(["recipes", "validate", dir, "--json"]);
+  assert.equal(result.status, 1);
+  const [invalid, valid] = JSON.parse(result.stdout).files;
+  assert.match(invalid.errors.join("\n"), /unknown shape "toString"/);
+  assert.match(invalid.errors.join("\n"), /unsupported default ratio "7:3"/);
+  assert.deepEqual(valid.errors, []);
+});

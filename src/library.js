@@ -400,7 +400,7 @@ function isRecipeObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function readCustomRecipes(dirs, slots, protectedIds) {
+function readCustomRecipes(dirs, slots, shapes, protectedIds) {
   const seenDirs = new Set();
   const customRecipes = [];
   const customCategories = new Map();
@@ -473,6 +473,7 @@ function readCustomRecipes(dirs, slots, protectedIds) {
         for (const key of ["category", "goal", "when", "shape", "example"]) {
           if (raw[key] !== undefined && typeof raw[key] !== "string") issue(`${key} must be a string`);
         }
+        if (typeof raw.shape === "string" && !Object.hasOwn(shapes, raw.shape)) issue(`unknown shape "${raw.shape}"`);
         if (raw.source !== undefined && !isRecipeObject(raw.source)) issue("source must be an object");
         const entryKind = raw.kind === "look" || data.kind === "look" ? "look" : kind;
         const catId = typeof raw.category === "string" && raw.category ? raw.category
@@ -501,6 +502,7 @@ function readCustomRecipes(dirs, slots, protectedIds) {
         if (raw.defaults !== undefined && !isRecipeObject(raw.defaults)) issue("defaults must be an object");
         for (const [key, value] of Object.entries(isRecipeObject(raw.defaults) ? raw.defaults : {})) {
           if (!entrySlots.includes(key) || typeof value !== "string") issue(`default for "${key}" requires a declared slot and string value`);
+          else if (key === "ratio" && (!ratioToSize(value) || !slots.ratio?.options?.includes(value))) issue(`unsupported default ratio "${value}"`);
           else defaults[key] = value;
         }
         const defaultValues = Object.fromEntries(entrySlots.map((key) => [
@@ -542,10 +544,11 @@ function readCustomRecipes(dirs, slots, protectedIds) {
   return { customRecipes, customCategories, files };
 }
 
-function scanCustomRecipes(dirs, { slots, recipes, styles }, preceding = []) {
+function scanCustomRecipes(dirs, { slotsFile, slots, recipes, styles }, preceding = []) {
+  const shapes = slotsFile.shapes || {};
   const protectedIds = new Set([...recipes, ...styles].map((r) => r.id));
-  if (preceding.length) readCustomRecipes(preceding, slots, protectedIds);
-  return readCustomRecipes(dirs, slots, protectedIds);
+  if (preceding.length) readCustomRecipes(preceding, slots, shapes, protectedIds);
+  return readCustomRecipes(dirs, slots, shapes, protectedIds);
 }
 
 export function validateCustomRecipes(paths = []) {
