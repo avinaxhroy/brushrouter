@@ -14,9 +14,9 @@ import { existsSync, readFileSync, mkdtempSync, rmSync, readdirSync, statSync } 
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendTailed } from "../util/common.js";
+import { appendTailed, detectImageMime, isPathInside } from "../util/common.js";
 import { resolveExecutable } from "../util/discover.js";
-import { registerSecret } from "../util/redact.js";
+import { redact, registerSecret } from "../util/redact.js";
 
 function run(cmd, args, { timeoutMs = 180000, cwd, env, shell = false } = {}) {
   return new Promise((resolve) => {
@@ -84,6 +84,7 @@ function findNewestImage(dir, sinceMs = 0) {
         continue;
       }
       if (!/\.(png|jpe?g|webp|gif)$/i.test(e.name)) continue;
+      if (!isPathInside(p, dir)) continue;
       try {
         const t = statSync(p).mtimeMs;
         // `sinceMs` guards against returning a stale image from a previous run.
@@ -186,12 +187,22 @@ async function generateWithAntigravity(cli, { prompt, onProgress, model: request
     // The CLI is not guaranteed to honour the working directory: it sometimes
     // writes to its own scratch area instead. Look in both places, and only
     // accept a file created during THIS run so a stale image is never returned.
+    const scratchDir = join(homedir(), ".gemini", "antigravity-cli", "scratch");
+    const allowedDirs = [work, scratchDir];
     const found =
       findNewestImage(work, started) ||
-      findNewestImage(join(homedir(), ".gemini", "antigravity-cli", "scratch"), started) ||
+      findNewestImage(scratchDir, started) ||
       findNewestImage(work) ||
-      parseImagePathFromOutput(r.stdout);
-    if (found) return { buffer: readFileSync(found), meta: { provider: "gemini", cli: "agy", model } };
+      parseImagePathFromOutput(r.stdout, allowedDirs);
+    if (found) {
+      const buf = readFileSync(found);
+      if (!detectImageMime(buf)) {
+        const e = new Error(`agy wrote a non-image file at ${found} (${buf.length} bytes)`);
+        e.code = "BAD_IMAGE_PAYLOAD";
+        throw e;
+      }
+      return { buffer: buf, meta: { provider: "gemini", cli: "agy", model } };
+    }
     throw failedFromCli("agy", r);
   } finally {
     try {
@@ -215,8 +226,16 @@ async function generateWithGemini(cli, { prompt, onProgress, model: requestedMod
       env: { GEMINI_CLI_TRUST_WORKSPACE: "true" },
     });
     const found =
-      findNewestImage(work, started) || findNewestImage(work) || parseImagePathFromOutput(r.stdout);
-    if (found) return { buffer: readFileSync(found), meta: { provider: "gemini", cli: "gemini", model } };
+      findNewestImage(work, started) || findNewestImage(work) || parseImagePathFromOutput(r.stdout, [work]);
+    if (found) {
+      const buf = readFileSync(found);
+      if (!detectImageMime(buf)) {
+        const e = new Error(`gemini wrote a non-image file at ${found} (${buf.length} bytes)`);
+        e.code = "BAD_IMAGE_PAYLOAD";
+        throw e;
+      }
+      return { buffer: buf, meta: { provider: "gemini", cli: "gemini", model } };
+    }
     throw failedFromCli("gemini", r);
   } finally {
     try {
@@ -227,7 +246,7 @@ async function generateWithGemini(cli, { prompt, onProgress, model: requestedMod
 
 // The CLI often prints the path it saved to (in markdown link or plain form).
 // Using it is more reliable than guessing from the filesystem.
-function parseImagePathFromOutput(stdout) {
+function parseImagePathFromOutput(stdout, allowedDirs = []) {
   const text = String(stdout || "");
   const patterns = [
     /file:\/\/([^\s)\]"']+\.(?:png|jpe?g|webp|gif))/gi,
@@ -240,7 +259,7 @@ function parseImagePathFromOutput(stdout) {
       try {
         const raw = matches[i][1];
         const p = decodeURIComponent(raw.startsWith("/") && raw.length > 2 && raw[2] === ":" ? raw.slice(1) : raw);
-        if (existsSync(p)) return p;
+        if (existsSync(p) && allowedDirs.some((dir) => isPathInside(p, dir))) return p;
       } catch {}
     }
   }
@@ -249,9 +268,10 @@ function parseImagePathFromOutput(stdout) {
 
 function failedFromCli(name, r) {
   const blob = `${r.stdout}\n${r.stderr}`;
+  const detail = redact(blob.split("\n").filter((l) => l.trim()).slice(-2).join(" ").slice(0, 300));
   const err = new Error(
     `${name} produced no image (exit ${r.code})` +
-      (blob.trim() ? `: ${blob.split("\n").filter((l) => l.trim()).slice(-2).join(" ").slice(0, 300)}` : ""),
+      (detail.trim() ? `: ${detail}` : ""),
   );
   if (/IneligibleTier|UNSUPPORTED_CLIENT|no longer supported/i.test(blob)) {
     err.code = "DEPRECATED";

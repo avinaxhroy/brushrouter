@@ -3744,3 +3744,154 @@ test("openrouterImagesGenerate ignores zero-dimension sizes and strips multiple 
     globalThis.fetch = origFetch;
   }
 });
+
+test("assertSafeImageDownloadUrl and httpImageGenerate block SSRF and unsafe redirects", async () => {
+  const { assertSafeImageDownloadUrl, httpImageGenerate, resolvePath } = await import("../src/providers/http.js");
+  // Prototype traversal blocked in resolvePath
+  assert.equal(resolvePath({ data: [{}] }, "constructor.name"), undefined);
+  assert.equal(resolvePath({ data: [{}] }, "data.0.__proto__"), undefined);
+  // Direct SSRF targets blocked
+  for (const bad of [
+    "http://127.0.0.1:8080/secret.png",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://10.0.0.5/internal.png",
+    "http://192.168.1.1/admin.png",
+    "http://localhost:1455/auth/callback",
+    "http://[::1]:8080/secret.png",
+    "file:///etc/passwd",
+  ]) {
+    assert.throws(() => assertSafeImageDownloadUrl(bad), { code: "UNSAFE_URL" }, `should block ${bad}`);
+  }
+  // Same-origin localhost allowed when explicitly permitted
+  assert.equal(
+    assertSafeImageDownloadUrl("http://127.0.0.1:9999/img.png", { allowedOrigins: ["http://127.0.0.1:9999"] }),
+    "http://127.0.0.1:9999/img.png",
+  );
+  // Redirect to internal metadata IP blocked in httpImageGenerate
+  const origFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls++;
+    if (calls === 1) {
+      return new Response(JSON.stringify({ data: [{ url: "https://cdn.example.test/img.png" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } });
+  };
+  try {
+    await assert.rejects(
+      () =>
+        httpImageGenerate(
+          { prompt: "test", images: [], cwd: process.cwd() },
+          {},
+          {
+            id: "test",
+            name: "test",
+            url: "https://api.example.test/v1/images",
+            method: "POST",
+            headers: {},
+            body: '{"prompt":"{prompt}"}',
+            responsePath: "json:data.0.url",
+            defaultModel: "m",
+            supportsRefImages: false,
+          },
+        ),
+      { code: "UNSAFE_URL" },
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("isPathInside rejects outside paths and codex-cli refuses JSON-reported paths outside scratch dir", async () => {
+  const { isPathInside } = await import("../src/util/common.js");
+  const { codexCliProvider } = await import("../src/providers/codex-cli.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-sec-path-"));
+  const outside = mkdtempSync(join(tmpdir(), "br-sec-outside-"));
+  const secretImg = join(outside, "secret.png");
+  const fakeCli = join(dir, "codex");
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  try {
+    writeFileSync(secretImg, pngBytes);
+    assert.equal(isPathInside(secretImg, dir), false);
+    assert.equal(isPathInside(fakeCli, dir), false); // non-existent
+    writeFileSync(
+      fakeCli,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.1.0"; exit 0; fi\necho '{"path":"${secretImg}"}'\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    await assert.rejects(
+      () => codexCliProvider.generate({ prompt: "test", cwd: dir }, { cli: fakeCli }),
+      /produced no image/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("gemini provider contains output paths, validates image magic bytes, and redacts CLI errors", async () => {
+  const { geminiProvider } = await import("../src/providers/gemini.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-sec-gemini-"));
+  const outside = mkdtempSync(join(tmpdir(), "br-sec-gemini-out-"));
+  const secretImg = join(outside, "secret.png");
+  const fakeAgy = join(dir, "agy");
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  try {
+    writeFileSync(secretImg, pngBytes);
+    // 1. Reports an outside image path + leaks a token shape on stderr -> must refuse outside path and redact error
+    writeFileSync(
+      fakeAgy,
+      `#!/bin/sh\necho "saved at ${secretImg}"\necho "err sk-secret1234567890abcdef" >&2\nexit 1\n`,
+      { mode: 0o755 },
+    );
+    await assert.rejects(
+      () => geminiProvider.generate({ prompt: "test" }, { cli: fakeAgy }),
+      (err) => {
+        assert.match(err.message, /produced no image/);
+        assert.doesNotMatch(err.message, /sk-secret1234567890abcdef/);
+        return true;
+      },
+    );
+    // 2. Writes a non-image payload into brushrouter-out.png -> rejected with BAD_IMAGE_PAYLOAD
+    writeFileSync(
+      fakeAgy,
+      `#!/bin/sh\necho "not a png" > brushrouter-out.png\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    await assert.rejects(
+      () => geminiProvider.generate({ prompt: "test" }, { cli: fakeAgy }),
+      { code: "BAD_IMAGE_PAYLOAD" },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("saveKey backs up non-object keys.json and readBodyCapped caps arrayBuffer fallback", async () => {
+  const { saveKey } = await import("../src/util/keys.js");
+  const { readBodyCapped } = await import("../src/util/common.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-sec-keys-"));
+  const keysPath = join(dir, "keys.json");
+  const prevDir = process.env.BRUSHROUTER_CONFIG_DIR;
+  const prevKeys = process.env.BRUSHROUTER_KEYS_PATH;
+  try {
+    process.env.BRUSHROUTER_CONFIG_DIR = dir;
+    process.env.BRUSHROUTER_KEYS_PATH = keysPath;
+    writeFileSync(keysPath, "[]\n");
+    saveKey("openrouter", "sk-or-v1-1234567890abcdef");
+    const saved = JSON.parse(readFileSync(keysPath, "utf8"));
+    assert.equal(saved.openrouter.key, "sk-or-v1-1234567890abcdef");
+    const fakeRes = { body: null, arrayBuffer: async () => new Uint8Array(32).buffer };
+    await assert.rejects(() => readBodyCapped(fakeRes, 16), /download limit/);
+  } finally {
+    if (prevDir === undefined) delete process.env.BRUSHROUTER_CONFIG_DIR;
+    else process.env.BRUSHROUTER_CONFIG_DIR = prevDir;
+    if (prevKeys === undefined) delete process.env.BRUSHROUTER_KEYS_PATH;
+    else process.env.BRUSHROUTER_KEYS_PATH = prevKeys;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

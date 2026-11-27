@@ -151,7 +151,11 @@ export function saveKey(provider, key) {
   let data = {};
   if (existsSync(keysPath)) {
     try {
-      data = JSON.parse(readFileSync(keysPath, "utf8"));
+      const parsed = JSON.parse(readFileSync(keysPath, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new SyntaxError("expected a top-level JSON object");
+      }
+      data = parsed;
     } catch (e) {
       // Never silently reset: `data = {}` here used to overwrite a real store
       // with one entry, destroying every other key with no backup and no word to

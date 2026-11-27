@@ -1,7 +1,7 @@
 // Small dependency-free helpers shared across providers.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
-import { resolve, dirname, isAbsolute, extname } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync, readSync, closeSync, fstatSync, realpathSync } from "node:fs";
+import { resolve, dirname, isAbsolute, extname, relative } from "node:path";
 
 const jwtCache = new Map();
 
@@ -190,13 +190,32 @@ export function assertImageFile(filePath, cwd = process.cwd()) {
 // reader) must call it when the body settles, or the deadline stays armed.
 export const RESPONSE_SETTLED = Symbol("brushrouter.responseSettled");
 
+// Verify that `candidate` resolves inside `allowedDir` (following symlinks) so
+// CLI/model-reported output paths cannot read arbitrary files outside the
+// provider's scratch directory.
+export function isPathInside(candidate, allowedDir) {
+  if (!candidate || !allowedDir) return false;
+  try {
+    const realRoot = realpathSync(allowedDir);
+    const realTarget = realpathSync(candidate);
+    const rel = relative(realRoot, realTarget);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  } catch {
+    return false;
+  }
+}
+
 // Read a response body as bytes, refusing payloads bigger than `max`. Every
 // byte download (image file, raw body) goes through this: a hostile or
 // misconfigured endpoint can otherwise stream unbounded data into memory.
 export async function readBodyCapped(res, max = 64 * 1024 * 1024) {
   const settle = res[RESPONSE_SETTLED];
   try {
-    if (!res.body) return Buffer.from(await res.arrayBuffer());
+    if (!res.body) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > max) throw new Error(`response body exceeds the ${Math.round(max / 1048576)}MB download limit`);
+      return buf;
+    }
     const reader = res.body.getReader();
     const chunks = [];
     let size = 0;

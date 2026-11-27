@@ -20,7 +20,7 @@
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:net";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -98,14 +98,37 @@ async function tryReleaseInstall(dir, onLog) {
     onLog?.(`release ${release.tag_name} has no ${wanted}; falling back to source build`);
     return null;
   }
+  const assertHttpsUrl = (u, label) => {
+    let parsed;
+    try {
+      parsed = new URL(u);
+    } catch {
+      throw new Error(`invalid ${label} URL`);
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error(`refusing non-HTTPS ${label} URL (${parsed.protocol})`);
+    }
+    return parsed.toString();
+  };
   const tmp = mkdtempSync(join(tmpdir(), "brushrouter-vendor-"));
   try {
-    const payload = await downloadFile(asset.browser_download_url, join(tmp, wanted));
-    const sumsBody = await downloadFile(sums.browser_download_url, join(tmp, "SHA256SUMS"));
-    const line = sumsBody.toString().split("\n").find((l) => l.endsWith(`  ${wanted}`));
-    const want = line?.split(/\s+/)[0];
+    const assetUrl = assertHttpsUrl(asset.browser_download_url, "release asset");
+    const sumsUrl = assertHttpsUrl(sums.browser_download_url, "SHA256SUMS");
+    const payload = await downloadFile(assetUrl, join(tmp, wanted));
+    const sumsBody = await downloadFile(sumsUrl, join(tmp, "SHA256SUMS"));
+    let want = null;
+    for (const rawLine of sumsBody.toString().split("\n")) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) continue;
+      const m = trimmed.match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+      if (m && m[2] === wanted) {
+        want = m[1].toLowerCase();
+        break;
+      }
+    }
     const got = createHash("sha256").update(payload).digest("hex");
-    if (!want || want !== got) {
+    const match = Boolean(want) && timingSafeEqual(Buffer.from(want, "hex"), Buffer.from(got, "hex"));
+    if (!match) {
       throw new Error(`checksum mismatch for ${wanted} (expected ${want || "none"}, got ${got})`);
     }
     const binPath = join(dir, `gptweb2api${EXE}`);
@@ -129,8 +152,11 @@ async function trySourceInstall(dir, ref, onLog) {
     mkdirSync(dir, { recursive: true });
     await promisifiedExecFile("git", ["clone", "--no-checkout", `https://github.com/${GITHUB_REPO}`, srcDir]);
   }
-  const wanted = ref === "HEAD" ? "" : ref;
+  const wanted = ref === "HEAD" ? "" : String(ref || "").trim();
   if (wanted) {
+    if (wanted.startsWith("-") || /[\s\0]/.test(wanted) || !/^[A-Za-z0-9._/@^~-]+$/.test(wanted)) {
+      throw new Error(`invalid git ref for gptweb2api: "${wanted}"`);
+    }
     await promisifiedExecFile("git", ["-C", srcDir, "checkout", "--detach", "--quiet", wanted]);
   }
   // Cleanup patch: hide throwaway image conversations from account history

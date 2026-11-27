@@ -20,7 +20,7 @@ import { join, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendTailed, assertImageFile, detectImageMime } from "../util/common.js";
+import { appendTailed, assertImageFile, detectImageMime, isPathInside } from "../util/common.js";
 import { findCodexCli } from "../util/discover.js";
 import { openaiJwtClaim } from "./codex.js";
 import { redact } from "../util/redact.js";
@@ -84,6 +84,7 @@ function findNewestImage(dir) {
         continue;
       }
       if (!/\.(png|jpe?g|webp|gif)$/i.test(e.name)) continue;
+      if (!isPathInside(p, dir)) continue;
       try {
         const t = statSync(p).mtimeMs;
         if (t > bestTime) {
@@ -233,7 +234,7 @@ export const codexCliProvider = {
           }
           const item = j.item || j;
           const p = item.path || item.file || item.filename || item.output_path || item.savedPath || item.saved_path;
-          if (p && existsSync(p) && /\.(png|jpe?g|webp|gif)$/i.test(p)) {
+          if (p && existsSync(p) && /\.(png|jpe?g|webp|gif)$/i.test(p) && isPathInside(p, work)) {
             found = p;
             break;
           }

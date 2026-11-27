@@ -13,7 +13,7 @@
 //     by the hosted image tool. This path shares the Codex TEXT quota, so a
 //     text-quota exhaustion surfaces as 429 usage_limit_reached.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { fetchWithTimeout, sseData, jwtExpiryMs, jwtClientId, readImageAsDataUrl, normalizeSize, RESPONSE_SETTLED } from "../util/common.js";
@@ -250,6 +250,9 @@ function persistAuth(auth, newAccess, newRefresh) {
     if (newRefresh) target.refresh = newRefresh;
   }
   writeFileSync(auth.filePath, JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
+  try {
+    chmodSync(auth.filePath, 0o600);
+  } catch {}
   // A refreshed token is a new secret the redactor has never seen.
   registerSecret(newAccess);
   registerSecret(newRefresh);
