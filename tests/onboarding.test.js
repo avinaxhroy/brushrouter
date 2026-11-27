@@ -395,3 +395,18 @@ test("custom recipe validation flags unknown shapes and unsupported default rati
   assert.match(invalid.errors.join("\n"), /unsupported default ratio "7:3"/);
   assert.deepEqual(valid.errors, []);
 });
+
+test("custom recipe validation and rendering accept padded default ratios", (t) => {
+  const { cwd, run } = fixture(t);
+  const dir = join(cwd, "recipes");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "wide.json"), '{"id":"wide","text":"Fixture {ratio}","defaults":{"ratio":" 16:9 "}}');
+  const extraEnv = { BRUSHROUTER_EXTRA_RECIPES_DIRS: dir };
+  const checked = run(["recipes", "validate", "--json"], { extraEnv });
+  const rendered = run(["prompts", "--id", "wide", "--full", "--json"], { extraEnv });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const [recipe] = JSON.parse(rendered.stdout).recipes;
+  assert.equal(checked.status, 0, checked.stdout + checked.stderr);
+  assert.equal(recipe.defaults.ratio, "16:9");
+  assert.equal(recipe.suggestedSize, "1536x864");
+});

@@ -502,7 +502,11 @@ function readCustomRecipes(dirs, slots, shapes, protectedIds) {
         if (raw.defaults !== undefined && !isRecipeObject(raw.defaults)) issue("defaults must be an object");
         for (const [key, value] of Object.entries(isRecipeObject(raw.defaults) ? raw.defaults : {})) {
           if (!entrySlots.includes(key) || typeof value !== "string") issue(`default for "${key}" requires a declared slot and string value`);
-          else if (key === "ratio" && (!ratioToSize(value) || !slots.ratio?.options?.includes(value))) issue(`unsupported default ratio "${value}"`);
+          else if (key === "ratio") {
+            const ratio = value.trim();
+            if (!ratioToSize(ratio) || !slots.ratio?.options?.includes(ratio)) issue(`unsupported default ratio "${value}"`);
+            else defaults[key] = ratio;
+          }
           else defaults[key] = value;
         }
         const defaultValues = Object.fromEntries(entrySlots.map((key) => [
