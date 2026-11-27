@@ -1973,6 +1973,14 @@ test("a project config cannot choose an executable via providers.*.bin", () => {
   }
 });
 
+test("a checkout can set a non-metered priority when every listed metered route is disabled", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "br-project-priority-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({ priority: ["gemini", "openai", "codex"] }));
+  const userConfig = { priority: ["codex", "openai", "fal", "gemini"], providers: { fal: { enabled: false } } };
+  assert.deepEqual(loadConfig({ cwd, userConfig }).priority, ["gemini", "codex"]);
+});
+
 test("project-config allow-list is not bypassable via __proto__, nesting or arrays", () => {
   const dir = mkdtempSync(join(tmpdir(), "br-project-proto-"));
   try {

@@ -322,9 +322,10 @@ function stripUntrusted(project, cfg, operator) {
   const dropped = [];
   const trusted = {};
   const basePriority = Array.isArray(cfg.priority) ? cfg.priority : [];
-  const hasUserMeteredOrder = basePriority.some((id) => PROJECT_METERED_ROUTES.has(id) &&
+  const isEnabledMetered = (id) => PROJECT_METERED_ROUTES.has(id) && cfg.providers?.[id]?.enabled !== false;
+  const hasUserMeteredOrder = basePriority.some((id) => isEnabledMetered(id) &&
     (Array.isArray(operator.priority) || operator.providers?.[id]?.enabled === true));
-  const lastEnabledMetered = basePriority.findLastIndex((id) => PROJECT_METERED_ROUTES.has(id) && cfg.providers?.[id]?.enabled !== false);
+  const lastEnabledMetered = basePriority.findLastIndex(isEnabledMetered);
   for (const [k, v] of Object.entries(project)) {
     if (k === "providers") continue; // walked below, per leaf
     if ((k === "priority" || k === "order") && Array.isArray(v)) {
