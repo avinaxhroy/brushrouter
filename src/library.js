@@ -38,8 +38,8 @@
 //               negatives (no watermark, no extra limbs). A look that clones its
 //               source image is a licensing problem, not a quality one.
 
-import { readFileSync, readdirSync, existsSync, openSync, readSync, closeSync } from "node:fs";
-import { join, dirname, delimiter } from "node:path";
+import { readFileSync, readdirSync, existsSync, openSync, readSync, closeSync, statSync } from "node:fs";
+import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getConfigDir } from "./config.js";
 import { redact, safeParseMessage } from "./util/redact.js";
@@ -307,17 +307,9 @@ function indexEntry(entry, { category, categoryLabel, aliasData, defaultValues =
   };
 }
 
-let cache = null;
-
-/**
- * Load and index the whole library: our jobs plus any vendored looks.
- * Memoized — the library is static, so re-reading it per call would be waste.
- */
-export function loadRecipes() {
-  if (cache) return cache;
+function loadBuiltInRecipes() {
   const slotsFile = readJson(join(RECIPES_DIR, "slots.json"));
   const slots = slotsFile.slots || {};
-  const freeSlots = Object.entries(slots).filter(([, s]) => s.free).map(([k]) => k);
   const categories = [];
   const recipes = [];
 
@@ -391,117 +383,191 @@ export function loadRecipes() {
     }
   }
 
-  // Layer optional user & project custom recipes/looks on top of built-ins
-  // (pure prompt data only — no executables, endpoints, or credentials).
-  // Trusted dirs (user config & BRUSHROUTER_EXTRA_RECIPES_DIRS) may override
-  // built-in ids; project-local .brushrouter/recipes/ may only add NEW ids
-  // so an untrusted repo cannot hijack a built-in MCP prompt like `logo-mark`.
-  const customDirs = [];
-  if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES !== "1") {
-    customDirs.push({ dir: join(getConfigDir(), "recipes"), trusted: true });
-    if (process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS) {
-      for (const d of process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS.split(delimiter)) {
-        if (d.trim()) customDirs.push({ dir: d.trim(), trusted: true });
-      }
-    }
-    customDirs.push({ dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false });
-  }
+  return { slotsFile, slots, categories, recipes, styles, stylesFile };
+}
+
+function customRecipeDirs() {
+  if (process.env.BRUSHROUTER_NO_CUSTOM_RECIPES === "1") return [];
+  return [
+    { dir: join(getConfigDir(), "recipes"), trusted: true, optional: true },
+    ...(process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS || "").split(delimiter).map((dir) => dir.trim()).filter(Boolean)
+      .map((dir) => ({ dir, trusted: true })),
+    { dir: join(process.cwd(), ".brushrouter", "recipes"), trusted: false, optional: true },
+  ];
+}
+
+function isRecipeObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readCustomRecipes(dirs, slots, protectedIds) {
   const seenDirs = new Set();
   const customRecipes = [];
   const customCategories = new Map();
-  const protectedIds = new Set([...recipes, ...styles].map((r) => r.id));
-  const stringArray = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
-  for (const { dir, trusted } of customDirs) {
-    if (!dir || seenDirs.has(dir) || !existsSync(dir)) continue;
+  const files = [];
+  const safeSlot = (key) => /^\w+$/.test(key) && !Object.hasOwn(Object.prototype, key);
+  for (const { dir: source, trusted, optional } of dirs) {
+    const dir = resolve(source);
+    if (seenDirs.has(dir)) continue;
     seenDirs.add(dir);
-    let customFiles;
+    let names;
     try {
-      customFiles = readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "slots.json").sort();
-    } catch {
+      names = readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "slots.json").sort();
+    } catch (error) {
+      if (!optional || error.code !== "ENOENT") files.push({ file: dir, entries: 0, errors: [error.message] });
       continue;
     }
-    for (const file of customFiles) {
+    const ids = new Set();
+    for (const name of names) {
+      const file = join(dir, name);
+      const report = { file, entries: 0, errors: [] };
+      files.push(report);
+      const strings = (value, field) => {
+        if (value === undefined) return [];
+        if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+          report.errors.push(`${field}: expected an array of strings`);
+        }
+        return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+      };
       let data;
       try {
-        data = readJson(join(dir, file));
-      } catch (e) {
-        process.stderr.write(redact(`brushrouter: ignoring invalid custom recipe file ${join(dir, file)} (${safeParseMessage(e)})\n`));
+        if (!statSync(file).isFile()) throw new Error("expected a regular file");
+        data = readJson(file);
+      } catch (error) {
+        report.errors.push(safeParseMessage(error));
         continue;
       }
-      if (!data || typeof data !== "object" || Array.isArray(data)) continue;
-      // Support both category-bundle files ({ id, label, recipes: [...] }) and
-      // standalone single-recipe/look files ({ id, text, slots, ... }).
-      const isBundle = Array.isArray(data.recipes) || Array.isArray(data.styles);
-      const entries = isBundle ? (data.recipes || data.styles) : (data.id && typeof data.text === "string" ? [data] : []);
-      const bundleKind = data.kind === "look" || Array.isArray(data.styles) ? "look" : "job";
-      const bundleCatId = isBundle && data.id ? String(data.id) : null;
-      const bundleLabel = isBundle && data.label ? String(data.label) : null;
-      const bundleIntent = isBundle && data.intent ? String(data.intent) : "";
-      const bundleAliases = isBundle ? stringArray(data.aliases) : [];
-      for (const raw of entries) {
-        if (!raw || typeof raw !== "object" || !raw.id || typeof raw.text !== "string") continue;
-        const entryId = String(raw.id);
-        if (!trusted && protectedIds.has(entryId)) {
-          process.stderr.write(redact(`brushrouter: ignoring project-local override of built-in recipe "${entryId}" in ${join(dir, file)}\n`));
+      if (!isRecipeObject(data)) {
+        report.errors.push("expected a recipe or bundle object");
+        continue;
+      }
+      const fields = ["recipes", "styles"].filter((key) => Object.hasOwn(data, key));
+      if (fields.length > 1) report.errors.push("expected either recipes or styles, not both");
+      if (fields.length) {
+        for (const key of ["id", "kind", "label", "intent"]) {
+          if (data[key] !== undefined && typeof data[key] !== "string") report.errors.push(`${key}: expected a string`);
+        }
+        if (typeof data.kind === "string" && !["job", "look"].includes(data.kind)) report.errors.push("kind must be job or look");
+      }
+      const entries = fields.length ? fields.flatMap((key) => {
+        if (Array.isArray(data[key]) && data[key].length) {
+          return data[key].map((raw, i) => ({ raw, kind: key === "styles" ? "look" : "job", label: `${key}[${i}]` }));
+        }
+        report.errors.push(`${key}: expected a non-empty array`);
+        return [];
+      }) : [{ raw: data, kind: "job", label: "entry" }];
+      const bundleAliases = fields.length ? strings(data.aliases, "aliases") : [];
+      for (const { raw, kind, label } of entries) {
+        if (!isRecipeObject(raw) || typeof raw.id !== "string" || !raw.id.trim() || typeof raw.text !== "string" || !raw.text.trim()) {
+          report.errors.push(`${label}: expected non-empty string id and text`);
           continue;
         }
-        const entryKind = raw.kind === "look" ? "look" : bundleKind;
-        const catId = String(raw.category || bundleCatId || "custom");
-        const entrySlots = Array.isArray(raw.slots)
-          ? stringArray(raw.slots)
-          : [...new Set([...raw.text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]))];
-        const rawDefaults = raw.defaults && typeof raw.defaults === "object" && !Array.isArray(raw.defaults) ? raw.defaults : {};
-        const defaultValues = {};
-        for (const slot of entrySlots) {
-          const spec = slots[slot];
-          defaultValues[slot] = entryKind === "job" && spec?.options?.length ? rawDefaults[slot] ?? spec.options[0] : (rawDefaults[slot] ?? "");
+        const id = raw.id;
+        const issue = (message) => report.errors.push(`${label} "${id}": ${message}`);
+        if (!trusted && protectedIds.has(id)) {
+          issue("untrusted directory cannot override a built-in or trusted recipe");
+          continue;
         }
-        const entryAliases = [...bundleAliases, ...stringArray(raw.aliases)];
-        const aliasData = parseAliases(entryAliases);
+        if (ids.has(id)) issue("duplicate id in the same directory");
+        if (raw.kind !== undefined && !["job", "look"].includes(raw.kind)) issue("kind must be job or look");
+        for (const key of ["category", "goal", "when", "shape", "example"]) {
+          if (raw[key] !== undefined && typeof raw[key] !== "string") issue(`${key} must be a string`);
+        }
+        if (raw.source !== undefined && !isRecipeObject(raw.source)) issue("source must be an object");
+        const entryKind = raw.kind === "look" || data.kind === "look" ? "look" : kind;
+        const catId = typeof raw.category === "string" && raw.category ? raw.category
+          : fields.length && typeof data.id === "string" && data.id ? data.id : "custom";
+        const categoryLabel = fields.length && typeof data.label === "string" ? data.label : catId === "custom" ? "Custom recipes" : catId;
+        let image;
+        if (raw.image != null) {
+          if (!isRecipeObject(raw.image) || typeof raw.image.skeleton !== "string" || !raw.image.skeleton.trim()) {
+            issue("image.skeleton must be a non-empty string");
+          } else {
+            const preserve = strings(raw.image.preserve, `${label} image.preserve`);
+            const accepts = typeof raw.image.accepts === "string" ? raw.image.accepts : "";
+            if (!preserve.length || !accepts) issue("image needs accepts and preserve metadata");
+            image = { skeleton: raw.image.skeleton, accepts, preserve };
+          }
+        }
+        const used = [...new Set([raw.text, image?.skeleton || ""].flatMap((s) => [...s.matchAll(/\{(\w+)\}/g)].map((m) => m[1])))];
+        const entrySlots = (raw.slots === undefined ? used : strings(raw.slots, `${label} slots`)).filter((key) => {
+          if (safeSlot(key)) return true;
+          issue(`invalid slot "${key}"`);
+          return false;
+        });
+        for (const key of used) if (!entrySlots.includes(key)) issue(`placeholder {${key}} is not declared`);
+        for (const key of entrySlots) if (!used.includes(key)) issue(`slot "${key}" is never used`);
+        const defaults = {};
+        if (raw.defaults !== undefined && !isRecipeObject(raw.defaults)) issue("defaults must be an object");
+        for (const [key, value] of Object.entries(isRecipeObject(raw.defaults) ? raw.defaults : {})) {
+          if (!entrySlots.includes(key) || typeof value !== "string") issue(`default for "${key}" requires a declared slot and string value`);
+          else defaults[key] = value;
+        }
+        const defaultValues = Object.fromEntries(entrySlots.map((key) => [
+          key, defaults[key] ?? (entryKind === "job" ? slots[key]?.options?.[0] : undefined) ?? "",
+        ]));
+        const aliases = [...bundleAliases, ...strings(raw.aliases, `${label} aliases`)];
+        const goal = typeof raw.goal === "string" ? raw.goal : id;
         const normalized = {
+          id, kind: entryKind, category: catId, custom: true, goal, text: raw.text, slots: entrySlots, defaults, image,
+          when: typeof raw.when === "string" ? raw.when : goal,
           shape: typeof raw.shape === "string" ? raw.shape : "single",
-          goal: typeof raw.goal === "string" ? raw.goal : entryId,
-          when: typeof raw.when === "string" ? raw.when : (typeof raw.goal === "string" ? raw.goal : entryId),
-          ...raw,
-          id: entryId,
-          kind: entryKind,
-          category: catId,
-          slots: entrySlots,
-          defaults: rawDefaults,
-          ...(raw.styleLock !== undefined ? { styleLock: stringArray(raw.styleLock) } : {}),
-          ...(raw.doNotClone !== undefined ? { doNotClone: stringArray(raw.doNotClone) } : {}),
-          ...(raw.negative !== undefined ? { negative: stringArray(raw.negative) } : {}),
-          custom: true,
+          example: typeof raw.example === "string" ? raw.example : undefined,
+          source: isRecipeObject(raw.source) ? raw.source : undefined,
         };
-        let indexed;
+        for (const key of ["styleLock", "doNotClone", "negatives", "negative"]) {
+          if (raw[key] !== undefined) normalized[key] = strings(raw[key], `${label} ${key}`);
+        }
         try {
-          indexed = indexEntry(normalized, {
-            category: catId,
-            categoryLabel: bundleLabel || catId,
-            aliasData,
-            defaultValues,
-            allSlots: slots,
-          });
-        } catch (e) {
-          process.stderr.write(redact(`brushrouter: ignoring malformed custom recipe "${entryId}" in ${join(dir, file)} (${e.message})\n`));
+          customRecipes.push(indexEntry(normalized, { category: catId, categoryLabel, aliasData: parseAliases(aliases), defaultValues, allSlots: slots }));
+        } catch (error) {
+          issue(error.message);
           continue;
         }
-        customRecipes.push({ ...indexed, kind: entryKind, custom: true });
-        if (trusted) protectedIds.add(entryId);
+        report.entries++;
+        ids.add(id);
+        if (trusted) protectedIds.add(id);
         if (!customCategories.has(catId)) {
           customCategories.set(catId, {
-            id: catId,
-            kind: entryKind,
-            label: bundleLabel || (catId === "custom" ? "Custom recipes" : catId),
-            intent: bundleIntent || "User and project custom recipes and brand looks.",
-            aliases: entryAliases,
+            id: catId, kind: entryKind, label: categoryLabel, aliases,
+            intent: fields.length && typeof data.intent === "string" ? data.intent : "User and project custom recipes and brand looks.",
             recipes: [],
           });
         }
-        const cObj = customCategories.get(catId);
-        if (!cObj.recipes.includes(indexed.id)) cObj.recipes.push(indexed.id);
+        const category = customCategories.get(catId);
+        if (!category.recipes.includes(id)) category.recipes.push(id);
       }
     }
+  }
+  return { customRecipes, customCategories, files };
+}
+
+function scanCustomRecipes(dirs, { slots, recipes, styles }, preceding = []) {
+  const protectedIds = new Set([...recipes, ...styles].map((r) => r.id));
+  if (preceding.length) readCustomRecipes(preceding, slots, protectedIds);
+  return readCustomRecipes(dirs, slots, protectedIds);
+}
+
+export function validateCustomRecipes(paths = []) {
+  const configured = customRecipeDirs();
+  const dirs = paths.length ? paths.map((dir) => ({
+    dir, trusted: configured.some((entry) => entry.trusted && resolve(entry.dir) === resolve(dir)),
+  })) : configured;
+  const { files } = scanCustomRecipes(dirs, loadBuiltInRecipes(), paths.length ? configured.filter((entry) => entry.trusted) : []);
+  return { ok: files.every((file) => !file.errors.length), directories: dirs.map(({ dir }) => resolve(dir)), files };
+}
+
+let cache = null;
+
+export function loadRecipes() {
+  if (cache) return cache;
+  const builtIn = loadBuiltInRecipes();
+  const { slotsFile, slots, categories, recipes, styles, stylesFile } = builtIn;
+  const freeSlots = Object.entries(slots).filter(([, s]) => s.free).map(([k]) => k);
+  const { customRecipes, customCategories, files } = scanCustomRecipes(customRecipeDirs(), builtIn);
+  const customWarnings = files.flatMap(({ file, errors }) => errors.map((message) => ({ file, message })));
+  for (const { file, message } of customWarnings) {
+    process.stderr.write(redact(`brushrouter: custom recipe ${file}: ${message}\n`));
   }
 
   // Merge custom recipes on top of built-ins (same id overrides built-in).
@@ -599,6 +665,7 @@ export function loadRecipes() {
     },
     listCategories: precomputedListCategories,
     styleSource: stylesFile?.source || null,
+    customWarnings,
     categoryById,
     recipeById,
   };

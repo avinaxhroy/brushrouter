@@ -52,7 +52,7 @@ export function listProviderIds() {
   return Object.keys(PROVIDERS);
 }
 
-export async function probeAll(cfg) {
+export async function probeAll(cfg, { skipDisabled = false } = {}) {
   // Probes are independent — each spawns a process or makes a request of its
   // own — so running them together costs the slowest probe instead of the sum.
   // `Promise.all` preserves this order, which callers (doctor, routes) display.
@@ -62,7 +62,9 @@ export async function probeAll(cfg) {
       const pcfg = providerConfig(cfg, id);
       let status;
       try {
-        status = await p.probe(pcfg);
+        status = skipDisabled && pcfg.enabled === false
+          ? { available: false, auth: "disabled" }
+          : await p.probe(pcfg);
       } catch (e) {
         status = { available: false, auth: "error", detail: e.message };
       }

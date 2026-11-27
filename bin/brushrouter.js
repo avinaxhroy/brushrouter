@@ -18,7 +18,7 @@
 
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, statSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, statSync, writeSync, lstatSync, chmodSync, copyFileSync, constants, mkdtempSync, renameSync, rmSync } from "node:fs";
 import { resolve, join, dirname, extname, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -45,7 +45,7 @@ import { saveImage, detectImageMime, assertImageFile, batchItemPath, pngSize } f
 import { redact, redactValue, registerSecret } from "../src/util/redact.js";
 import { discoverKey, saveKey, describeKey } from "../src/util/keys.js";
 import { findCodexCli, findGoogleClis, isOnPath } from "../src/util/discover.js";
-import { findRecipes, renderResult, listCategories, publicRecipe, composePrompt, resolveBatchItem, expandBrainstormBatch, MODES, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
+import { findRecipes, renderResult, listCategories, publicRecipe, composePrompt, resolveBatchItem, expandBrainstormBatch, MODES, RECIPES_DIR, STYLES_FILE, recipeCounts, validateCustomRecipes } from "../src/library.js";
 import { getKnownAgentConfigs, detectInstalledAgents, getBrushrouterMcpEntry, installMcpToAgent } from "../src/util/mcp-install.js";
 import { detectRuleFiles, injectRuleToFile } from "../src/util/rules.js";
 // NOTE: ../src/mcp.js is imported dynamically in the `serve` case below. A static
@@ -53,6 +53,8 @@ import { detectRuleFiles, injectRuleToFile } from "../src/util/rules.js";
 // every command, including `--help`.
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const NPM_LINK_TIMEOUT_MS = 60000;
+const REPAIRED_USER_CONFIG = { providers: { fal: { enabled: false } } };
 // Fails loudly: a corrupted package.json is a broken install, not a soft error.
 const PKG = (() => {
   try {
@@ -174,6 +176,8 @@ function parse(argv) {
         "dry-run": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
         yes: { type: "boolean", short: "y", default: false },
+        "non-interactive": { type: "boolean", default: false },
+        fix: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         verbose: { type: "boolean", short: "v", default: false },
         category: { type: "string", short: "c" },
@@ -283,7 +287,7 @@ ${paint(C.bold, "USAGE")}
   brushrouter <command> [options]
 
 ${paint(C.bold, "COMMANDS")}
-  setup                    Auto-connect: detect what's here, ask only if needed
+  setup                    Auto-connect; exits nonzero if no provider is usable
   login                    Sign in to ChatGPT for the codex route (browser OAuth,
                            no API key — nothing else needs to be installed)
   vendor gptweb2api        Install the browserless ChatGPT-web gateway binary
@@ -296,9 +300,10 @@ ${paint(C.bold, "COMMANDS")}
   stats                    Provider latency, success-rate, and spend/usage stats
   providers                List providers + connection status
   routes [enable|disable]  Show or toggle which routes auto-routing may use
-  doctor                   Diagnose every provider's connectivity
-  models [provider]        List available models (live, when the provider can)
+  doctor [--fix]           Diagnose enabled providers; optional local config fixes
+  models [provider...]     List available models (live, when the provider can)
   prompts [query]          Find a prompt recipe or a look to build an image from
+  recipes validate [dir...]  Check custom recipe/looks JSON (defaults to configured dirs)
   init [--force]           Write a starter config to ${dim(getUserConfigPath())}
   install [--dry-run]      Add brushrouter to detected agent MCP configs
   rules [--dry-run]        Inject or update clean brushrouter guidance in AI coding
@@ -319,6 +324,9 @@ ${paint(C.bold, "OPTIONS")}
       --images <path>      Reference image (repeatable; image-to-image)
       --mask <path>        Inpaint the first reference image (requires --images)
       --json               Machine-readable output
+      --non-interactive    setup: never prompt (also automatic with CI or no TTY)
+  -y, --yes                setup: never prompt; allow MCP and rules changes
+      --fix                doctor: repair local user config only; no login or installs
   -c, --category <id>      Recipes: restrict to one category
       --kind <k>           Recipes: job (a layout we wrote, ${LIB_COUNTS.job}) | look
                            (a vendored visual system, ${LIB_COUNTS.look}). Omit for both
@@ -346,7 +354,7 @@ ${paint(C.bold, "OPTIONS")}
       --before <days>      history prune: remove entries older than N days (e.g. 30d)
       --no-images          replay: drop original reference images and mask
       --dry-run            gen: show the route it would take, send nothing.
-                           routes/install: show what would change, apply nothing
+                           routes/install/setup/update/doctor --fix: plan only
       --force              gen: overwrite -o instead of saving a new version.
                            init: overwrite an existing config
   -v, --verbose            Show routing decisions
@@ -1690,43 +1698,120 @@ async function cmdProviders(args) {
   console.log(dim(`\nAuto-routing order: ${cfg.priority.join(" → ")}`));
 }
 
-async function cmdDoctor(args) {
-  const cwd = process.cwd();
-  // Resolved at use time, not module scope: BRUSHROUTER_USER_CONFIG /
-  // BRUSHROUTER_CONFIG_DIR may be set after import, and the frozen constants
-  // src/config.js still exports would miss them.
-  const userCfgPath = getUserConfigPath();
-  const cfg = loadConfig({ cwd });
-  const rows = await probeAll(cfg);
-  const installedAgents = detectInstalledAgents().filter((a) => a.isInstalled);
-  if (args.values.json) {
-    console.log(
-      JSON.stringify(
-        redactValue({
-          config: { user: userCfgPath, exists: existsSync(userCfgPath) },
-          providers: rows,
-          agents: installedAgents,
-        }),
-        null,
-        2
-      )
-    );
-    return;
+function writeJson(value) {
+  console.log(JSON.stringify(redactValue(value), null, 2));
+}
+
+function pathInfo(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return null;
   }
+}
+
+function repairUserConfig(dry) {
+  const fixes = [];
+  const dir = getConfigDir();
+  const file = getUserConfigPath();
+  const safe = (info, type) => info[type]() && (!process.getuid || info.uid === process.getuid()) && (type !== "isFile" || info.nlink === 1);
+  const apply = (action, path, change) => {
+    const result = { action, path, status: dry ? "planned" : "applied" };
+    fixes.push(result);
+    if (!dry) {
+      try {
+        change(result);
+      } catch (error) {
+        Object.assign(result, { status: "error", error: error.message });
+      }
+    }
+  };
+  try {
+    const info = pathInfo(dir);
+    if (!info) apply("create-directory", dir, () => mkdirSync(dir, { recursive: true, mode: 0o700 }));
+    else if (!safe(info, "isDirectory")) throw new Error(`not an owned directory: ${dir}`);
+    else if (process.platform !== "win32" && (info.mode & 0o777) !== 0o700) {
+      apply("secure-directory", dir, () => chmodSync(dir, 0o700));
+    }
+    const configInfo = pathInfo(file);
+    if (!configInfo) {
+      apply("create-config", file, () => {
+        mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+        writeFileSync(file, "{}\n", { mode: 0o600, flag: "wx" });
+      });
+    } else {
+      if (!safe(configInfo, "isFile")) throw new Error(`not an owned regular file: ${file}`);
+      const source = readFileSync(file, "utf8");
+      let valid;
+      try {
+        const parsed = JSON.parse(source);
+        valid = parsed && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        valid = false;
+      }
+      if (!valid) {
+        apply("repair-config", file, (result) => {
+          const backupDir = mkdtempSync(`${file}.backup-`);
+          const backup = join(backupDir, "config.json");
+          copyFileSync(file, backup, constants.COPYFILE_EXCL);
+          result.backup = backup;
+          const replacement = join(backupDir, "replacement.json");
+          try {
+            writeFileSync(replacement, JSON.stringify(REPAIRED_USER_CONFIG, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+            renameSync(replacement, file);
+          } finally {
+            rmSync(replacement, { force: true });
+          }
+        });
+      } else if (process.platform !== "win32" && (configInfo.mode & 0o777) !== 0o600) {
+        apply("secure-config", file, () => chmodSync(file, 0o600));
+      }
+    }
+  } catch (error) {
+    fixes.push({ action: "inspect-config", path: file, status: "error", error: error.message });
+  }
+  return fixes;
+}
+
+async function diagnose({ fix = false, dry = false } = {}) {
+  const user = getUserConfigPath();
+  const fixes = fix ? repairUserConfig(dry) : [];
+  const result = { ok: false, ready: 0, config: { user, exists: existsSync(user) }, providers: [], agents: [], fixes };
+  try {
+    const repairedInPlan = fixes.some((item) => item.action === "repair-config" && item.status === "planned");
+    const cfg = loadConfig({ userConfig: repairedInPlan ? REPAIRED_USER_CONFIG : null });
+    result.providers = (await probeAll(cfg, { skipDisabled: true })).map((row) => ({
+      ...row,
+      verification: row.available ? row.verification || "configured" : null,
+    }));
+    result.agents = detectInstalledAgents().filter((a) => a.isInstalled);
+    result.ready = result.providers.filter((row) => row.enabled && row.available).length;
+    result.ok = result.ready > 0 && !fixes.some((item) => item.status === "error");
+  } catch (error) {
+    result.error = error.message;
+  }
+  return result;
+}
+
+function renderDoctor(result) {
+  const { providers: rows, agents: installedAgents, ready, fixes, config, error } = result;
   console.log(paint(C.bold, "brushrouter doctor\n"));
-  let usable = 0;
+  for (const fix of fixes) {
+    console.log(redact(`  ${fix.status}: ${fix.action} ${fix.path}${fix.backup ? ` (backup: ${fix.backup})` : ""}${fix.error ? ` — ${fix.error}` : ""}`));
+  }
+  if (error) return console.error(bad(redact(error)));
   for (const r of rows) {
     const mark = !r.enabled ? warn("○") : r.available ? ok("●") : bad("○");
     console.log(`${mark} ${paint(C.bold, r.id)} ${dim(`(${r.kind})`)}`);
     console.log(`    ${r.label}`);
-    console.log(`    status: ${r.available ? ok("ready") : r.enabled ? bad(r.auth || "unavailable") : warn("disabled")}`);
+    console.log(`    status: ${r.available ? ok(r.verification === "verified" ? "verified" : "configured (not verified)") : r.enabled ? bad(r.auth || "unavailable") : warn("disabled")}`);
     if (r.detail) console.log(`    ${dim(redact(r.detail))}`);
     if (r.expires) console.log(`    token expires: ${dim(r.expires)}`);
     if (r.note) console.log(`    ${dim("note: " + r.note)}`);
     console.log("");
-    if (r.available && r.enabled) usable++;
   }
-  console.log(usable > 0 ? ok(`\n${usable} provider(s) ready.`) : bad("\nNo providers ready — run `brushrouter setup` to connect one."));
+  console.log(ready > 0 ? ok(`\n${ready} provider(s) available.`) : bad("\nNo providers ready — run `brushrouter setup` to connect one."));
 
   if (installedAgents.length > 0) {
     console.log(paint(C.bold, "\nMCP Agent Integrations:"));
@@ -1737,14 +1822,20 @@ async function cmdDoctor(args) {
     }
   }
 
-  if (!existsSync(getUserConfigPath())) {
+  if (!config.exists) {
     console.log(dim(`\nTip: run \`brushrouter setup\` to configure your environment and agents.`));
   }
 }
 
+async function cmdDoctor({ values }) {
+  const result = await diagnose({ fix: values.fix, dry: values["dry-run"] });
+  if (values.json) writeJson(result);
+  else renderDoctor(result);
+  if (!result.ok) return exitAfterFlush(1);
+}
+
 async function cmdModels(args) {
-  const cfg = loadConfig({ cwd: process.cwd() });
-  const only = args.positionals?.[0] || null;
+  const { json } = args.values;
   // Static knowledge — what each provider can do even with no network.
   const known = {
     "codex-cli": ["(auto — the bundled Codex CLI picks its own default)", "gpt-image-1", "gpt-image-1.5", "gpt-image-2"],
@@ -1766,36 +1857,75 @@ async function cmdModels(args) {
     comfyui: ["flux1-schnell.safetensors"],
     "custom-http": ["(from your config)"],
   };
-  // OpenRouter is the one provider with a live catalogue — fetch it so the user
-  // sees exactly what THEIR key can reach (image-only models included).
-  let live = null;
-  if (!only || only === "openrouter") {
-    try {
+  const ids = args.positionals.length ? [...new Set(args.positionals)] : Object.keys(known);
+  const unknown = ids.filter((id) => !Object.hasOwn(known, id));
+  if (unknown.length) {
+    const message = `Unknown provider(s): ${unknown.join(", ")}. Known providers: ${Object.keys(known).join(", ")}`;
+    if (json) writeJson({ error: { code: "unknown-provider", message } });
+    else console.error(bad(redact(message)));
+    return exitAfterFlush(2);
+  }
+  let cfg;
+  try {
+    cfg = loadConfig({ cwd: process.cwd() });
+  } catch (error) {
+    if (json) writeJson({ error: { code: "config", message: error.message } });
+    else console.error(bad(redact(error.message)));
+    return exitAfterFlush(1);
+  }
+  const out = {};
+  for (const id of ids) {
+    const provider = cfg.providers?.[id];
+    const entry = out[id] = { configured: provider?.model || null, models: known[id] };
+    if (id === "openrouter") {
       const { openrouterListModels } = await import("../src/providers/http.js");
-      live = await openrouterListModels(cfg.providers?.openrouter || {});
-    } catch {
-      live = null;
+      const { models, error, warnings } = await openrouterListModels(provider || {});
+      entry.models = models.map((m) => m.id);
+      if (models.length) entry.endpoints = Object.fromEntries(models.map((m) => [m.id, m.endpoint]));
+      if (error) entry.error = error;
+      if (warnings?.length) entry.warnings = warnings;
     }
   }
-  if (live?.length) known.openrouter = live.map((m) => `${m.id}${dim(`  [${m.endpoint}]`)}`);
-  else if (!only || only === "openrouter") known.openrouter = ["(could not list — run `brushrouter doctor` to check the key)"];
+  if (json) writeJson(out);
+  else {
+    console.log(paint(C.bold, "Models per provider") + "\n");
+    for (const [id, entry] of Object.entries(out)) {
+      const { configured, models, endpoints, error, warnings } = entry;
+      const enabled = cfg.providers?.[id]?.enabled !== false;
+      console.log(`${paint(C.bold, id)}${enabled ? "" : warn(" (disabled)")}${configured ? dim(`  (pinned: ${redact(configured)})`) : ""}`);
+      for (const m of models) console.log(`  ${redact(m)}${endpoints?.[m] ? dim(`  [${endpoints[m]}]`) : ""}`);
+      if (error) console.error(bad(redact(`  ${error.message}`)));
+      for (const warning of warnings || []) console.error(warn(redact(`  ${warning.message}`)));
+      console.log("");
+    }
+    if (!args.positionals.length) console.log(dim("Pin one with: brushrouter gen \"...\" -p openrouter -m <model-id>"));
+  }
+  if (Object.values(out).every((entry) => entry.error)) return exitAfterFlush(1);
+}
 
-  const entries = Object.entries(known).filter(([id]) => !only || id === only);
-  if (args.values.json) {
-    const out = {};
-    for (const [id, list] of entries) out[id] = { configured: cfg.providers?.[id]?.model || null, models: list.map((s) => String(s).replace(/\u001b\[[0-9;]*m/g, "")) };
-    console.log(JSON.stringify(out, null, 2));
-    return;
+function cmdRecipes({ values, positionals }) {
+  const [action, ...dirs] = positionals;
+  if (action !== "validate") {
+    const message = "usage: brushrouter recipes validate [dir...] [--json]";
+    if (values.json) writeJson({ ok: false, error: message });
+    else console.error(message);
+    return exitAfterFlush(2);
   }
-  console.log(paint(C.bold, "Models per provider") + dim(only ? ` (${only})` : "") + "\n");
-  for (const [id, list] of entries) {
-    const cur = cfg.providers?.[id]?.model;
-    const enabled = cfg.providers?.[id]?.enabled !== false;
-    console.log(`${paint(C.bold, id)}${enabled ? "" : warn(" (disabled)")}${cur ? dim(`  (pinned: ${cur})`) : ""}`);
-    for (const m of list) console.log(`  ${m}`);
-    console.log("");
+  let result;
+  try {
+    result = validateCustomRecipes(dirs);
+  } catch (error) {
+    result = { ok: false, files: [], error: error.message };
   }
-  if (!only) console.log(dim("Pin one with: brushrouter gen \"...\" -p openrouter -m <model-id>"));
+  if (values.json) writeJson(result);
+  else {
+    if (result.error) console.error(bad(redact(result.error)));
+    for (const { file, errors } of result.files) {
+      for (const error of errors) console.error(bad(redact(`${file}: ${error}`)));
+    }
+    if (result.ok) console.log(`Validated ${result.files.length} custom recipe file(s).`);
+  }
+  if (!result.ok) return exitAfterFlush(1);
 }
 
 // Prompt recipes: search brushrouter's own recipe library. Same engine the MCP
@@ -2129,64 +2259,67 @@ async function cmdRules(args) {
   }
 }
 
-async function cmdUpdate(args) {
-  console.log(paint(C.bold, `brushrouter update (current version: v${PKG.version})\n`));
+function commandFailure(command, result) {
+  const detail = result.error?.message || (result.stderr || result.stdout || "").trim() || `exit ${result.status ?? result.signal ?? "unknown"}`;
+  return `${command} failed: ${detail}`;
+}
+
+async function cmdUpdate({ values }) {
+  const dry = values["dry-run"];
   const isGit = existsSync(join(PACKAGE_ROOT, ".git"));
-  let failed = false;
-
-  const dry = args.values["dry-run"];
-  if (dry) {
-    if (isGit) {
-      console.log(`Dry run: would run 'git pull --rebase' in ${PACKAGE_ROOT}`);
-    } else {
-      console.log("Dry run: would run 'npm install -g brushrouter@latest'");
+  const steps = isGit ? [
+    { command: "git", args: ["pull", "--rebase", "--no-edit"], timeout: 30000 },
+    { command: "npm", args: ["link"], timeout: NPM_LINK_TIMEOUT_MS },
+  ] : [
+    { command: "npm", args: ["install", "-g", "brushrouter@latest"], timeout: 60000 },
+  ];
+  const result = { ok: true, dryRun: dry, method: isGit ? "git" : "npm", previousVersion: PKG.version, version: PKG.version, steps: [], doctor: null };
+  if (!values.json) console.log(paint(C.bold, `brushrouter update (current version: v${PKG.version})\n`));
+  for (const { command, args, timeout } of steps) {
+    const display = [command, ...args].join(" ");
+    const step = { command, args, status: dry ? "planned" : "applied" };
+    result.steps.push(step);
+    if (dry) {
+      if (!values.json) console.log(`Dry run: would run '${display}'${isGit ? ` in ${PACKAGE_ROOT}` : ""}`);
+      continue;
     }
-    return;
-  }
-
-  if (isGit) {
-    console.log(`Checking for updates via git (${dim(PACKAGE_ROOT)})...`);
-    const pullRes = spawnSync("git", ["pull", "--rebase"], {
+    const child = spawnSync(command, args, {
       cwd: PACKAGE_ROOT,
       encoding: "utf8",
-      timeout: 30000,
+      timeout,
+      killSignal: "SIGKILL",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ...(command === "git" ? { GIT_TERMINAL_PROMPT: "0", GIT_EDITOR: "true", GIT_SEQUENCE_EDITOR: "true" } : {}),
+      },
     });
-    if (pullRes.status === 0) {
-      const out = (pullRes.stdout || "").trim();
-      console.log(out.includes("Already up to date") ? dim(`  ${out}`) : ok(`  ${out}`));
-    } else {
-      console.error(bad(`  git pull failed: ${(pullRes.stderr || pullRes.stdout || "").trim()}`));
-      failed = true;
+    if (child.status !== 0) {
+      const error = commandFailure(isGit ? `${command} ${args[0]}` : "npm install", child);
+      Object.assign(step, { status: "error", error });
+      result.ok = false;
+      if (!isGit) result.recovery = ["npm install -g brushrouter@latest", `curl -fsSL ${installScriptUrl()} | bash`];
+      if (!values.json) {
+        console.error(bad(redact(`  ${error}`)));
+        for (const hint of result.recovery || []) console.log(dim(`  To update manually: ${hint}`));
+      }
+      break;
     }
-
+    if (!values.json) console.log(ok(redact(`  ${(child.stdout || "").trim() || `${display} completed`}`)));
+  }
+  if (result.ok && !dry) {
     try {
-      spawnSync("npm", ["link"], { cwd: PACKAGE_ROOT, stdio: "ignore" });
+      result.version = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")).version;
     } catch {}
-  } else {
-    console.log("Checking for updates via npm global...");
-    const npmRes = spawnSync("npm", ["install", "-g", "brushrouter@latest"], {
-      encoding: "utf8",
-      timeout: 60000,
-    });
-    if (npmRes.status === 0) {
-      console.log(ok("  Updated brushrouter via npm install -g brushrouter@latest"));
-    } else {
-      // A failed update must not exit 0: scripts and wrappers read the status.
-      failed = true;
-      console.error(bad(`  npm install failed${(npmRes.stderr || npmRes.stdout || "").trim() ? `: ${(npmRes.stderr || npmRes.stdout).trim()}` : ` (exit ${npmRes.status ?? "unknown"})`}`));
-      console.log(dim("  To update manually, run: npm install -g brushrouter@latest"));
-      console.log(dim(`  Or re-run the one-liner: curl -fsSL ${installScriptUrl()} | bash`));
+    result.doctor = await diagnose();
+    if (!values.json) {
+      console.log(`\n${ok("✓")} Current version: ${paint(C.bold, `v${result.version}`)}`);
+      console.log("\nVerifying providers and routing after update:");
+      renderDoctor(result.doctor);
     }
   }
-
-  try {
-    const updatedPkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8"));
-    console.log(`\n${ok("✓")} Current version: ${paint(C.bold, `v${updatedPkg.version}`)}`);
-  } catch {}
-
-  console.log("\nVerifying providers and routing after update:");
-  await cmdDoctor({ values: { json: false } });
-  if (failed) return exitAfterFlush(1);
+  if (values.json) writeJson(result);
+  if (!result.ok) return exitAfterFlush(1);
 }
 
 function cmdInit(args) {
@@ -2221,7 +2354,7 @@ function cmdInit(args) {
 //   * Only prompt for a credential when nothing usable was found, the input is
 //     hidden, and it is stored 0600 — never echoed, never logged.
 //   * In a non-interactive context (no TTY, or --yes) we NEVER block: we print
-//     exactly what to set and exit 0.
+//     exactly what to set when no provider is usable.
 // ---------------------------------------------------------------------------
 
 // A free ChatGPT plan can only generate through the gptweb2api web-bucket
@@ -2352,13 +2485,27 @@ function prompt(question, { hidden = false } = {}) {
 
 async function cmdSetup(args) {
   const cwd = process.cwd();
-  let cfg = loadConfig({ cwd });
-  const interactive = process.stdin.isTTY && process.stdout.isTTY && !args.values.yes;
+  const { json, yes } = args.values;
   const dry = args.values["dry-run"];
+  const interactive = process.stdin.isTTY && process.stdout.isTTY && /^(?:false|0)?$/i.test(process.env.CI || "")
+    && !args.values["non-interactive"] && !yes && !dry && !json;
+  const messages = [];
+  const log = json ? (message) => messages.push(String(message).replace(/\x1b\[[0-9;]*m/g, "")) : console.log;
+  const finish = (result) => {
+    if (json) writeJson({ ...result, dryRun: dry, interactive: Boolean(interactive), messages });
+    return exitAfterFlush(result.ok ? 0 : 1);
+  };
+  let cfg;
+  try {
+    cfg = loadConfig({ cwd });
+  } catch (error) {
+    if (!json) console.error(bad(redact(error.message)));
+    return finish({ ok: false, error: error.message });
+  }
   const skipMcp = args.values["skip-mcp"];
   const skipTest = args.values["skip-test"];
 
-  console.log(paint(C.bold, "brushrouter setup — auto-connect backends & AI agent MCP wiring\n"));
+  log(paint(C.bold, "brushrouter setup — auto-connect backends & AI agent MCP wiring\n"));
 
   // Ensure the user config directory exists with safe permissions. Resolved at
   // use time so BRUSHROUTER_CONFIG_DIR is honoured, and skipped on --dry-run
@@ -2370,149 +2517,136 @@ async function cmdSetup(args) {
   }
 
   // ---- Phase 1: Probe image generation capability ----
-  console.log(paint(C.bold, "1. Checking image generation backends..."));
+  log(paint(C.bold, "1. Checking image generation backends..."));
 
   let probes = await probeAll(cfg);
   let ready = probes.filter((p) => p.available && p.enabled);
 
   for (const p of probes) {
     if (p.available && p.enabled) {
-      console.log(`  ${ok("✓")} ${paint(C.bold, p.id.padEnd(14))} — ${p.label} ${dim(`(${p.kind})`)}`);
-      if (p.detail) console.log(`      ${dim(redact(p.detail))}`);
+      log(`  ${ok("✓")} ${paint(C.bold, p.id.padEnd(14))} — ${p.label} ${dim(`(${p.kind})`)}`);
+      if (p.detail) log(`      ${dim(redact(p.detail))}`);
     } else if (p.available && !p.enabled) {
-      console.log(`  ${warn("○")} ${paint(C.bold, p.id.padEnd(14))} — ${p.label} ${warn("(disabled in routes)")}`);
+      log(`  ${warn("○")} ${paint(C.bold, p.id.padEnd(14))} — ${p.label} ${warn("(disabled in routes)")}`);
     }
   }
 
   if (ready.length > 0) {
-    console.log(ok(`\n  ${ready.length} backend(s) ready to generate images immediately!`));
+    log(ok(`\n  ${ready.length} backend(s) ready to generate images immediately!`));
   } else {
-    console.log(warn("\n  No image generation backends detected yet."));
+    log(warn("\n  No image generation backends detected yet."));
   }
 
   // ---- Phase 2: Onboard missing credentials if needed ----
   if (ready.length === 0) {
     if (!interactive) {
-      console.log(dim("\nNon-interactive session. To enable image generation:"));
-      console.log(dim("  1. Sign in with ChatGPT:       brushrouter login"));
-      console.log(dim("  2. Or set OpenRouter API key:  export BRUSHROUTER_OPENROUTER_KEY=sk-or-..."));
-      console.log(dim("  3. Or set fal.ai API key:      export BRUSHROUTER_FAL_KEY=..."));
-      console.log(dim("  4. Or run 'brushrouter setup' interactively in a terminal."));
+      log(dim(dry ? "\nDry run: would offer sign-in or API key setup in an interactive terminal." : "\nNon-interactive session. To enable image generation:"));
+      log(dim("  1. Sign in with ChatGPT:       brushrouter login"));
+      log(dim("  2. Or set OpenRouter API key:  export BRUSHROUTER_OPENROUTER_KEY=sk-or-..."));
+      log(dim("  3. Or set fal.ai API key:      export BRUSHROUTER_FAL_KEY=..."));
+      log(dim("  4. Or run 'brushrouter setup' interactively in a terminal."));
     } else {
-      console.log(dim("\nLet's connect your first backend (pick any):"));
-      console.log(`  ${paint(C.bold, "1)")} Sign in with ChatGPT ${ok("[Recommended]")} — browser login (no API key needed)`);
-      console.log(`  ${paint(C.bold, "2)")} Add an OpenRouter API key — access to FLUX, Gemini, Recraft, SD`);
-      console.log(`  ${paint(C.bold, "3)")} Add a fal.ai API key — fast hosted FLUX and SD models`);
-      console.log(`  ${paint(C.bold, "4)")} Skip for now (configure later)`);
+      log(dim("\nLet's connect your first backend (pick any):"));
+      log(`  ${paint(C.bold, "1)")} Sign in with ChatGPT ${ok("[Recommended]")} — browser login (no API key needed)`);
+      log(`  ${paint(C.bold, "2)")} Add an OpenRouter API key — access to FLUX, Gemini, Recraft, SD`);
+      log(`  ${paint(C.bold, "3)")} Add a fal.ai API key — fast hosted FLUX and SD models`);
+      log(`  ${paint(C.bold, "4)")} Skip for now (configure later)`);
 
       const choice = await prompt("\nSelect [1-4] (default 1): ");
       const picked = choice.trim() === "" ? "1" : choice.trim();
 
       if (picked === "1") {
-        if (dry) {
-          // --dry-run promises "apply nothing". Phase 2 used to ignore the flag
-          // entirely and run a real OAuth login (writing auth.json), save real
-          // keys and flip real route flags — a dry run that mutated the machine.
-          console.log(warn("\nDry run: would sign in to ChatGPT via browser OAuth"));
-          console.log(dim(`  credentials would be written to ${join(getConfigDir(), "auth.json")} (mode 0600)`));
-        } else {
-          console.log(dim("\nOpening browser for ChatGPT OAuth sign-in..."));
-          // Resolved here, not at module scope: BRUSHROUTER_* may point elsewhere.
-          const { runLogin } = await import("../src/oauth.js");
-          try {
-            const { path, plan, accountId } = await runLogin({
-              configDir: getConfigDir(),
-              log: (l) => console.log(dim(l)),
-            });
-            console.log(ok(`\n✓ Logged into ChatGPT (plan: ${plan || "active"}, account: ${accountId})`));
-            console.log(dim(`  Credentials saved to ${path} (mode 0600)`));
-            const freeNote = applyFreePlanRouting(plan);
-            if (freeNote) console.log(ok(`✓ ${freeNote}`));
-            cfg = loadConfig({ cwd });
-            probes = await probeAll(cfg);
-            ready = probes.filter((p) => p.available && p.enabled);
-          } catch (e) {
-            console.log(bad(`\nLogin failed: ${redact(e.message)}`));
-            console.log(dim("You can retry anytime with: brushrouter login"));
-          }
+        log(dim("\nOpening browser for ChatGPT OAuth sign-in..."));
+        // Resolved here, not at module scope: BRUSHROUTER_* may point elsewhere.
+        const { runLogin } = await import("../src/oauth.js");
+        try {
+          const { path, plan, accountId } = await runLogin({
+            configDir: getConfigDir(),
+            log: (l) => log(dim(l)),
+          });
+          log(ok(`\n✓ Logged into ChatGPT (plan: ${plan || "active"}, account: ${accountId})`));
+          log(dim(`  Credentials saved to ${path} (mode 0600)`));
+          const freeNote = applyFreePlanRouting(plan);
+          if (freeNote) log(ok(`✓ ${freeNote}`));
+          cfg = loadConfig({ cwd });
+          probes = await probeAll(cfg);
+          ready = probes.filter((p) => p.available && p.enabled);
+        } catch (e) {
+          log(bad(`\nLogin failed: ${redact(e.message)}`));
+          log(dim("You can retry anytime with: brushrouter login"));
         }
       } else if (picked === "2" || picked === "3") {
         const provider = picked === "2" ? "openrouter" : "fal";
         const label = picked === "2" ? "OpenRouter" : "fal.ai";
         const key = await prompt(`Paste your ${label} key (input hidden): `, { hidden: true });
         if (key) {
-          if (dry) {
-            console.log(warn(`\nDry run: would save the ${label} key`));
-            console.log(dim(`  key would be written to ${getKeysPath()} (mode 0600)`));
-            console.log(dim(`  route '${provider}' would be enabled for auto-routing`));
-          } else {
-            try {
-              const path = saveKey(provider, key);
-              setRouteEnabled(provider, true);
-              console.log(ok(`✓ Saved ${label} key to ${path} (mode 0600)`));
-              console.log(ok(`✓ ${provider} enabled for auto-routing`));
-              cfg = loadConfig({ cwd });
-              probes = await probeAll(cfg);
-              ready = probes.filter((p) => p.available && p.enabled);
-            } catch (e) {
-              console.log(bad(`Failed to store key: ${redact(e.message)}`));
-            }
+          try {
+            const path = saveKey(provider, key);
+            setRouteEnabled(provider, true);
+            log(ok(`✓ Saved ${label} key to ${path} (mode 0600)`));
+            log(ok(`✓ ${provider} enabled for auto-routing`));
+            cfg = loadConfig({ cwd });
+            probes = await probeAll(cfg);
+            ready = probes.filter((p) => p.available && p.enabled);
+          } catch (e) {
+            log(bad(`Failed to store key: ${redact(e.message)}`));
           }
         }
       } else {
-        console.log(dim("Skipped provider setup for now."));
+        log(dim("Skipped provider setup for now."));
       }
     }
   }
 
   // ---- Phase 3: Check CLI / PATH availability ----
-  console.log(paint(C.bold, "\n2. Checking CLI availability in PATH..."));
+  log(paint(C.bold, "\n2. Checking CLI availability in PATH..."));
   const onPath = isOnPath("brushrouter");
   if (onPath) {
-    console.log(`  ${ok("✓")} 'brushrouter' (and shorthand 'br') command available on your PATH`);
+    log(`  ${ok("✓")} 'brushrouter' (and shorthand 'br') command available on your PATH`);
   } else {
-    console.log(`  ${warn("○")} 'brushrouter' is not currently in your PATH`);
+    log(`  ${warn("○")} 'brushrouter' is not currently in your PATH`);
     const inPackage = existsSync(join(cwd, "package.json"));
     if (inPackage && dry) {
       // --dry-run must not spawn npm link, which writes into the global prefix.
-      console.log(dim("  Dry run: would run 'npm link' to add 'brushrouter' and 'br' to your PATH"));
+      log(dim("  Dry run: would run 'npm link' to add 'brushrouter' and 'br' to your PATH"));
     } else if (inPackage && interactive && !dry) {
       const wantLink = await prompt("  Run 'npm link' now to make 'brushrouter' available globally? [Y/n] ");
       if (!/^n/i.test(wantLink)) {
         try {
-          const res = spawnSync("npm", ["link"], { stdio: "pipe" });
+          const res = spawnSync("npm", ["link"], { stdio: "pipe", timeout: NPM_LINK_TIMEOUT_MS, killSignal: "SIGKILL" });
           if (res.status === 0 && isOnPath("brushrouter")) {
-            console.log(`  ${ok("✓")} Successfully linked! 'brushrouter' and 'br' are now available globally`);
+            log(`  ${ok("✓")} Successfully linked! 'brushrouter' and 'br' are now available globally`);
           } else {
-            console.log(dim("  npm link finished. If not found, ensure your npm global bin is in PATH."));
+            log(warn(`  npm link did not make brushrouter available${res.error ? `: ${redact(res.error.message)}` : ` (exit ${res.status ?? res.signal ?? "unknown"})`}`));
           }
         } catch {
-          console.log(dim("  Tip: Run 'npm link' manually or add this folder's bin/ to your PATH."));
+          log(dim("  Tip: Run 'npm link' manually or add this folder's bin/ to your PATH."));
         }
       }
     } else {
-      console.log(dim("  Tip: Run 'npm link' or add ~/.local/bin to PATH to use 'brushrouter' from any directory."));
+      log(dim("  Tip: Run 'npm link' or add ~/.local/bin to PATH to use 'brushrouter' from any directory."));
     }
   }
 
   // ---- Phase 4: AI Agent MCP Integrations ----
   if (!skipMcp) {
-    console.log(paint(C.bold, "\n3. Checking AI agent MCP integrations..."));
+    log(paint(C.bold, "\n3. Checking AI agent MCP integrations..."));
     const detectedAgents = detectInstalledAgents().filter((a) => a.isInstalled && !a.optInOnly);
     const unconfiguredAgents = detectedAgents.filter((a) => !a.hasBrushrouter);
 
     if (detectedAgents.length === 0) {
-      console.log(dim("  No supported AI agent installations detected on this machine."));
-      console.log(dim("  (Supported: Claude Code, Claude Desktop, Cursor, Oh-My-Pi, Pi, Windsurf, OpenCode, Cline, Roo Code)"));
+      log(dim("  No supported AI agent installations detected on this machine."));
+      log(dim("  (Supported: Claude Code, Claude Desktop, Cursor, Oh-My-Pi, Pi, Windsurf, OpenCode, Cline, Roo Code)"));
     } else {
       const names = detectedAgents.map((a) => a.name).join(", ");
-      console.log(`  Found ${detectedAgents.length} AI agent(s): ${names}`);
+      log(`  Found ${detectedAgents.length} AI agent(s): ${names}`);
 
       let doInstall = false;
       if (unconfiguredAgents.length === 0) {
-        console.log(`  ${ok("✓")} All detected agents already have brushrouter configured!`);
+        log(`  ${ok("✓")} All detected agents already have brushrouter configured!`);
       } else if (!interactive) {
-        doInstall = true;
+        doInstall = yes || dry;
+        if (!doInstall) log(dim("  Skipping MCP changes without --yes."));
       } else {
         const promptText = `  Wire brushrouter MCP into ${unconfiguredAgents.map((a) => a.name).join(", ")}? [Y/n] `;
         const answer = await prompt(promptText);
@@ -2524,29 +2658,31 @@ async function cmdSetup(args) {
         for (const agent of unconfiguredAgents) {
           const res = installMcpToAgent(agent, entry, { dry });
           if (res.status === "updated" || res.status === "created") {
-            console.log(`  ${ok("✓")} ${agent.name.padEnd(14)} — configured brushrouter MCP`);
+            log(`  ${ok("✓")} ${agent.name.padEnd(14)} — configured brushrouter MCP`);
+          } else if (dry && res.status.startsWith("would-")) {
+            log(dim(`  Dry run: ${res.status} ${res.path}`));
           } else if (res.status === "error") {
-            console.log(`  ${bad("!")} ${agent.name.padEnd(14)} — ${bad(res.error)}`);
+            log(`  ${bad("!")} ${agent.name.padEnd(14)} — ${bad(res.error)}`);
           }
         }
         if (!dry) {
-          console.log(dim("  Restart your agents or reload MCP servers to pick up the new tools."));
+          log(dim("  Restart your agents or reload MCP servers to pick up the new tools."));
         }
       }
     }
   }
 
   // ---- Phase 4: Coding Tool Rules Injection ----
-  console.log(paint(C.bold, "\n4. Checking AI coding tool rules (AGENTS.md, CLAUDE.md, .cursorrules)..."));
+  log(paint(C.bold, "\n4. Checking AI coding tool rules (AGENTS.md, CLAUDE.md, .cursorrules)..."));
   const detectedRules = detectRuleFiles().filter((r) => r.exists);
   const unconfiguredRules = detectedRules.filter((r) => !r.hasRule);
 
   if (detectedRules.length === 0) {
-    console.log(dim("  No existing rule files found (AGENTS.md, CLAUDE.md, .cursorrules)."));
-    console.log(dim("  Tip: Run `brushrouter rules --create` anytime to generate a project rule file."));
+    log(dim("  No existing rule files found (AGENTS.md, CLAUDE.md, .cursorrules)."));
+    log(dim("  Tip: Run `brushrouter rules --create` anytime to generate a project rule file."));
   } else {
     const fileNames = detectedRules.map((r) => r.name).join(", ");
-    console.log(`  Found ${detectedRules.length} coding tool rule file(s): ${fileNames}`);
+    log(`  Found ${detectedRules.length} coding tool rule file(s): ${fileNames}`);
 
     let doInject = false;
     if (unconfiguredRules.length > 0) {
@@ -2554,19 +2690,22 @@ async function cmdSetup(args) {
         const wantRules = await prompt(`  Inject clean brushrouter guidance into ${unconfiguredRules.length} rule file(s)? (~60 tokens) [Y/n] `);
         doInject = !/^n/i.test(wantRules);
       } else {
-        doInject = true;
+        doInject = yes || dry;
+        if (!doInject) log(dim("  Skipping rules changes without --yes."));
       }
     } else {
-      console.log(`  ${ok("✓")} All detected coding tool rule files already contain brushrouter guidance.`);
+      log(`  ${ok("✓")} All detected coding tool rule files already contain brushrouter guidance.`);
     }
 
     if (doInject && unconfiguredRules.length > 0) {
       for (const rule of unconfiguredRules) {
         const res = injectRuleToFile(rule.path, { dry });
         if (res.status === "updated" || res.status === "created") {
-          console.log(`  ${ok("✓")} ${rule.name.padEnd(25)} — injected clean rule block`);
+          log(`  ${ok("✓")} ${rule.name.padEnd(25)} — injected clean rule block`);
+        } else if (dry && res.status.startsWith("would-")) {
+          log(dim(`  Dry run: ${res.status} ${res.path}`));
         } else if (res.status === "error") {
-          console.log(`  ${bad("!")} ${rule.name.padEnd(25)} — ${bad(res.error)}`);
+          log(`  ${bad("!")} ${rule.name.padEnd(25)} — ${bad(res.error)}`);
         }
       }
     }
@@ -2574,7 +2713,7 @@ async function cmdSetup(args) {
 
   // ---- Phase 5: Verification Smoke Test ----
   if (ready.length > 0 && !skipTest && interactive && !dry) {
-    console.log(paint(C.bold, "\n5. Verifying with test generation..."));
+    log(paint(C.bold, "\n5. Verifying with test generation..."));
     const wantTest = await prompt("  Generate a quick test image to verify everything works? [y/N] ");
     if (/^y/i.test(wantTest)) {
       const testPrompt = "a tiny cute robot holding a paintbrush";
@@ -2600,32 +2739,36 @@ async function cmdSetup(args) {
         const sec = ((Date.now() - start) / 1000).toFixed(1);
         const kb = Math.round(res.buffer.length / 1024);
         const mime = detectImageMime(res.buffer) || "image/png";
-        console.log(ok(`✓ done in ${sec}s!`));
-        console.log(ok(`  Saved: ${saved.savedPath} (${mime}, ${kb} KB via ${res.provider}${res.meta?.model ? `/${res.meta.model}` : ""})`));
+        log(ok(`✓ done in ${sec}s!`));
+        log(ok(`  Saved: ${saved.savedPath} (${mime}, ${kb} KB via ${res.provider}${res.meta?.model ? `/${res.meta.model}` : ""})`));
       } catch (e) {
-        console.log(bad(`failed: ${redact(e.message)}`));
+        log(bad(`failed: ${redact(e.message)}`));
         if (e.attempts?.length) {
-          console.log(dim(`  attempts: ${e.attempts.map((a) => `${a.provider}=${a.outcome}`).join(" → ")}`));
+          log(dim(`  attempts: ${e.attempts.map((a) => `${a.provider}=${a.outcome}`).join(" → ")}`));
         }
-        console.log(dim("  Setup itself is fine — run `brushrouter doctor` to check this provider."));
+        log(dim("  Setup itself is fine — run `brushrouter doctor` to check this provider."));
       }
     }
   }
 
   // ---- Phase 6: Cheatsheet / Completion ----
-  console.log(paint(C.bold, "\n🎉 brushrouter is ready!\n"));
-  console.log("  CLI:     brushrouter gen \"a red fox in snow\" -o fox.png  (or shorthand: br gen ...)");
-  console.log("  MCP:     Ask your AI agent to create or edit an image");
-  console.log("  Rules:   br rules (sync clean ~60-token guidance into coding tools)");
-  console.log("  Update:  br update (keep backends and prompt library current)");
-  console.log("  Help:    br doctor | br prompts | br --help\n");
+  if (ready.length === 0) {
+    log(bad("\nSetup did not find a usable provider — run `brushrouter doctor` for details."));
+    return finish({ ok: false, ready: 0, providers: probes });
+  }
+  log(paint(C.bold, "\n🎉 brushrouter is ready!\n"));
+  log("  CLI:     brushrouter gen \"a red fox in snow\" -o fox.png  (or shorthand: br gen ...)");
+  log("  MCP:     Ask your AI agent to create or edit an image");
+  log("  Rules:   br rules (sync clean ~60-token guidance into coding tools)");
+  log("  Update:  br update (keep backends and prompt library current)");
+  log("  Help:    br doctor | br prompts | br --help\n");
 
   // Exit explicitly. Every prompt pauses stdin and closes its readline
   // interface, but on Node a readline interface created with `terminal: true`
   // still leaves the stdin socket ref'd, so the process sat there after
   // "brushrouter is ready!". Flushing first also keeps a piped `setup` from
   // truncating.
-  return exitAfterFlush(0);
+  return finish({ ok: true, ready: ready.length, providers: probes });
 }
 
 async function main() {
@@ -2687,6 +2830,9 @@ async function main() {
       break;
     case "models":
       await cmdModels(args);
+      break;
+    case "recipes":
+      await cmdRecipes(args);
       break;
     case "prompts":
     case "prompt":

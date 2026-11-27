@@ -433,36 +433,54 @@ export async function openrouterImagesGenerate({ prompt, size, quality, seed, im
   };
 }
 
-// Live model catalogue for `brushrouter models` — the image-capable models the
-// user's key can actually see. Returns [] on any failure (never throws).
+function catalogueError(status) {
+  if (status === 401 || status === 403) return { code: "auth", status, message: `OpenRouter rejected the key (HTTP ${status})` };
+  if (status === 429 || status >= 500) return { code: "transient", status, message: `OpenRouter catalogue temporarily unavailable (HTTP ${status})` };
+  return { code: "http", status, message: `OpenRouter catalogue request failed (HTTP ${status})` };
+}
+
+async function readOpenRouterCatalogue(url, headers) {
+  try {
+    const response = await fetchWithTimeout(url, { headers }, 20000);
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      return { error: catalogueError(response.status) };
+    }
+    const body = await response.json();
+    if (!Array.isArray(body?.data)) return { error: { code: "response", message: "Invalid OpenRouter catalogue response" } };
+    return { data: body.data.filter((m) => typeof m?.id === "string" && m.id.length > 0) };
+  } catch (error) {
+    if (error instanceof SyntaxError) return { error: { code: "response", message: "Invalid JSON in OpenRouter catalogue response" } };
+    return { error: { code: "transient", message: `OpenRouter catalogue request failed: ${error.message}` } };
+  }
+}
+
 export async function openrouterListModels(cfg) {
   const found = resolveKey(cfg, "openrouter");
-  if (!found) return [];
+  if (!found) return { models: [], error: { code: "missing", message: "No OpenRouter API key (set BRUSHROUTER_OPENROUTER_KEY)" } };
+  if (cfg?.baseUrl && typeof cfg.baseUrl !== "string") {
+    return { models: [], error: { code: "config", message: "OpenRouter baseUrl must be a string" } };
+  }
   const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
   const headers = { Authorization: `Bearer ${found.key}` };
-  const out = [];
-  // Both catalogues are needed, so fetch them together instead of paying two
-  // round-trips back to back. Order of `out` is preserved below: image-only
-  // models first, so the de-dupe keeps the /images endpoint for a shared id.
   const [imgRes, chatRes] = await Promise.all([
-    fetchWithTimeout(`${base}/images/models`, { headers }, 20000).catch(() => null),
-    fetchWithTimeout(`${base}/models`, { headers }, 20000).catch(() => null),
+    readOpenRouterCatalogue(`${base}/images/models`, headers),
+    readOpenRouterCatalogue(`${base}/models`, headers),
   ]);
-  // The dedicated images catalogue lists image-only models that /models omits.
-  if (imgRes?.ok) {
-    const j = await imgRes.json().catch(() => null);
-    for (const m of j?.data || []) if (m?.id) out.push({ id: m.id, endpoint: "/images", name: m.name || null });
-  }
-  if (chatRes?.ok) {
-    const j = await chatRes.json().catch(() => null);
-    for (const m of j?.data || []) {
-      if (m?.architecture?.output_modalities?.includes("image") || /image/.test(m.id)) {
-        out.push({ id: m.id, endpoint: "/chat/completions", name: m.name || null });
-      }
-    }
-  }
+  const images = imgRes.data || [];
+  const chat = (chatRes.data || []).filter((m) =>
+    (Array.isArray(m.architecture?.output_modalities) && m.architecture.output_modalities.includes("image")) || /image/.test(m.id)
+  );
+  const out = [
+    ...images.map((m) => ({ id: m.id, endpoint: "/images" })),
+    ...chat.map((m) => ({ id: m.id, endpoint: "/chat/completions" })),
+  ];
   const seen = new Set();
-  return out.filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
+  const models = out.filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
+  const errors = [chatRes.error, imgRes.error].filter(Boolean);
+  const error = models.length ? null : errors.find((e) => e.code === "transient") || errors[0] ||
+    { code: "empty", message: "OpenRouter returned no image models" };
+  return { models, error, warnings: models.length ? errors : [], source: found.source };
 }
 
 export const openrouterProvider = {
@@ -476,35 +494,20 @@ export const openrouterProvider = {
   // use any other id from `brushrouter models`.
   defaultModels: ["google/gemini-3.1-flash-image", "google/gemini-3-pro-image", "google/gemini-2.5-flash-image"],
   async probe(cfg) {
-    const found = resolveKey(cfg, "openrouter");
-    if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_OPENROUTER_KEY)" };
-    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
-    const headers = { Authorization: `Bearer ${found.key}` };
-    try {
-      // The count needs both catalogues, so request them together: this probe
-      // used to serialize two round-trips on the critical path of every
-      // `providers` / `doctor` / `gen --dry-run`.
-      const [res, r2] = await Promise.all([
-        fetchWithTimeout(`${base}/models`, { headers }, 20000),
-        fetchWithTimeout(`${base}/images/models`, { headers }, 20000).catch(() => null),
-      ]);
-      if (!res.ok) return { available: false, auth: "invalid", detail: `key rejected (${res.status}) from ${found.source}` };
-      const j = await res.json();
-      const all = Array.isArray(j.data) ? j.data : [];
-      const chatImage = all.filter((m) => m.architecture?.output_modalities?.includes("image") || /image/.test(m.id)).length;
-      // The dedicated image catalogue carries image-only models that /models omits.
-      let imageOnly = 0;
-      if (r2?.ok) imageOnly = (await r2.json().catch(() => null))?.data?.length || 0;
-      const total = chatImage + imageOnly;
-      const pinned = cfg?.model ? `; model pinned to ${cfg.model}` : "";
-      return {
-        available: true,
-        auth: "ok",
-        detail: `key from ${found.source}; ${total} image model(s) available (${chatImage} chat + ${imageOnly} image-only)${pinned}`,
-      };
-    } catch (e) {
-      return { available: false, auth: "error", detail: e.message };
+    const { models, error, warnings, source } = await openrouterListModels(cfg);
+    if (error) {
+      const auth = error.code === "auth" ? "invalid" : ["http", "response", "config"].includes(error.code) ? "error" : error.code;
+      return { available: false, auth, detail: error.message };
     }
+    const imageOnly = models.filter((m) => m.endpoint === "/images").length;
+    const pinned = cfg?.model ? `; model pinned to ${cfg.model}` : "";
+    const partial = warnings.length ? `; partial catalogue: ${warnings.map((w) => w.message).join("; ")}` : "";
+    return {
+      available: true,
+      auth: "ok",
+      verification: "verified",
+      detail: `catalogue reachable with key from ${source}; ${models.length} image model(s) listed (${models.length - imageOnly} chat + ${imageOnly} image-only)${pinned}${partial}`,
+    };
   },
   async generate({ prompt, size, quality, seed, images, cwd, onProgress, model: requestedModel }, cfg) {
     const found = resolveKey(cfg, "openrouter");

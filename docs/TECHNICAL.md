@@ -309,6 +309,10 @@ The invariants are asserted by `scripts/check-recipes.mjs`: `text` must exist an
 
 Current shape: 27 recipes, 19 image-capable and 8 text-only, across `single` 17 / `grid` 7 / `sheet` 1 / `document` 2; plus 137 looks, all `single`, in 6 categories. `check-recipes.mjs` validates both — a malformed `styles.json` is a hard failure, an absent one is not.
 
+Custom JSON can be a standalone recipe or look (`id`, `text`, and optional metadata), or a bundle with a `recipes` or `styles` array. Custom slots are inferred from text and image skeletons unless declared explicitly. The runtime scans the user config's `recipes/` directory, the platform-delimited `BRUSHROUTER_EXTRA_RECIPES_DIRS`, then the project's `.brushrouter/recipes/`. Trusted user or environment directories may override bundled IDs; project directories may not override bundled or trusted IDs. `BRUSHROUTER_NO_CUSTOM_RECIPES=1` disables automatic scanning.
+
+Run `brushrouter recipes validate [dir...] --json` for per-file results and a nonzero exit on errors. With no arguments it checks the configured custom directories; explicit paths are checked even when automatic scanning is disabled. Unconfigured explicit directories follow the same override restrictions as project directories. Runtime loading uses the same checks but warns and continues loading supported entries. `npm run recipes:check` is for the bundled library only and rejects directory arguments.
+
 ### Free slots
 
 Of the 17 slots, nine carry a curated option list and are filled for the caller. Eight are deliberately free — `subject`, `subject_action`, `text`, `secondary_text`, `prop`, `location`, `wardrobe`, `accent_symbol` — because only the caller knows them. Unfilled, they are returned in `missing` and **left visible as placeholders**; `fill()` never silently emits a literal `{subject}` into a prompt destined for an image model, where it would render as meaningless text.
