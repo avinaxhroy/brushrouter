@@ -1,7 +1,7 @@
 // Small dependency-free helpers shared across providers.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync, readSync, closeSync, fstatSync, realpathSync } from "node:fs";
-import { resolve, dirname, isAbsolute, extname, relative } from "node:path";
+import { resolve, dirname, isAbsolute, extname, relative, sep } from "node:path";
 
 const jwtCache = new Map();
 
@@ -199,7 +199,7 @@ export function isPathInside(candidate, allowedDir) {
     const realRoot = realpathSync(allowedDir);
     const realTarget = realpathSync(candidate);
     const rel = relative(realRoot, realTarget);
-    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../") && !isAbsolute(rel));
   } catch {
     return false;
   }

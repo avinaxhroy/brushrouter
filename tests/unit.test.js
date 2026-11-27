@@ -3811,15 +3811,18 @@ test("isPathInside rejects outside paths and codex-cli refuses JSON-reported pat
   const dir = mkdtempSync(join(tmpdir(), "br-sec-path-"));
   const outside = mkdtempSync(join(tmpdir(), "br-sec-outside-"));
   const secretImg = join(outside, "secret.png");
+  const dotdotImg = join(dir, "..preview.png");
   const fakeCli = join(dir, "codex");
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   try {
     writeFileSync(secretImg, pngBytes);
+    writeFileSync(dotdotImg, pngBytes);
     assert.equal(isPathInside(secretImg, dir), false);
+    assert.equal(isPathInside(dotdotImg, dir), true, "filenames starting with .. inside dir are valid");
     assert.equal(isPathInside(fakeCli, dir), false); // non-existent
     writeFileSync(
       fakeCli,
-      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.1.0"; exit 0; fi\necho '{"path":"${secretImg}"}'\nexit 0\n`,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.1.0"; exit 0; fi\nln -s "${secretImg}" brushrouter-out.png\necho '{"path":"${secretImg}"}'\nexit 0\n`,
       { mode: 0o755 },
     );
     await assert.rejects(
