@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { getUserConfigPath } from "../config.js";
 import { normalizeSize } from "../util/common.js";
 import { safeParseMessage } from "../util/redact.js";
 import { apiRequest, deadline, imageResult, jsonPost, multipartImage, pollDelay, providerError, requireMaskImage } from "./image-api.js";
@@ -22,8 +23,8 @@ function fluxWorkflow({ prompt, model, seed, width, height }, cfg) {
   };
 }
 
-function loadWorkflow(path, cwd) {
-  const file = resolve(cwd || process.cwd(), path);
+function loadWorkflow(path) {
+  const file = resolve(dirname(resolve(getUserConfigPath())), path);
   const stat = statSync(file);
   if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw providerError("BAD_WORKFLOW", "ComfyUI workflow must be a regular JSON file up to 2 MB");
   let graph;
@@ -85,7 +86,7 @@ export const comfyUIProvider = {
     const params = { prompt, model, width, height, size: `${width}x${height}`, seed: randomInt(2 ** 32) };
     let graph;
     if (cfg?.workflow) {
-      const template = loadWorkflow(cfg.workflow, cwd);
+      const template = loadWorkflow(cfg.workflow);
       const placeholders = { ...params, ...Object.fromEntries(images.map((_, i) => [`image${i + 1}`, ""])), ...(images.length && { image: "" }), ...(mask && { mask: "" }) };
       const seen = new Set();
       fillWorkflow(template, placeholders, seen);

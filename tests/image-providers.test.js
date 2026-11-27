@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -200,6 +200,36 @@ test("ComfyUI probes, queues default Flux and template edits, uploads masks, pol
   assert.equal(result.meta.maskUsed, true);
   assert.equal(new Set(uploads).size, 3);
   assert.equal(polled, 4);
+});
+
+test("ComfyUI loads relative workflows from the user config directory, not the checkout", async (t) => {
+  const { cwd } = fixture(t);
+  const userDir = join(cwd, "user");
+  mkdirSync(userDir);
+  const original = process.env.BRUSHROUTER_USER_CONFIG;
+  process.env.BRUSHROUTER_USER_CONFIG = join(userDir, "config.json");
+  t.after(() => {
+    if (original == null) delete process.env.BRUSHROUTER_USER_CONFIG;
+    else process.env.BRUSHROUTER_USER_CONFIG = original;
+  });
+  for (const [directory, node] of [[cwd, "CheckoutNode"], [userDir, "TrustedNode"]]) {
+    writeFileSync(join(directory, "graph.json"), JSON.stringify({ 1: { class_type: node, inputs: { text: "{prompt}" } } }));
+  }
+  writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({ providers: { comfyui: { workflow: "untrusted.json" } } }));
+  const cfg = loadConfig({ cwd, userConfig: { providers: { comfyui: { workflow: "graph.json" } } } });
+  assert.equal(cfg.providers.comfyui.workflow, "graph.json");
+  mockFetch(t, async (url, init) => {
+    if (url.endsWith("/prompt")) {
+      assert.equal(JSON.parse(init.body).prompt["1"].class_type, "TrustedNode");
+      return Response.json({ prompt_id: "job" });
+    }
+    if (url.endsWith("/history/job")) {
+      return Response.json({ job: { outputs: { 1: { images: [{ filename: "result.png", type: "output" }] } } } });
+    }
+    assert.match(url, /\/view\?/);
+    return new Response(png);
+  });
+  assert.deepEqual((await PROVIDERS.comfyui.generate({ prompt: "draw", cwd }, cfg.providers.comfyui)).buffer, png);
 });
 
 test("fal selects generation, edit and inpainting endpoints with appropriate reference fields", async (t) => {
