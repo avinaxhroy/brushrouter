@@ -2664,7 +2664,7 @@ async function cmdSetup(args) {
           if (res.status === "updated" || res.status === "created") {
             log(`  ${ok("✓")} ${agent.name.padEnd(14)} — configured brushrouter MCP`);
           } else if (dry && res.status.startsWith("would-")) {
-            log(dim(`  Dry run: ${res.status} ${res.path}`));
+            log(dim(`  Dry run: ${res.status} ${redact(res.path)}`));
           } else if (res.status === "error") {
             log(`  ${bad("!")} ${agent.name.padEnd(14)} — ${bad(res.error)}`);
           }

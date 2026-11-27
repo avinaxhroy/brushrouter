@@ -67,6 +67,17 @@ test("setup only changes MCP settings and rules in automation with --yes", (t) =
   assert.ok(JSON.parse(readFileSync(agent, "utf8")).mcpServers.brushrouter);
 });
 
+test("setup human dry-run redacts a credential-shaped MCP config path", (t) => {
+  const { home, run } = fixture(t);
+  const token = "sk-FIXTUREMCP000000000000";
+  const agent = join(home, token + ".json");
+  writeFileSync(agent, "{}");
+  const preview = run(["setup", "--dry-run"], { extraEnv: { ...fal, BRUSHROUTER_MCP_CONFIGS: agent } });
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /Dry run: would-update .*sk-\*\*\*\.json/);
+  assert.ok(!preview.stdout.includes(token));
+});
+
 test("setup without a provider returns a JSON failure instead of declaring readiness", (t) => {
   const result = fixture(t).run(["setup", "--non-interactive", "--json"]);
   assert.equal(result.status, 1, result.stderr);
