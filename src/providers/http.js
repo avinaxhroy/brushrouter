@@ -208,6 +208,7 @@ function sizeToAspectRatio(size) {
   if (!m) return null;
   let w = Number(m[1]);
   let h = Number(m[2]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
   const gcd = (a, b) => (b ? gcd(b, a % b) : a);
   const d = gcd(w, h) || 1;
   return `${w / d}:${h / d}`;
@@ -243,7 +244,7 @@ function isUrlConfigError(message) {
 
 // Shared helper: POST /images and pull b64_json|url out of data[0].
 export async function openrouterImagesGenerate({ prompt, size, quality, images = [], cwd, onProgress }, cfg, model, apiKey) {
-  const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
+  const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
   const body = { model, prompt, n: 1 };
   const aspect = sizeToAspectRatio(size);
   if (aspect) body.aspect_ratio = aspect;
@@ -300,7 +301,7 @@ export async function openrouterImagesGenerate({ prompt, size, quality, images =
 export async function openrouterListModels(cfg) {
   const found = resolveKey(cfg, "openrouter");
   if (!found) return [];
-  const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
+  const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
   const headers = { Authorization: `Bearer ${found.key}` };
   const out = [];
   // Both catalogues are needed, so fetch them together instead of paying two
@@ -340,7 +341,7 @@ export const openrouterProvider = {
   async probe(cfg) {
     const found = resolveKey(cfg, "openrouter");
     if (!found) return { available: false, auth: "missing", detail: "no API key (set BRUSHROUTER_OPENROUTER_KEY)" };
-    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
+    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
     const headers = { Authorization: `Bearer ${found.key}` };
     try {
       // The count needs both catalogues, so request them together: this probe
@@ -377,7 +378,7 @@ export const openrouterProvider = {
     }
     // Precedence: per-call model > configured model > built-in fallback list.
     const pinned = requestedModel || cfg?.model;
-    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/$/, "");
+    const base = (cfg?.baseUrl || OPENROUTER_BASE).replace(/\/+$/, "");
     const candidates = pinned
       ? [pinned]
       : [...new Set([...(cfg?.models || []), ...openrouterProvider.defaultModels].filter(Boolean))];

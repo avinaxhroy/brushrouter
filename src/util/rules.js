@@ -9,6 +9,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, platform } from "node:os";
+import { redact } from "./redact.js";
 
 export const RULE_START_MARKER = "<!-- BRUSHROUTER_START -->";
 export const RULE_END_MARKER = "<!-- BRUSHROUTER_END -->";
@@ -210,7 +211,7 @@ export function injectRuleToFile(filePath, { dry = false, create = false } = {})
       writeFileSync(filePath, BRUSHROUTER_RULE_SNIPPET + "\n");
       return { status: "created", path: filePath };
     } catch (e) {
-      return { status: "error", error: e.message, path: filePath };
+      return { status: "error", error: redact(e.message), path: filePath };
     }
   }
 
@@ -219,11 +220,11 @@ export function injectRuleToFile(filePath, { dry = false, create = false } = {})
   try {
     content = readFileSync(filePath, "utf8");
   } catch (e) {
-    return { status: "error", error: e.message, path: filePath };
+    return { status: "error", error: redact(e.message), path: filePath };
   }
 
   const startIdx = content.indexOf(RULE_START_MARKER);
-  const endIdx = content.indexOf(RULE_END_MARKER);
+  const endIdx = startIdx !== -1 ? content.indexOf(RULE_END_MARKER, startIdx + RULE_START_MARKER.length) : -1;
 
   if (startIdx !== -1 && endIdx !== -1 && endIdx >= startIdx) {
     const currentBlock = content.slice(startIdx, endIdx + RULE_END_MARKER.length);
@@ -241,7 +242,7 @@ export function injectRuleToFile(filePath, { dry = false, create = false } = {})
       writeFileSync(filePath, newContent);
       return { status: "updated", backup, path: filePath };
     } catch (e) {
-      return { status: "error", error: e.message, path: filePath };
+      return { status: "error", error: redact(e.message), path: filePath };
     }
   }
 
@@ -258,6 +259,6 @@ export function injectRuleToFile(filePath, { dry = false, create = false } = {})
     writeFileSync(filePath, newContent);
     return { status: "updated", backup, path: filePath };
   } catch (e) {
-    return { status: "error", error: e.message, path: filePath };
+    return { status: "error", error: redact(e.message), path: filePath };
   }
 }

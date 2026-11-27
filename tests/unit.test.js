@@ -3660,3 +3660,87 @@ test("codexCliProvider.generate validates reference images before spawning CLI",
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("MCP generate_image and batch_generate_images fail fast on invalid args before starting async jobs", async () => {
+  const { handleToolCall, handleRequest } = await import("../src/mcp.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-mcp-failfast-"));
+  try {
+    // 1. Directory passed to out must be rejected in both sync and async modes.
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", out: dir }, { cwd: dir }),
+      /is a directory/,
+    );
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", out: dir, async: true }, { cwd: dir }),
+      /is a directory/,
+    );
+    // 2. Invalid count/concurrency must fail fast in async mode before starting a job.
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", count: 99, async: true }, { cwd: dir }),
+      /at most 8/,
+    );
+    await assert.rejects(
+      () => handleToolCall("generate_image", { prompt: "a cat", concurrency: 0, async: true }, { cwd: dir }),
+      /positive integer/,
+    );
+    // 3. Invalid batch args must fail fast in async mode before starting a job.
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { prompts: [], async: true }, { cwd: dir }),
+      /requires 'prompts' or 'items'/,
+    );
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { items: [{ prompt: "  " }], async: true }, { cwd: dir }),
+      /missing a non-empty "prompt"/,
+    );
+    // 4. batch_generate_images schema exposes per-item `images`.
+    const listed = await handleRequest({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { cwd: dir });
+    const batchTool = listed.result.tools.find((t) => t.name === "batch_generate_images");
+    assert.ok(batchTool?.inputSchema?.properties?.items?.items?.properties?.images, "batch schema should expose per-item images");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("injectRuleToFile updates existing block even when a stray end marker appears earlier", async () => {
+  const { injectRuleToFile, RULE_START_MARKER, RULE_END_MARKER, BRUSHROUTER_RULE_BODY } = await import("../src/util/rules.js");
+  const dir = mkdtempSync(join(tmpdir(), "br-rules-marker-"));
+  const file = join(dir, "AGENTS.md");
+  try {
+    writeFileSync(file, `intro\n${RULE_END_MARKER}\n${RULE_START_MARKER}\nold text\n${RULE_END_MARKER}\n`);
+    const res = injectRuleToFile(file);
+    assert.equal(res.status, "updated");
+    const after = readFileSync(file, "utf8");
+    assert.equal(after.split(RULE_START_MARKER).length - 1, 1, "should not duplicate rule block");
+    assert.ok(after.includes(BRUSHROUTER_RULE_BODY));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("openrouterImagesGenerate ignores zero-dimension sizes and strips multiple trailing slashes", async () => {
+  const { openrouterImagesGenerate } = await import("../src/providers/http.js");
+  const origFetch = globalThis.fetch;
+  let capturedUrl = null;
+  let capturedBody = null;
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  globalThis.fetch = async (url, init) => {
+    capturedUrl = String(url);
+    capturedBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ data: [{ b64_json: pngBytes.toString("base64") }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  try {
+    await openrouterImagesGenerate(
+      { prompt: "test", size: "0x1024", images: [], cwd: process.cwd() },
+      { baseUrl: "https://example.test/api/v1///" },
+      "test/model",
+      "sk-or-test-key-1234567890",
+    );
+    assert.equal(capturedUrl, "https://example.test/api/v1/images");
+    assert.equal(capturedBody.aspect_ratio, undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

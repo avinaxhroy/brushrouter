@@ -5,7 +5,7 @@
 // generate tool description advertises which providers are currently connected
 // so the calling agent can make an informed choice (or let auto-routing decide).
 
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
@@ -109,10 +109,15 @@ const BATCH_TOOL_SCHEMA = {
             quality: { type: "string" },
             background: { type: "string", enum: ["opaque", "transparent"] },
             model: { type: "string" },
+            images: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional reference image paths for this item.",
+            },
           },
           required: ["prompt"],
         },
-        description: "List of items with per-item options (e.g. prompt, out, size, quality, model).",
+        description: "List of items with per-item options (e.g. prompt, out, size, quality, background, model, images).",
       },
       outDir: {
         type: "string",
@@ -150,14 +155,14 @@ const BATCH_TOOL_SCHEMA = {
 const JOB_TOOL_SCHEMA = {
   name: JOB_TOOL_NAME,
   description:
-    "Collect the image from an async generate_image call. Call it with the jobId returned by " +
-    "generate_image {async:true}. While the job is still working it returns a status and you " +
-    "should do other work and poll again; once complete it returns the saved path and the image " +
-    "itself. Jobs live only for this server session.",
+    "Collect the image(s) from an async generate_image or batch_generate_images call. Call it with the jobId returned by " +
+    "generate_image {async:true} or batch_generate_images {async:true}. While the job is still working it returns a status and you " +
+    "should do other work and poll again; once complete it returns the saved path(s) and the image(s). " +
+    "Jobs live only for this server session.",
   inputSchema: {
     type: "object",
     properties: {
-      jobId: { type: "string", description: "The jobId returned by generate_image with async:true." },
+      jobId: { type: "string", description: "The jobId returned by generate_image or batch_generate_images with async:true." },
     },
     required: ["jobId"],
   },
@@ -288,22 +293,61 @@ async function mapLimited(items, limit, fn) {
   return out;
 }
 
-function assertGeneratePrompt(args) {
+function assertGenerateArgs(args, cwd = process.cwd()) {
   if (typeof args?.prompt !== "string" || args.prompt.trim() === "") {
     throw new Error('generate_image requires a non-empty "prompt" string');
   }
+  const count = positiveInt(args.count, "count", { max: MAX_COUNT });
+  const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
+  if (args.out != null) {
+    if (typeof args.out !== "string" || args.out.trim() === "") {
+      throw new Error('generate_image "out" must be a non-empty file path string');
+    }
+    const resolvedOut = resolve(cwd, args.out);
+    if (existsSync(resolvedOut) && statSync(resolvedOut).isDirectory()) {
+      throw new Error(`generate_image "out" is a directory, not a file path: ${resolvedOut}`);
+    }
+  }
+  return { count, concurrency };
+}
+
+function validateBatchArgs(args) {
+  let rawItems = [];
+  if (Array.isArray(args.items) && args.items.length) {
+    rawItems = args.items;
+  } else if (Array.isArray(args.prompts) && args.prompts.length) {
+    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
+  } else {
+    throw new Error("batch_generate_images requires 'prompts' or 'items' array");
+  }
+
+  // The schema declares `prompt` required, but MCP clients are not obliged to
+  // validate against it. Sending an empty prompt to a provider costs a real
+  // request and reports "✓" for a blank image, so reject it here and name the
+  // offending index. A bare string entry is a prompt, not an object to spread —
+  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
+  const normalized = rawItems.map((item, idx) => {
+    const entry = typeof item === "string" ? { prompt: item } : item;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
+    }
+    if (typeof entry.prompt !== "string" || entry.prompt.trim() === "") {
+      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
+    }
+    return entry;
+  });
+  const concurrency = args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency");
+  return { rawItems: normalized, concurrency };
 }
 
 // Runs the generation and returns the exact tools/call content the agent would
 // have received from a blocking call. Shared by the sync and async paths so the
 // two can never drift.
 async function runGenerate(args, ctx, onProgress) {
-  assertGeneratePrompt(args);
   const { cwd = process.cwd() } = ctx;
+  const { count, concurrency } = assertGenerateArgs(args, cwd);
   const cfg = loadConfig({ cwd });
   const out = args.out || defaultOut();
-  const count = positiveInt(args.count, "count", { max: MAX_COUNT });
-  const concurrency = args.concurrency == null ? count : positiveInt(args.concurrency, "concurrency");
   if (count === 1) {
     const result = await generate({ ...args, out, cwd, fallback: args.fallback === true, onProgress }, cfg);
     const saved = saveImage(out, result.buffer, cwd);
@@ -382,31 +426,7 @@ function imageBlock(result) {
 async function runBatchGenerate(args, ctx, onProgress) {
   const { cwd = process.cwd() } = ctx;
   const cfg = loadConfig({ cwd });
-
-  let rawItems = [];
-  if (Array.isArray(args.items) && args.items.length) {
-    rawItems = args.items;
-  } else if (Array.isArray(args.prompts) && args.prompts.length) {
-    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
-  } else {
-    throw new Error("batch_generate_images requires 'prompts' or 'items' array");
-  }
-
-  // The schema declares `prompt` required, but MCP clients are not obliged to
-  // validate against it. Sending an empty prompt to a provider costs a real
-  // request and reports "✓" for a blank image, so reject it here and name the
-  // offending index. A bare string entry is a prompt, not an object to spread —
-  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
-  rawItems = rawItems.map((item, idx) => {
-    const normalised = typeof item === "string" ? { prompt: item } : item;
-    if (!normalised || typeof normalised !== "object" || Array.isArray(normalised)) {
-      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
-    }
-    if (typeof normalised.prompt !== "string" || normalised.prompt.trim() === "") {
-      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
-    }
-    return normalised;
-  });
+  const { rawItems, concurrency } = validateBatchArgs(args);
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, args.outDir || `brushrouter-batch-${timestamp}`);
@@ -423,7 +443,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
       items,
       outDir,
       cwd,
-      concurrency: args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency"),
+      concurrency,
       provider: args.provider,
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
@@ -708,6 +728,7 @@ export async function handleToolCall(name, args = {}, ctx = {}) {
   }
   if (name === BATCH_TOOL_NAME) {
     if (args.async === true) {
+      validateBatchArgs(args);
       const job = startJob(args, ctx, runBatchGenerate);
       return {
         content: [
@@ -723,7 +744,7 @@ export async function handleToolCall(name, args = {}, ctx = {}) {
   }
   if (name !== TOOL_NAME) throw new Error(`unknown tool: ${name}`);
   if (args.async === true) {
-    assertGeneratePrompt(args);
+    assertGenerateArgs(args, ctx?.cwd || process.cwd());
     const job = startJob(args, ctx);
     return {
       content: [
