@@ -493,7 +493,7 @@ async function runGenerate(args, ctx, onProgress) {
           error: redact(String(e?.message || e)),
           errorCode: e.code || null,
         },
-        { cfg },
+        { cfg, cwd },
       );
       throw e;
     }
@@ -596,7 +596,7 @@ async function runGenerate(args, ctx, onProgress) {
           replayOf: args._replayOf || null,
           batchId,
         },
-        { cfg },
+        { cfg, cwd },
       );
       const block = imageBlock(result);
       result.buffer = null;
@@ -626,7 +626,7 @@ async function runGenerate(args, ctx, onProgress) {
           error: msg,
           errorCode: e.code || null,
         },
-        { cfg },
+        { cfg, cwd },
       );
       return { ok: false, error: msg };
     }
@@ -719,7 +719,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
           costUsd: r.meta?.costUsd,
           batchId,
         },
-        { cfg },
+        { cfg, cwd },
       );
     } else {
       tryRecordHistory(
@@ -743,7 +743,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
           error: redact(r.error),
           errorCode: r.code || null,
         },
-        { cfg },
+        { cfg, cwd },
       );
     }
   }

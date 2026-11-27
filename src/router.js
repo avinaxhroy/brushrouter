@@ -224,7 +224,7 @@ export async function generate({ prompt, size, quality, background, seed, images
             replayOf: hOpts.replayOf || null,
             batchId: hOpts.batchId || null,
           },
-          { cfg, ...(hOpts.path ? { path: hOpts.path } : {}) },
+          { cfg, cwd, ...(hOpts.path ? { path: hOpts.path } : {}) },
         );
       }
       return { ...result, meta, provider: id, attempts, durationMs, ...(historyRecord ? { historyId: historyRecord.id } : {}) };
@@ -270,7 +270,7 @@ export async function generate({ prompt, size, quality, background, seed, images
         error: err.message,
         errorCode: err.code,
       },
-      { cfg, ...(hOpts.path ? { path: hOpts.path } : {}) },
+      { cfg, cwd, ...(hOpts.path ? { path: hOpts.path } : {}) },
     );
     if (rec) err.historyId = rec.id;
   }

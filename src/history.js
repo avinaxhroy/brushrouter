@@ -193,7 +193,7 @@ function normalizeSeed(seed) {
   return Number.isFinite(n) && Number.isInteger(n) ? n : null;
 }
 
-export function buildHistoryRecord(entry, { cfg = null } = {}) {
+export function buildHistoryRecord(entry, { cfg = null, cwd = process.cwd() } = {}) {
   const provider = entry.provider || null;
   const model = entry.model || null;
   const usage = normalizeUsage(entry.usage);
@@ -227,7 +227,11 @@ export function buildHistoryRecord(entry, { cfg = null } = {}) {
     quality: entry.quality || null,
     background: entry.background || null,
     seed: normalizeSeed(entry.seed),
-    images: Array.isArray(entry.images) ? entry.images.filter((s) => typeof s === "string" && s.length > 0) : [],
+    images: Array.isArray(entry.images)
+      ? entry.images
+          .filter((s) => typeof s === "string" && s.length > 0)
+          .map((s) => (isAbsolute(s) ? s : resolve(cwd, s)))
+      : [],
     imagesUsed: Boolean(entry.imagesUsed),
     recipe: entry.recipe || null,
     look: entry.look || null,
@@ -262,9 +266,9 @@ function lockPermissions(filePath) {
   } catch {}
 }
 
-export function recordHistory(entry, { path = getHistoryPath(), cfg = null } = {}) {
+export function recordHistory(entry, { path = getHistoryPath(), cfg = null, cwd = process.cwd() } = {}) {
   if (isHistoryDisabled(cfg)) return null;
-  const record = buildHistoryRecord(entry, { cfg });
+  const record = buildHistoryRecord(entry, { cfg, cwd });
   ensureHistoryDir(path);
   appendFileSync(path, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
   lockPermissions(path);
