@@ -75,17 +75,21 @@ export const comfyUIProvider = {
       return { available: false, auth: "unreachable", detail: `ComfyUI is not reachable: ${err.message}` };
     }
   },
-  async generate({ prompt, size, images = [], mask, cwd, model: requestedModel, onProgress }, cfg) {
+  async generate({ prompt, size, seed: requestedSeed, images = [], mask, cwd, model: requestedModel, onProgress }, cfg) {
     requireMaskImage(mask, images);
+    if (requestedSeed != null && (!Number.isSafeInteger(requestedSeed) || requestedSeed < 0)) {
+      throw providerError("BAD_SEED", "ComfyUI seed must be a non-negative safe integer");
+    }
     const base = endpoint(cfg);
     const remaining = deadline(cfg, 300000);
     const model = requestedModel || cfg?.model || defaultModel;
     const dimensions = normalizeSize(size);
     const width = dimensions?.width || 1024;
     const height = dimensions?.height || 1024;
-    const params = { prompt, model, width, height, size: `${width}x${height}`, seed: randomInt(2 ** 32) };
+    const params = { prompt, model, width, height, size: `${width}x${height}`, seed: requestedSeed ?? randomInt(2 ** 32) };
     let graph;
     let usedModel = model;
+    let usedSeed = params.seed;
     if (cfg?.workflow) {
       const template = loadWorkflow(cfg.workflow);
       const placeholders = { ...params, ...Object.fromEntries(images.map((_, i) => [`image${i + 1}`, ""])), ...(images.length && { image: "" }), ...(mask && { mask: "" }) };
@@ -94,6 +98,10 @@ export const comfyUIProvider = {
       if (!seen.has("model")) {
         if (requestedModel) throw providerError("BAD_WORKFLOW", "ComfyUI workflow needs a {model} placeholder to override its model");
         usedModel = undefined;
+      }
+      if (!seen.has("seed")) {
+        if (requestedSeed != null) throw providerError("BAD_WORKFLOW", "ComfyUI workflow needs a {seed} placeholder to override its seed");
+        usedSeed = undefined;
       }
       if (!seen.has("prompt") || (mask && !seen.has("mask")) || images.some((_, i) => !seen.has(`image${i + 1}`) && !(i === 0 && seen.has("image")))) {
         throw providerError("BAD_WORKFLOW", "ComfyUI workflow must consume {prompt}, every supplied reference ({image}, {image2}, …), and {mask} when supplied");
@@ -129,7 +137,9 @@ export const comfyUIProvider = {
       if (output) {
         const query = new URLSearchParams({ filename: output.filename, subfolder: output.subfolder || "", type: "output" });
         const buffer = await apiRequest(id, `${base}/view?${query}`, {}, remaining(), { raw: true });
-        return imageResult(id, usedModel, buffer, { images, mask });
+        const result = imageResult(id, usedModel, buffer, { images, mask });
+        if (usedSeed !== undefined) result.meta.seed = usedSeed;
+        return result;
       }
       if (record?.status?.completed) throw providerError("BAD_IMAGE_PAYLOAD", "ComfyUI workflow completed without an output image; add a SaveImage node");
       await pollDelay(remaining, cfg);
