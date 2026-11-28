@@ -23,7 +23,7 @@ import { resolve, join, dirname, extname, basename, isAbsolute } from "node:path
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG } from "../src/config.js";
+import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG, DEFAULT_OPENAI_IMAGE_MODEL } from "../src/config.js";
 import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
 import {
   tryRecordHistory,
@@ -169,6 +169,7 @@ function parse(argv) {
         quality: { type: "string", short: "q" },
         background: { type: "string" },
         images: { type: "string", multiple: true },
+        mask: { type: "string" },
         json: { type: "boolean", default: false },
         "dry-run": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
@@ -233,7 +234,7 @@ function parse(argv) {
 // tokens a leading flag consumes while looking for the command.
 const VALUE_FLAGS = new Set([
   "--provider", "-p", "--model", "-m", "--out", "-o", "--size", "-s",
-  "--quality", "-q", "--background", "--images", "--category", "-c", "--kind",
+  "--quality", "-q", "--background", "--images", "--mask", "--category", "-c", "--kind",
   "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape",
   "--recipe", "--look", "--twist", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
@@ -316,6 +317,7 @@ ${paint(C.bold, "OPTIONS")}
                            the codex route; phrase prompts as "sticker/isolated"
                            to reliably keep alpha — other routes get a prompt hint)
       --images <path>      Reference image (repeatable; image-to-image)
+      --mask <path>        Inpaint the first reference image (requires --images)
       --json               Machine-readable output
   -c, --category <id>      Recipes: restrict to one category
       --kind <k>           Recipes: job (a layout we wrote, ${LIB_COUNTS.job}) | look
@@ -342,7 +344,7 @@ ${paint(C.bold, "OPTIONS")}
       --status <ok|failed> history: filter by outcome (or --failed)
       --keep <n>           history prune: keep the newest N entries
       --before <days>      history prune: remove entries older than N days (e.g. 30d)
-      --no-images          replay: drop original reference images
+      --no-images          replay: drop original reference images and mask
       --dry-run            gen: show the route it would take, send nothing.
                            routes/install: show what would change, apply nothing
       --force              gen: overwrite -o instead of saving a new version.
@@ -472,6 +474,16 @@ async function cmdGenerate(args) {
   // Reference images: validate before spending a request, and never let a route
   // silently drop them (they used to be accepted and ignored on 4 of 7 routes).
   const imagePaths = values.images || [];
+  const mask = values.mask;
+  if (mask != null) {
+    try {
+      if (!mask.trim() || !imagePaths.length) throw new Error("requires a base image via --images");
+      assertImageFile(mask, cwd);
+    } catch (e) {
+      console.error(bad(`error: --mask ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
+  }
   for (const p of imagePaths) {
     try {
       // Header-only: this loop only needs to reject a bad reference before a
@@ -487,7 +499,7 @@ async function cmdGenerate(args) {
     console.error(bad("error: --background must be opaque or transparent"));
     return exitAfterFlush(2);
   }
-  if (imagePaths.length && values.provider) {
+  if (imagePaths.length && values.provider && !(mask && values.fallback)) {
     // `supportsImages` is a static capability flag, not a health check. This used
     // to call probeAll() — spawning the Codex CLI and hitting the OpenRouter API
     // — to read a constant. An unknown id is left for generate() to reject.
@@ -508,7 +520,7 @@ async function cmdGenerate(args) {
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback, images: imagePaths });
+      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback, images: imagePaths, mask });
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -516,7 +528,7 @@ async function cmdGenerate(args) {
     const rows = await probeAll(cfg);
     const byId = new Map(rows.map((r) => [r.id, r]));
     if (values.json) {
-      console.log(JSON.stringify(redactValue({ dryRun: true, prompt, out, provider: values.provider || null, model: values.model || null, images: imagePaths, wouldTry: order.map((id) => ({ id, ready: Boolean(byId.get(id)?.available), detail: byId.get(id)?.detail || null })) }), null, 2));
+      console.log(JSON.stringify(redactValue({ dryRun: true, prompt, out, provider: values.provider || null, model: values.model || null, images: imagePaths, mask, wouldTry: order.map((id) => ({ id, ready: Boolean(byId.get(id)?.available), detail: byId.get(id)?.detail || null })) }), null, 2));
       return;
     }
     console.log(paint(C.bold, "Dry run") + dim(" — no request sent, no quota used\n"));
@@ -524,6 +536,7 @@ async function cmdGenerate(args) {
     console.log(`  out:      ${out}`);
     if (values.model) console.log(`  model:    ${values.model}`);
     if (imagePaths.length) console.log(`  images:   ${imagePaths.join(", ")}`);
+    if (mask) console.log(`  mask:     ${redact(mask)}`);
     console.log(dim("\n  would try, in order:"));
     for (const id of order) {
       const r = byId.get(id);
@@ -545,6 +558,7 @@ async function cmdGenerate(args) {
         background: values.background || undefined,
         seed,
         images: imagePaths,
+        mask,
         out,
         cwd,
         provider: values.provider,
@@ -570,6 +584,7 @@ async function cmdGenerate(args) {
         background: values.background || null,
         seed: seed ?? null,
         images: imagePaths,
+        mask,
         ...recipeMeta,
         out: outAbs,
         durationMs: e.durationMs ?? null,
@@ -598,7 +613,7 @@ async function cmdGenerate(args) {
 
   let saved;
   try {
-    saved = saveImage(out, result.buffer, cwd, { force: values.force });
+    saved = saveImage(out, result.buffer, cwd, { force: values.force, matchExtension: !values.out });
   } catch (e) {
     if (values.json) {
       console.log(JSON.stringify(redactValue({ ok: false, error: e.message, code: "SAVE_FAILED" }), null, 2));
@@ -624,6 +639,7 @@ async function cmdGenerate(args) {
       background: values.background || null,
       seed: result.meta?.seed ?? seed ?? null,
       images: imagePaths,
+      mask,
       imagesUsed: result.meta?.imagesUsed,
       ...recipeMeta,
       out: saved.savedPath,
@@ -981,25 +997,49 @@ async function cmdBatch(args) {
 
   const items = resolvedItems.map((item, idx) => ({
     ...item,
+    ...(item.mask != null || values.mask != null ? { mask: item.mask ?? values.mask } : {}),
     ...(item.seed !== undefined ? { seed: item.seed } : batchSeed !== undefined ? { seed: batchSeed } : {}),
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, resolvedItems.length, item.slugLabel || item.prompt),
+    out: item.out ? resolve(outDir, item.out) : undefined,
   }));
+
+  for (const [index, item] of items.entries()) {
+    if (item.mask == null) continue;
+    try {
+      if (typeof item.mask !== "string" || !item.mask.trim() || !item.images.length) throw new Error("requires a mask file path and a base image");
+      assertImageFile(item.mask, cwd);
+      for (const path of item.images) assertImageFile(path, cwd);
+    } catch (e) {
+      console.error(bad(`error: batch item ${index + 1} mask: ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
+  }
 
   const onProgress = values.verbose
     ? (msg) => process.stderr.write(dim(`  · ${redact(msg)}\n`))
     : null;
 
   if (values["dry-run"]) {
-    let order;
+    const previewPath = (item, index) => item.out || batchItemPath(outDir, index + 1, items.length, item.slugLabel || item.prompt);
+    let plans;
     try {
-      order = await planAttemptOrder(cfg, { provider: values.provider, fallback: values.fallback });
+      plans = await Promise.all(items.map(async (item) => {
+        try {
+          const order = await planAttemptOrder(cfg, {
+            provider: values.provider, fallback: values.fallback, images: item.images, mask: item.mask,
+          });
+          return { order };
+        } catch (error) {
+          if (!item.mask || error.code !== "UNSUPPORTED") throw error;
+          return { order: [], code: error.code, error: error.message };
+        }
+      }));
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
     }
     const probes = await probeAll(cfg);
     const byId = new Map(probes.map((p) => [p.id, p]));
-    const readyProbes = order
+    const readyProbes = [...new Set(plans.flatMap((plan) => plan.order))]
       .map((id) => byId.get(id))
       .filter((p) => p && (values.provider === p.id ? p.enabled : p.enabled && p.available));
     const perProviderLimit = (id) => {
@@ -1009,6 +1049,7 @@ async function cmdBatch(args) {
     const concurrency = values.concurrency
       ? Number(values.concurrency)
       : readyProbes.reduce((sum, p) => sum + perProviderLimit(p.id), 0);
+    const allFailed = plans.length > 0 && plans.every((plan) => plan.error);
 
     if (values.json) {
       console.log(
@@ -1023,7 +1064,10 @@ async function cmdBatch(args) {
             items: items.map((it, idx) => ({
               index: idx + 1,
               prompt: it.prompt,
-              out: it.out,
+              out: previewPath(it, idx),
+              code: plans[idx].code,
+              error: plans[idx].error,
+              ...(it.mask !== undefined ? { mask: it.mask } : {}),
               ...(it.size ? { size: it.size } : {}),
               ...(it.recipe ? { recipe: it.recipe } : {}),
               ...(it.look ? { look: it.look } : {}),
@@ -1034,6 +1078,7 @@ async function cmdBatch(args) {
           2,
         ),
       );
+      if (allFailed) return exitAfterFlush(1);
       return;
     }
 
@@ -1049,10 +1094,12 @@ async function cmdBatch(args) {
       const it = items[i];
       const tagParts = [it.recipe, it.look && it.look !== it.recipe ? it.look : null].filter(Boolean);
       const tag = tagParts.length ? `[${tagParts.join(" + ")}] ` : "";
-      console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${it.out}`);
+      const destination = plans[i].error ? warn(redact(plans[i].error)) : previewPath(it, i);
+      console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${destination}`);
     }
     if (items.length > 10) console.log(dim(`    ... and ${items.length - 10} more`));
     console.log("");
+    if (allFailed) return exitAfterFlush(1);
     return;
   }
 
@@ -1100,6 +1147,7 @@ async function cmdBatch(args) {
               background: res.item.background || null,
               seed: res.meta?.seed ?? res.item.seed ?? null,
               images: res.item.images || [],
+              mask: res.item.mask,
               imagesUsed: res.meta?.imagesUsed,
               out: res.savedPath,
               bytes: res.bytes ?? null,
@@ -1153,6 +1201,7 @@ async function cmdBatch(args) {
               background: fail.item.background || null,
               seed: fail.item.seed ?? null,
               images: fail.item.images || [],
+              mask: fail.item.mask,
               out: fail.item.out || null,
               durationMs: fail.durationMs ?? null,
               attempts: fail.attempts,
@@ -1412,6 +1461,7 @@ async function cmdReplay(args) {
       out: values.out,
       fallback: values.fallback,
       images: values.images,
+      mask: values.mask,
       noImages: values["no-images"],
       prompt: values.prompt?.[0],
       twist: values.twist,
@@ -1437,11 +1487,21 @@ async function cmdReplay(args) {
       return exitAfterFlush(2);
     }
   }
+  if (req.mask != null) {
+    try {
+      if (!req.mask.trim() || !req.images.length) throw new Error("requires a mask file path and a base image");
+      assertImageFile(req.mask, cwd);
+    } catch (e) {
+      console.error(bad(`error: mask is unavailable (${redact(e.message)})`));
+      console.error(dim("  pass --mask <path> to supply a replacement, or --no-images to drop the references and mask"));
+      return exitAfterFlush(2);
+    }
+  }
 
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: req.provider, fallback: req.fallback, images: req.images });
+      order = await planAttemptOrder(cfg, req);
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -1458,6 +1518,7 @@ async function cmdReplay(args) {
     if (req.size) console.log(`  size:     ${req.size}`);
     if (req.seed != null) console.log(`  seed:     ${req.seed}`);
     if (req.images?.length) console.log(`  images:   ${req.images.join(", ")}`);
+    if (req.mask) console.log(`  mask:     ${redact(req.mask)}`);
     console.log(`  would try: ${order.join(" → ")}\n`);
     return;
   }
@@ -1476,6 +1537,7 @@ async function cmdReplay(args) {
         background: req.background,
         seed: req.seed,
         images: req.images,
+        mask: req.mask,
         out,
         cwd,
         provider: req.provider,
@@ -1501,6 +1563,7 @@ async function cmdReplay(args) {
         background: req.background || null,
         seed: req.seed ?? null,
         images: req.images || [],
+        mask: req.mask,
         recipe: req.recipe,
         look: req.look,
         values: req.values,
@@ -1540,6 +1603,7 @@ async function cmdReplay(args) {
       background: req.background || null,
       seed: result.meta?.seed ?? req.seed ?? null,
       images: req.images || [],
+      mask: req.mask,
       imagesUsed: result.meta?.imagesUsed,
       recipe: req.recipe,
       look: req.look,
@@ -1620,7 +1684,7 @@ async function cmdProviders(args) {
   const width = Math.max(0, ...rows.map((r) => r.id.length));
   for (const r of rows) {
     const badge = !r.enabled ? warn("disabled") : r.available ? ok("connected") : bad("unavailable");
-    console.log(`  ${r.id.padEnd(width)}  ${badge}  ${dim(r.label)}${r.supportsImages ? "" : dim("  (no reference images)")}`);
+    console.log(`  ${r.id.padEnd(width)}  ${badge}  ${dim(r.label)}${r.supportsMask ? dim("  (inpainting)") : r.supportsImages ? "" : dim("  (no reference images)")}`);
     if (r.detail) console.log(`  ${" ".repeat(width)}  ${dim(redact(r.detail))}`);
   }
   console.log(dim(`\nAuto-routing order: ${cfg.priority.join(" → ")}`));
@@ -1695,7 +1759,11 @@ async function cmdModels(args) {
       "gemini-2.5-flash-image",
     ],
     openrouter: [],
-    fal: ["fal-ai/flux/schnell", "fal-ai/flux/dev", "fal-ai/flux-pro/v1.1"],
+    fal: ["fal-ai/flux/schnell", "fal-ai/flux/dev", "fal-ai/flux-pro/v1.1", "fal-ai/flux-2/edit", "fal-ai/flux-lora/inpainting"],
+    openai: [DEFAULT_OPENAI_IMAGE_MODEL, "gpt-image-2.6-flare"],
+    "gemini-api": ["gemini-2.5-flash-image"],
+    replicate: ["black-forest-labs/flux-schnell"],
+    comfyui: ["flux1-schnell.safetensors"],
     "custom-http": ["(from your config)"],
   };
   // OpenRouter is the one provider with a live catalogue — fetch it so the user
@@ -2528,7 +2596,7 @@ async function cmdSetup(args) {
         if (!res || !Buffer.isBuffer(res.buffer) || res.buffer.length === 0) {
           throw new Error(`${res?.provider || ready[0].id} returned no image data`);
         }
-        const saved = saveImage(testOut, res.buffer, cwd, { force: true });
+        const saved = saveImage(testOut, res.buffer, cwd, { force: true, matchExtension: true });
         const sec = ((Date.now() - start) / 1000).toFixed(1);
         const kb = Math.round(res.buffer.length / 1024);
         const mime = detectImageMime(res.buffer) || "image/png";

@@ -51,9 +51,9 @@ Every provider implements:
 
 ```js
 {
-  id, label, kind, note,
-  async probe(cfg)  -> { available, auth, detail, expires?, ... },   // cheap, credential-free
-  async generate({ prompt, size, quality, images, out, cwd, onProgress }, cfg)
+  id, label, kind, note, supportsImages?, supportsMask?,
+  async probe(cfg)  -> { available, auth, detail, expires?, ... },   // cheap; never bills
+  async generate({ prompt, size, quality, images, mask, out, cwd, onProgress }, cfg)
                     -> { buffer: Buffer, meta: { provider, model, ... } }
 }
 ```
@@ -70,6 +70,16 @@ Every provider implements:
 `enabled: false` is a capability switch, not a preference. It is the only thing standing between an agent that holds a key and a route that bills per request, so it is enforced in `attemptOrder()` *and* `batchGenerate()` — naming a disabled route explicitly is a hard error, and turning it on requires `brushrouter routes enable <id>` (a persisted, deliberate change) rather than a flag any caller can append.
 
 Every attempt is recorded, so the CLI and the MCP response can both report the full trail (`codex-cli=failed → codex=failed → gemini=ok`).
+
+Mask routing is stricter than reference-only routing: `mask` is a local file path and requires a first reference image. Single and batch dispatch exclude providers without `supportsMask: true` for that request, including fallback and retries. This flag denotes support by the adapter; Replicate and ComfyUI still require a compatible model or workflow and refuse edits they cannot convey.
+
+### Direct APIs and local workflows
+
+- **OpenAI Images** sends JSON to `/images/generations`, or multipart to `/images/edits` with ordered `image[]` parts and an optional PNG mask. The API key is separate from Codex subscription auth.
+- **Google AI Studio** (`gemini-api`) calls `generateContent` with an API key header and `inlineData` parts. Pixel sizes map to the nearest supported aspect ratio rather than exact dimensions. The separate `gemini` CLI route stages references in its temporary workspace and excludes those inputs from output discovery.
+- **fal** selects its configured text, edit, or inpaint endpoint based on the supplied files. Inputs are data URLs, using `image_urls` for edits and `image_url` plus `mask_url` for inpainting.
+- **Replicate** sends a prediction with `Prefer: wait=10`, polls the prediction ID on the same API until completion, and downloads the output without forwarding the API token.
+- **ComfyUI** probes `/system_stats`, optionally uploads files to `/upload/image`, submits a graph to `/prompt`, polls `/history/{id}`, and fetches a saved output from `/view`. Workflow paths and backend URLs are configured only in trusted user config or environment. Substitution walks parsed JSON values (not keys) and keeps exact numeric placeholders numeric.
 
 ## 3. Native first
 
@@ -136,6 +146,10 @@ Every browserless image generation is an ordinary **persistent** ChatGPT convers
 - Credentials come from the environment, from a `0600` file (`~/.config/brushrouter/keys.json`, directory `0700`), or from an auth store another tool already maintains.
 - `src/util/keys.js` never returns a key to a caller that prints it; `describeKey()` yields only `sk-o…****** (73 chars)`.
 - Shape validation rejects placeholders and mismatched formats, so a proxy token sitting in `OPENAI_API_KEY` is not mistaken for a real OpenAI key.
+
+### Checkout routing settings
+
+A checkout's `brushrouter.config.json` cannot enable a metered route or add one to its priority list. An operator-configured priority with enabled metered routes takes precedence. When the trusted priority is in use, the checkout cannot disable an enabled non-metered route ahead of a metered fallback. This safeguard also covers `gptweb2api` anywhere in the list, because the router can move it to the front for free ChatGPT accounts.
 
 ### Redaction at every boundary
 

@@ -1071,8 +1071,8 @@ test("attemptOrder prioritizes image-capable providers when images are provided"
     },
   };
   const order = await planAttemptOrder(cfg, { images: ["ref.png"] });
-  assert.equal(order[0], "openrouter");
-  assert.deepEqual(order, ["openrouter", "gptweb2api", "gemini", "fal"]);
+  assert.equal(order[0], "gemini");
+  assert.deepEqual(order, ["gemini", "fal", "openrouter", "gptweb2api"]);
 });
 
 test("customHttpProvider uses resolved key for auth", async () => {
@@ -1973,6 +1973,14 @@ test("a project config cannot choose an executable via providers.*.bin", () => {
   }
 });
 
+test("a checkout can set a non-metered priority when every listed metered route is disabled", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "br-project-priority-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeFileSync(join(cwd, "brushrouter.config.json"), JSON.stringify({ priority: ["gemini", "openai", "codex"] }));
+  const userConfig = { priority: ["codex", "openai", "fal", "gemini"], providers: { fal: { enabled: false } } };
+  assert.deepEqual(loadConfig({ cwd, userConfig }).priority, ["gemini", "codex"]);
+});
+
 test("project-config allow-list is not bypassable via __proto__, nesting or arrays", () => {
   const dir = mkdtempSync(join(tmpdir(), "br-project-proto-"));
   try {
@@ -2352,7 +2360,7 @@ test("MCP rejects batch items without a prompt instead of generating a blank ima
     assert.deepEqual(prompts, [], "a promptless item reached a provider");
 
     // A bare string is a prompt, not an object to spread character by character.
-    const ok = await call(2, { items: ["a red fox"], outDir: join(dir, "out2") });
+    const ok = await call(2, { items: ["a red fox"], provider: "mock-norm", outDir: join(dir, "out2") });
     assert.equal(ok.result.isError, false, ok.result.content[0].text);
     assert.deepEqual(prompts, ["a red fox"]);
     assert.match(ok.result.content[0].text, /01-a-red-fox\.png/);
@@ -3420,16 +3428,16 @@ test("codex refreshAuthToken persists refreshed tokens for non-openai pi/omp aut
   }
 });
 
-test("fal and gemini providers reject reference images loudly with UNSUPPORTED", async () => {
-  const { falProvider } = await import("../src/providers/http.js");
+test("Gemini CLI and Google AI Studio providers reject masks loudly with UNSUPPORTED", async () => {
+  const { geminiAPIProvider } = await import("../src/providers/gemini-api.js");
   const { geminiProvider } = await import("../src/providers/gemini.js");
   await assert.rejects(
-    () => falProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"] }, { apiKey: "fal-test-key-123456" }),
-    (err) => err.code === "UNSUPPORTED" && /reference images/i.test(err.message),
+    () => geminiAPIProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"], mask: "/tmp/mask.png" }, {}),
+    (err) => err.code === "UNSUPPORTED" && /masks/i.test(err.message),
   );
   await assert.rejects(
-    () => geminiProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"] }, {}),
-    (err) => err.code === "UNSUPPORTED" && /reference images/i.test(err.message),
+    () => geminiProvider.generate({ prompt: "edit this", images: ["/tmp/ref.png"], mask: "/tmp/mask.png" }, {}),
+    (err) => err.code === "UNSUPPORTED" && /masks/i.test(err.message),
   );
 });
 
@@ -3488,7 +3496,7 @@ test("CLI gen --dry-run --images prioritizes image-capable providers", () => {
     writeFileSync(
       home.userConfig,
       JSON.stringify({
-        priority: ["gemini", "fal", "openrouter"],
+        priority: ["gptweb2api", "gemini", "fal", "openrouter"],
         providers: { gemini: { enabled: true }, fal: { enabled: true }, openrouter: { enabled: true } },
       }),
     );
@@ -3498,7 +3506,7 @@ test("CLI gen --dry-run --images prioritizes image-capable providers", () => {
     });
     assert.equal(r.status, 0, r.stderr);
     const parsed = JSON.parse(r.stdout);
-    assert.equal(parsed.wouldTry[0].id, "openrouter", `expected image-capable openrouter first, got ${JSON.stringify(parsed.wouldTry)}`);
+    assert.equal(parsed.wouldTry[0].id, "gemini", `expected image-capable gemini first, got ${JSON.stringify(parsed.wouldTry)}`);
   } finally {
     rmSync(home.home, { recursive: true, force: true });
   }
@@ -3648,10 +3656,10 @@ test("saveImage uses atomic exclusive create and versions collisions without ove
 
 test("batchGenerate does not sleep for cooldown on providers incompatible with pending items", async () => {
   const { batchGenerate, PROVIDERS } = await import("../src/router.js");
-  const origGenerate = PROVIDERS.fal.generate;
-  const origProbe = PROVIDERS.fal.probe;
-  PROVIDERS.fal.probe = async () => ({ available: true });
-  PROVIDERS.fal.generate = async () => {
+  const origGenerate = PROVIDERS.gptweb2api.generate;
+  const origProbe = PROVIDERS.gptweb2api.probe;
+  PROVIDERS.gptweb2api.probe = async () => ({ available: true });
+  PROVIDERS.gptweb2api.generate = async () => {
     const e = new Error("429 Too Many Requests");
     e.code = "QUOTA";
     throw e;
@@ -3663,18 +3671,17 @@ test("batchGenerate does not sleep for cooldown on providers incompatible with p
         { prompt: "text only" },
         { prompt: "needs ref", images: ["/tmp/does-not-matter.png"] },
       ],
-      provider: "fal",
+      provider: "gptweb2api",
       fallback: false,
       cooldownMs: 30000,
       concurrency: 1,
-      cfg: { providers: { fal: { apiKey: "fal-key-test" } }, order: ["fal"] },
-    });
+    }, { providers: { gptweb2api: { enabled: true } }, priority: ["gptweb2api"] });
     const elapsed = Date.now() - t0;
     assert.equal(res.failed, 2);
     assert.ok(elapsed < 2000, `expected immediate failure for incompatible item, took ${elapsed}ms`);
   } finally {
-    PROVIDERS.fal.generate = origGenerate;
-    PROVIDERS.fal.probe = origProbe;
+    PROVIDERS.gptweb2api.generate = origGenerate;
+    PROVIDERS.gptweb2api.probe = origProbe;
   }
 });
 
@@ -4065,6 +4072,7 @@ test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, l
     const mcpItemsRes = await handleToolCall(
       "batch_generate_images",
       {
+        provider: "mock-br",
         outDir: join(dir, "mcp-items"),
         values: { ratio: "4:5" },
         items: [
@@ -4086,6 +4094,7 @@ test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, l
     const mcpBrainstormRes = await handleToolCall(
       "batch_generate_images",
       {
+        provider: "mock-br",
         outDir: join(dir, "mcp-brainstorm"),
         brainstorm: "editorial",
         recipe: "product-hero",

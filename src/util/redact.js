@@ -65,6 +65,7 @@ const SHAPE_PATTERNS = [
   [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "xox***"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***"],
   [/\bAIza[A-Za-z0-9_-]{30,}\b/g, "AIza***"],
+  [/\br8_[A-Za-z0-9_-]{20,}\b/g, "r8_***"],
   // AWS access key ids (AKIA + 16 upper-case alphanumerics) and their secret
   // siblings. AWS was the one credentialed provider whose key shape we did not
   // know, so a Custom-HTTP endpoint hit with SigV4 creds echoed in full.
@@ -87,7 +88,7 @@ const SHAPE_PATTERNS = [
   // Antigravity provider reads them off disk, so they need their own rule.
   [/\bya29\.[A-Za-z0-9._-]{20,}/g, "ya29.***"],
   [/\b1\/\/[A-Za-z0-9_-]{20,}/g, "1//***"],
-  [/\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|FAL_KEY|GEMINI_API_KEY|BRUSHROUTER_[A-Z_]*KEY)\s*=\s*\S+/g, "$1=***"],
+  [/\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|FAL_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|REPLICATE_API_TOKEN|BRUSHROUTER_[A-Z_]*KEY)\s*=\s*\S+/g, "$1=***"],
 ];
 
 export function redact(input) {

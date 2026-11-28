@@ -10,13 +10,14 @@
 // We delegate to the CLI rather than calling Google APIs directly so we never
 // handle the user's Google tokens ourselves.
 
-import { existsSync, readFileSync, mkdtempSync, rmSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, mkdirSync, rmSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendTailed, detectImageMime, isPathInside } from "../util/common.js";
+import { appendTailed, detectImageMime, isPathInside, readImageFile } from "../util/common.js";
 import { resolveExecutable } from "../util/discover.js";
 import { redact, registerSecret } from "../util/redact.js";
+import { providerError } from "./image-api.js";
 
 function run(cmd, args, { timeoutMs = 180000, cwd, env, shell = false } = {}) {
   return new Promise((resolve) => {
@@ -66,7 +67,7 @@ function run(cmd, args, { timeoutMs = 180000, cwd, env, shell = false } = {}) {
   });
 }
 
-function findNewestImage(dir, sinceMs = 0) {
+function findNewestImage(dir, sinceMs = 0, excluded) {
   let best = null;
   let bestTime = 0;
   const walk = (d, depth = 0) => {
@@ -79,6 +80,7 @@ function findNewestImage(dir, sinceMs = 0) {
     }
     for (const e of entries) {
       const p = join(d, e.name);
+      if (p === excluded || (excluded && isPathInside(p, excluded))) continue;
       if (e.isDirectory()) {
         walk(p, depth + 1);
         continue;
@@ -156,7 +158,20 @@ const AGY_AGENT_MODELS = new Set([
   "gpt-oss-120b-medium",
 ]);
 
-async function generateWithAntigravity(cli, { prompt, onProgress, model: requestedModel }, cfg) {
+function stageReferences(work, images, cwd) {
+  if (!images.length) return { instruction: "", dir: undefined };
+  const dir = join(work, "reference-inputs");
+  mkdirSync(dir, { mode: 0o700 });
+  const mentions = images.map((path, i) => {
+    const { buffer, mime } = readImageFile(path, cwd);
+    const name = `${i + 1}.${mime === "image/jpeg" ? "jpg" : mime.split("/")[1]}`;
+    writeFileSync(join(dir, name), buffer);
+    return `@reference-inputs/${name}`;
+  });
+  return { instruction: ` Read and use these reference images in order:\n${mentions.join("\n")}\n`, dir };
+}
+
+async function generateWithAntigravity(cli, { prompt, images, cwd, onProgress, model: requestedModel }, cfg) {
   const timeoutMs = Number(cfg?.timeoutMs) || 300000;
   const work = mkdtempSync(join(tmpdir(), "brushrouter-agy-"));
   try {
@@ -165,9 +180,10 @@ async function generateWithAntigravity(cli, { prompt, onProgress, model: request
     const isAgyAgentModel = AGY_AGENT_MODELS.has(model);
     const agyModelFlag = isAgyAgentModel ? model : DEFAULT_GEMINI_MODEL;
     const modelMention = isAgyAgentModel ? "" : ` using ${model}`;
+    const refs = stageReferences(work, images, cwd);
     const instruction =
       `Generate an image for this prompt${modelMention} and save the resulting image file in the current ` +
-      `directory as brushrouter-out.png: ${prompt}`;
+      `directory as brushrouter-out.png.${refs.instruction} Prompt: ${prompt}`;
     const started = Date.now();
     const args = [
       "--print",
@@ -190,10 +206,10 @@ async function generateWithAntigravity(cli, { prompt, onProgress, model: request
     const scratchDir = join(homedir(), ".gemini", "antigravity-cli", "scratch");
     const allowedDirs = [work, scratchDir];
     const found =
-      findNewestImage(work, started) ||
+      findNewestImage(work, started, refs.dir) ||
       findNewestImage(scratchDir, started) ||
-      findNewestImage(work) ||
-      parseImagePathFromOutput(r.stdout, allowedDirs);
+      findNewestImage(work, 0, refs.dir) ||
+      parseImagePathFromOutput(r.stdout, allowedDirs, refs.dir);
     if (found) {
       const buf = readFileSync(found);
       if (!detectImageMime(buf)) {
@@ -211,14 +227,15 @@ async function generateWithAntigravity(cli, { prompt, onProgress, model: request
   }
 }
 
-async function generateWithGemini(cli, { prompt, onProgress, model: requestedModel }, cfg) {
+async function generateWithGemini(cli, { prompt, images, cwd, onProgress, model: requestedModel }, cfg) {
   const model = requestedModel || cfg?.model || "gemini-2.5-flash-image";
   const work = mkdtempSync(join(tmpdir(), "brushrouter-gemini-"));
   try {
     onProgress?.("generating via gemini CLI...", 20);
+    const refs = stageReferences(work, images, cwd);
     const instruction =
       `Generate an image and save it as the file "brushrouter-out.png" in the current directory. ` +
-      `Use your image generation capability. Do not ask for confirmation. Prompt: ${prompt}`;
+      `Use your image generation capability. Do not ask for confirmation.${refs.instruction} Prompt: ${prompt}`;
     const started = Date.now();
     const r = await run(cli.bin, ["--skip-trust", "-m", model, "-p", instruction, "-y"], {
       timeoutMs: Number(cfg?.timeoutMs) || 180000,
@@ -226,7 +243,7 @@ async function generateWithGemini(cli, { prompt, onProgress, model: requestedMod
       env: { GEMINI_CLI_TRUST_WORKSPACE: "true" },
     });
     const found =
-      findNewestImage(work, started) || findNewestImage(work) || parseImagePathFromOutput(r.stdout, [work]);
+      findNewestImage(work, started, refs.dir) || findNewestImage(work, 0, refs.dir) || parseImagePathFromOutput(r.stdout, [work], refs.dir);
     if (found) {
       const buf = readFileSync(found);
       if (!detectImageMime(buf)) {
@@ -246,7 +263,7 @@ async function generateWithGemini(cli, { prompt, onProgress, model: requestedMod
 
 // The CLI often prints the path it saved to (in markdown link or plain form).
 // Using it is more reliable than guessing from the filesystem.
-function parseImagePathFromOutput(stdout, allowedDirs = []) {
+function parseImagePathFromOutput(stdout, allowedDirs = [], excluded) {
   const text = String(stdout || "");
   const patterns = [
     /file:\/\/([^\s)\]"']+\.(?:png|jpe?g|webp|gif))/gi,
@@ -259,7 +276,7 @@ function parseImagePathFromOutput(stdout, allowedDirs = []) {
       try {
         const raw = matches[i][1];
         const p = decodeURIComponent(raw.startsWith("/") && raw.length > 2 && raw[2] === ":" ? raw.slice(1) : raw);
-        if (existsSync(p) && allowedDirs.some((dir) => isPathInside(p, dir))) return p;
+        if (existsSync(p) && !(excluded && isPathInside(p, excluded)) && allowedDirs.some((dir) => isPathInside(p, dir))) return p;
       } catch {}
     }
   }
@@ -288,7 +305,7 @@ function failedFromCli(name, r) {
 
 export const geminiProvider = {
   id: "gemini",
-  supportsImages: false,
+  supportsImages: true,
   label: "Google (Antigravity / Gemini CLI)",
   kind: "cli-oauth",
   note: "Uses an installed Google CLI's login. Prefers `agy` (Antigravity); the old gemini free tier is retired.",
@@ -333,19 +350,16 @@ export const geminiProvider = {
     };
   },
 
-  async generate({ prompt, images = [], onProgress, model: requestedModel }, cfg) {
-    if (images?.length) {
-      const e = new Error("gemini does not support reference images; use codex, codex-cli, or openrouter");
-      e.code = "UNSUPPORTED";
-      throw e;
-    }
+  async generate({ prompt, images = [], mask, cwd, onProgress, model: requestedModel }, cfg) {
+    if (mask != null) throw providerError("UNSUPPORTED", "gemini CLI does not support masks");
     const cli = await resolveCli(cfg);
     if (!cli) {
       const e = new Error("neither `agy` nor `gemini` is installed");
       e.code = "NO_AUTH";
       throw e;
     }
-    if (cli.flavor === "antigravity") return generateWithAntigravity(cli, { prompt, onProgress, model: requestedModel }, cfg);
-    return generateWithGemini(cli, { prompt, onProgress, model: requestedModel }, cfg);
+    const request = { prompt, images, cwd, onProgress, model: requestedModel };
+    if (cli.flavor === "antigravity") return generateWithAntigravity(cli, request, cfg);
+    return generateWithGemini(cli, request, cfg);
   },
 };

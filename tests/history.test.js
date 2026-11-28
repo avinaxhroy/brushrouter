@@ -570,6 +570,82 @@ test("CLI: history, replay --dry-run, stats, and --seed validation", async () =>
   }
 });
 
+test("history detail strips terminal control characters from recorded paths", () => {
+  const path = (name) => `fixtures/\x1b[32m${name}\x1b[0m.png`;
+  const detail = renderHistoryDetail({
+    id: "test",
+    ok: true,
+    images: [path("base")],
+    mask: path("mask"),
+    out: path("output"),
+  });
+  assert.doesNotMatch(detail, /\x1b/);
+  for (const name of ["base", "mask", "output"]) assert.ok(detail.includes(`fixtures/${name}.png`));
+});
+
+test("masked history replays the original mask across working directories", async (t) => {
+  const dir = makeTempDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const historyPath = join(dir, "history.jsonl");
+  const previous = process.env.BRUSHROUTER_HISTORY_PATH;
+  process.env.BRUSHROUTER_HISTORY_PATH = historyPath;
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRUSHROUTER_HISTORY_PATH;
+    else process.env.BRUSHROUTER_HISTORY_PATH = previous;
+  });
+  const maskPath = join(dir, "mask.png");
+  const basePath = join(dir, "base.png");
+  for (const file of [basePath, maskPath]) writeFileSync(file, TINY_PNG);
+  const seen = [];
+  t.mock.method(PROVIDERS.fal, "generate", async ({ images, mask }) => {
+    seen.push({ images, mask });
+    return { buffer: TINY_PNG, meta: { model: "fixture" } };
+  });
+  await handleToolCall(TOOL_NAME, {
+    prompt: "edit", provider: "fal", images: ["base.png"], mask: "mask.png", out: "original.png",
+  }, { cwd: dir });
+  const entry = getHistoryEntry("last");
+  assert.equal(entry.mask, maskPath);
+  assert.deepEqual(entry.images, [basePath]);
+  const dry = await runCli(["replay", entry.id, "--dry-run", "--json"], { BRUSHROUTER_HISTORY_PATH: historyPath });
+  assert.equal(dry.code, 0, dry.stderr);
+  assert.equal(JSON.parse(dry.stdout).mask, maskPath);
+  await handleToolCall(REPLAY_TOOL_NAME, { id: entry.id, out: join(dir, "replayed.png") }, { cwd: tmpdir() });
+  assert.deepEqual(seen.at(-1), { images: [basePath], mask: maskPath });
+
+  rmSync(maskPath);
+  const missing = await runCli(["replay", entry.id, "--dry-run"], { BRUSHROUTER_HISTORY_PATH: historyPath });
+  assert.equal(missing.code, 2, missing.stderr);
+  assert.match(missing.stderr, /mask.*unavailable/i);
+  await assert.rejects(() => handleToolCall(REPLAY_TOOL_NAME, { id: entry.id }, { cwd: dir }), /mask.*unavailable/i);
+  assert.equal(seen.length, 2);
+  assert.equal(buildReplayRequest(entry, { noImages: true }).mask, undefined);
+});
+
+test("MCP batch records successful masked items in history", async (t) => {
+  const cwd = makeTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const path = join(cwd, "history.jsonl");
+  const previous = process.env.BRUSHROUTER_HISTORY_PATH;
+  process.env.BRUSHROUTER_HISTORY_PATH = path;
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRUSHROUTER_HISTORY_PATH;
+    else process.env.BRUSHROUTER_HISTORY_PATH = previous;
+  });
+  t.mock.method(PROVIDERS.fal, "generate", async () => ({ buffer: TINY_PNG, meta: { model: "fixture" } }));
+  const result = await handleToolCall("batch_generate_images", {
+    provider: "fal",
+    items: [{ prompt: "masked edit", images: ["base.png"], mask: "mask.png" }],
+  }, { cwd });
+  assert.equal(result.isError, false, result.content[0].text);
+  const { entries } = readHistory({ path });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].ok, true);
+  assert.equal(entries[0].source, "mcp");
+  assert.equal(entries[0].mask, join(cwd, "mask.png"));
+  assert.deepEqual(entries[0].images, [join(cwd, "base.png")]);
+});
+
 test("MCP: generation_history, usage_stats, replay_generation, and history/stats resources", async () => {
   const dir = makeTempDir();
   const histPath = join(dir, "history.jsonl");

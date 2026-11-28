@@ -45,6 +45,7 @@ export const CONFIG_DIR = getConfigDir();
 export const USER_CONFIG_PATH = getUserConfigPath();
 export const KEYS_PATH = getKeysPath();
 export const PROJECT_CONFIG_NAME = "brushrouter.config.json";
+export const DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2.6-sunburst";
 
 export const DEFAULT_CONFIG = {
   // Ordered preference used when --provider is not given. The router walks this
@@ -53,7 +54,7 @@ export const DEFAULT_CONFIG = {
   // Order rationale: prefer NATIVE, already-authenticated routes (no keys, no
   // extra login) before anything that needs credentials, and the setup-heavy
   // sidecar route (gptweb2api) before the user-configured endpoint.
-  priority: ["codex-cli", "codex", "gemini", "openrouter", "fal", "gptweb2api", "custom-http"],
+  priority: ["codex-cli", "codex", "gemini", "comfyui", "openrouter", "fal", "openai", "gemini-api", "replicate", "gptweb2api", "custom-http"],
 
   // Session-start guidance handed to MCP clients in the `initialize` result.
   // This is the one place an MCP server can tell the calling model WHEN to
@@ -151,7 +152,41 @@ export const DEFAULT_CONFIG = {
       apiKey: null,
       baseUrl: "https://fal.run",
       model: "fal-ai/flux/schnell",
+      editModel: "fal-ai/flux-2/edit",
+      inpaintModel: "fal-ai/flux-lora/inpainting",
       timeoutMs: 180000,
+    },
+
+    openai: {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://api.openai.com/v1",
+      model: DEFAULT_OPENAI_IMAGE_MODEL,
+      timeoutMs: 180000,
+    },
+    "gemini-api": {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      model: "gemini-2.5-flash-image",
+      timeoutMs: 180000,
+    },
+    replicate: {
+      enabled: false,
+      apiKey: null,
+      baseUrl: "https://api.replicate.com/v1",
+      model: "black-forest-labs/flux-schnell",
+      inputs: {},
+      imageInput: null,
+      maskInput: null,
+      timeoutMs: 300000,
+    },
+    comfyui: {
+      enabled: false,
+      baseUrl: "http://127.0.0.1:8188",
+      model: "flux1-schnell.safetensors",
+      workflow: null,
+      timeoutMs: 300000,
     },
 
     gptweb2api: {
@@ -280,15 +315,28 @@ const PROJECT_TRUSTED_LEAVES = new Set([
 // documented "this project prefers these providers" knob, `instructions` is
 // per-project MCP guidance. Everything else (nothing today) must be argued for
 // the same way the provider leaves were.
-const PROJECT_TRUSTED_TOP = new Set(["priority", "order", "instructions"]);
+const PROJECT_METERED_ROUTES = new Set(["openrouter", "fal", "openai", "gemini-api", "replicate"]);
 
-function stripUntrusted(project) {
+function stripUntrusted(project, cfg, operator) {
   if (!project || typeof project !== "object" || Array.isArray(project)) return { project, dropped: [] };
   const dropped = [];
   const trusted = {};
+  const basePriority = Array.isArray(cfg.priority) ? cfg.priority : [];
+  const isEnabledMetered = (id) => PROJECT_METERED_ROUTES.has(id) && cfg.providers?.[id]?.enabled !== false;
+  const hasUserMeteredOrder = basePriority.some((id) => isEnabledMetered(id) &&
+    (Array.isArray(operator.priority) || operator.providers?.[id]?.enabled === true));
+  const lastEnabledMetered = basePriority.findLastIndex(isEnabledMetered);
   for (const [k, v] of Object.entries(project)) {
     if (k === "providers") continue; // walked below, per leaf
-    if (PROJECT_TRUSTED_TOP.has(k) && Object.hasOwn(project, k)) trusted[k] = v;
+    if ((k === "priority" || k === "order") && Array.isArray(v)) {
+      if (k === "priority" && hasUserMeteredOrder) {
+        dropped.push("priority (user-configured metered order)");
+        continue;
+      }
+      const usable = v.filter((id) => typeof id === "string" && Object.hasOwn(DEFAULT_CONFIG.providers, id) && !PROJECT_METERED_ROUTES.has(id));
+      if (usable.length) trusted[k] = usable;
+      if (!usable.length || usable.length !== v.length) dropped.push(`${k} metered routes or invalid entries`);
+    } else if (k === "instructions") trusted[k] = v;
     else dropped.push(k);
   }
   if (!project.providers || typeof project.providers !== "object" || Array.isArray(project.providers)) {
@@ -304,6 +352,19 @@ function stripUntrusted(project) {
     }
     const kept = {};
     for (const [k, v] of Object.entries(pcfg)) {
+      if (k === "enabled" && PROJECT_METERED_ROUTES.has(name) && v !== false) {
+        dropped.push(`providers.${name}.enabled`);
+        continue;
+      }
+      // The router can promote the Web route ahead of the configured order on a free plan.
+      const position = basePriority.indexOf(name);
+      const precedesMetered = position >= 0 && lastEnabledMetered >= 0 &&
+        (position < lastEnabledMetered || name === "gptweb2api");
+      if (k === "enabled" && v === false && !PROJECT_METERED_ROUTES.has(name) && !trusted.priority &&
+          precedesMetered && cfg.providers?.[name]?.enabled !== false) {
+        dropped.push(`providers.${name}.enabled (before a metered fallback)`);
+        continue;
+      }
       // Object.hasOwn, not `in`: an inherited `__proto__`/`constructor` key must
       // not be mistaken for an allowed leaf.
       if (PROJECT_TRUSTED_LEAVES.has(k) && Object.hasOwn(pcfg, k)) kept[k] = v;
@@ -322,7 +383,7 @@ function warnUntrusted(dropped) {
   warnedUntrusted = true;
   process.stderr.write(
     `brushrouter: ignoring ${dropped.join(", ")} from ${PROJECT_CONFIG_NAME} — a project config may choose a model ` +
-      `or provider order, but not a program, a credential, or an endpoint. Set it in ${getUserConfigPath()} or the ` +
+      `or non-metered provider order, but not enable metered routes or set programs, credentials, or endpoints. Set it in ${getUserConfigPath()} or the ` +
       `environment instead.\n`,
   );
 }
@@ -342,6 +403,14 @@ function envOverrides() {
     BRUSHROUTER_OPENROUTER_RESOLUTION: ["openrouter", "resolution"],
     BRUSHROUTER_FAL_KEY: ["fal", "apiKey"],
     BRUSHROUTER_FAL_MODEL: ["fal", "model"],
+    BRUSHROUTER_FAL_EDIT_MODEL: ["fal", "editModel"],
+    BRUSHROUTER_FAL_INPAINT_MODEL: ["fal", "inpaintModel"],
+    BRUSHROUTER_OPENAI_MODEL: ["openai", "model"],
+    BRUSHROUTER_GEMINI_API_MODEL: ["gemini-api", "model"],
+    BRUSHROUTER_REPLICATE_MODEL: ["replicate", "model"],
+    BRUSHROUTER_COMFYUI_URL: ["comfyui", "baseUrl"],
+    BRUSHROUTER_COMFYUI_MODEL: ["comfyui", "model"],
+    BRUSHROUTER_COMFYUI_WORKFLOW: ["comfyui", "workflow"],
     BRUSHROUTER_CUSTOM_URL: ["custom-http", "url"],
     BRUSHROUTER_CUSTOM_KEY: ["custom-http", "apiKey"],
     BRUSHROUTER_GPTWEB_COOKIE: ["gptweb2api", "cookie"],
@@ -400,13 +469,15 @@ export function loadConfig({ cwd = process.cwd(), overrides = {}, userConfig = n
   let cfg = DEFAULT_CONFIG;
   const user = userConfig !== null ? userConfig : readJson(getUserConfigPath());
   if (user) cfg = deepMerge(cfg, user);
+  const env = envOverrides();
   const project = readJson(resolve(cwd, PROJECT_CONFIG_NAME));
   if (project) {
-    const { project: trusted, dropped } = stripUntrusted(project);
+    const operator = deepMerge(deepMerge(user || {}, env), overrides);
+    const { project: trusted, dropped } = stripUntrusted(project, deepMerge(DEFAULT_CONFIG, operator), operator);
     warnUntrusted(dropped);
     cfg = deepMerge(cfg, trusted);
   }
-  cfg = deepMerge(cfg, envOverrides());
+  cfg = deepMerge(cfg, env);
   cfg = deepMerge(cfg, overrides);
   return cfg;
 }

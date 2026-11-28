@@ -105,12 +105,24 @@ br serve            # run as an MCP server on stdio
 
 `--images` only works on routes that accept it; `brushrouter providers` marks the ones that don't. Passing it to a route that can't is an error when you forced the provider, a warning when auto-routing picked it.
 
-| route | reference images |
-| --- | --- |
-| `codex-cli`, `codex` | yes |
-| `openrouter` | yes (`input_references` data URLs) |
-| `custom-http` | yes (`{image}` data URL in your `body` template) |
-| `gemini`, `native-web`, `gptweb2api`, `fal` | no — text-to-image only |
+| route | reference images | inpainting mask |
+| --- | --- | --- |
+| `codex-cli`, `codex`, `openrouter` | yes | no |
+| `gemini` (CLI), `gemini-api` (AI Studio) | yes | no |
+| `openai` | yes | PNG with alpha; transparent areas are edited |
+| `fal` | yes | yes, with exactly one reference image |
+| `replicate`, `comfyui` | with an editing model/workflow | with an inpainting model/workflow |
+| `custom-http` | yes (`{image}` data URL in the request body template) | no |
+| `gptweb2api` | no | no |
+
+Pass `--mask` with `--images` for inpainting. The first reference is the base image; use a same-size mask and check the selected model's mask polarity. A masked request never falls back to text-only or unmasked editing. CLI batch accepts a per-item `mask` in JSON, or `--mask` as a default for all items.
+
+Automatically named outputs use the extension that matches the image bytes. An explicitly requested filename is used as written; changing its extension does not convert the image.
+
+```bash
+brushrouter gen "replace the sky with clouds" --provider openai \
+  --images photo.png --mask sky-mask.png -o edited.png
+```
 
 ### Transparent backgrounds
 
@@ -118,7 +130,7 @@ br serve            # run as an MCP server on stdio
 brushrouter gen "a red paper lantern sticker" --background transparent -o sticker.png
 ```
 
-Best on the `codex`/`codex-cli` routes, where transparent is a real API field (`output_format: "png"` makes the backend honor it). Other routes can only ask in the prompt, so check the file. Even with the field set, the model decides — subject-shaped prompts (*sticker*, *isolated object*) reliably come back RGBA; full-scene wording may stay flattened.
+The `codex` and `openai` (GPT Image) routes send transparency as an API field. Other routes ask in the prompt, so check the file. Even with the field set, the model decides — subject-shaped prompts (*sticker*, *isolated object*) are more likely to come back RGBA; full-scene wording may stay flattened.
 
 ### Codex size behavior
 
@@ -185,26 +197,41 @@ The `codex` and `codex-cli` routes use ChatGPT browser login — **no API key an
 | `codex-cli` | ChatGPT/Codex desktop app | **Native, preferred.** Drives the app's own signed CLI — already logged in, brushrouter never sees the token. |
 | `codex` | ChatGPT login with a paid plan (`brushrouter login`, or any login on disk) | Direct backend call (`gpt-image-2`). Shares the Codex text quota. |
 | `gemini` | Antigravity (`agy`) or Gemini CLI login | Delegates to the CLI; Google tokens never touch brushrouter. |
-| `openrouter` | `sk-or-...` key | Off by default — the only route billed per request. Key auto-discovered from env or existing agent stores. |
-| `fal` | fal.ai key | |
+| `comfyui` | ComfyUI running locally | Off by default. Runs a built-in Flux Schnell workflow or a custom workflow. |
+| `openrouter` | `sk-or-...` key | Off by default. Key auto-discovered from env or existing agent stores. |
+| `fal` | fal.ai key | Defaults to Flux Schnell for text, Flux 2 for edits, and Flux LoRA for inpainting. |
+| `openai` | `OPENAI_API_KEY` | Off by default. Direct Images API, default model `gpt-image-2.6-sunburst`; billed separately from ChatGPT. |
+| `gemini-api` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Off by default. Google AI Studio, default model `gemini-2.5-flash-image`; separate from the Google CLI route. |
+| `replicate` | `REPLICATE_API_TOKEN` | Off by default. Defaults to `black-forest-labs/flux-schnell`. |
 | `gptweb2api` | ChatGPT login (free plans work) + vendored gateway — `brushrouter vendor gptweb2api` | Off by default. Browserless web-session route, separate quota bucket (~2-3 free-plan images/day; see `docs/TECHNICAL.md`). |
 | `custom-http` | your own endpoint | Template-based; point it at any image API. |
 
 Default auto-routing order:
 
 ```text
-codex-cli → codex → gemini → openrouter → fal → gptweb2api → custom-http
+codex-cli → codex → gemini → comfyui → openrouter → fal → openai → gemini-api → replicate → gptweb2api → custom-http
 ```
 
-Three routes are off by default: `openrouter` (spends money), `gptweb2api` (needs `vendor`), `custom-http` (needs an endpoint). The `priority` list is authoritative — anything not listed is never auto-selected.
+`openrouter`, `openai`, `gemini-api`, `replicate`, `comfyui`, `gptweb2api`, and `custom-http` are off by default. The `priority` list is authoritative — anything not listed is never auto-selected. If you already customized it, add the new routes you want auto-selected.
+
+Set metered routes and their priority in your user config or environment. A checkout's config cannot enable a metered route or move it ahead of the routes you configured.
 
 A route that is off is off for **every** path, including an explicit `--provider`: naming one is refused with a `PROVIDER_DISABLED` error that says how to turn it on. That matters most for the metered routes — `enabled: false` is the only thing between an agent holding a key and your credits, so it is not a preference a caller can talk its way past. Opt in once, deliberately:
 
 ```bash
 brushrouter routes enable openrouter
+brushrouter routes enable openai   # after setting OPENAI_API_KEY securely
 ```
 
 OpenRouter runs two generation surfaces: multimodal chat models on `/chat/completions`, image-only models on `/images`. A "no endpoints found for output modalities" rejection is auto-retried on `/images`; auth, region, and credit errors are surfaced as they came.
+
+### Configure editing backends
+
+Set these options in your user config (`brushrouter init` creates a starter file):
+
+- **fal:** Set `providers.fal.editModel` for an endpoint accepting `image_urls`, or `inpaintModel` for an endpoint accepting `image_url` and `mask_url`. A per-call `--model` overrides the relevant default.
+- **Replicate:** Set `providers.replicate.model` to the editing model's `owner/name` (for models supporting the unversioned API) or `owner/name:<64-character version hash>`. Set `imageInput` and `maskInput` to the model's input field names. Set `imageInputArray: true` if the field takes an array. Pass other model-specific parameters in `inputs`; set `widthInput` and `heightInput` if the model accepts pixel dimensions.
+- **ComfyUI:** Start ComfyUI, then run `brushrouter routes enable comfyui`. The default workflow needs `flux1-schnell.safetensors` as a diffusion model, `clip_l.safetensors` and `t5xxl_fp8_e4m3fn.safetensors` as text encoders, and `ae.safetensors` as its VAE. Override these with `model`, `clip`, `t5`, and `vae` under `providers.comfyui`. For editing, set `providers.comfyui.workflow` to the absolute path of a trusted workflow exported in **API format**. In node inputs, use `{prompt}`, `{image}` (or `{image1}`), `{image2}` for another reference, and `{mask}` for inpainting. You can also use `{seed}`, `{width}`, `{height}`, `{size}`, and `{model}`. A custom workflow needs `{seed}` to accept `--seed`. Use a `SaveImage` output node. Reference and mask files are uploaded to that ComfyUI server's input directory.
 
 ## The prompt library
 
@@ -274,11 +301,12 @@ DeepSeek Harness (DSH) has no mcpServers JSON — its servers are YAML patch ent
 ```
 Exposed tools:
 
-- **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, seed?, out?, images?, async? }`. Returns the saved path, history id, and image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
+- **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, seed?, out?, images?, mask?, async? }`. Returns the saved path, history id, and image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
+- **`batch_generate_images`** — pass `items` with `prompt` and optional per-item `images` and `mask`; masks require a base image.
 - **`image_result`** — `{ jobId }`. Collects an async generation; poll again on a status while the job runs.
 - **`find_image_prompts`** — `{ query?, category?, kind?, input?, shape?, mode?, limit?, full?, id?, values?, seed? }`. Returns previews or a full skeleton to build from before generating. Its description tells the agent every entry works from text alone, that `{braces}` must be filled first, and to pass `input: "image"` only when it actually holds a photo.
 - **`generation_history`** — `{ id?, query?, provider?, model?, status?, source?, since?, until?, limit?, offset?, format? }`. Lists or inspects recorded generations from the persistent manifest log.
-- **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides.
+- **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, mask?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides. By default replay reuses recorded reference images and masks; `noImages` drops both.
 - **`usage_stats`** — `{ since?, until?, provider?, model?, source?, format? }`. Returns latency percentiles (`avg`/`p50`/`p95`/`min`/`max`), generation & attempt success rates, top error codes, model breakdown, daily trends, token totals, and USD spend.
 
 MCP resources also expose `brushrouter://history` (recent 50 generations) and `brushrouter://stats` (aggregated observability stats) alongside the prompt library resources.
@@ -383,10 +411,15 @@ One exception: a *project* config may not set `baseUrl`, `url`, `cli`, `command`
 | `BRUSHROUTER_OPENROUTER_MODELS` | comma-separated OpenRouter preference order |
 | `BRUSHROUTER_OPENROUTER_RESOLUTION` | image resolution requested from OpenRouter |
 | `BRUSHROUTER_FAL_KEY` / `BRUSHROUTER_FAL_MODEL` | fal.ai |
+| `BRUSHROUTER_FAL_EDIT_MODEL` / `BRUSHROUTER_FAL_INPAINT_MODEL` | fal.ai edit / inpainting endpoints |
+| `OPENAI_API_KEY` / `BRUSHROUTER_OPENAI_KEY` | OpenAI Images credential |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `BRUSHROUTER_GEMINI_API_KEY` | Google AI Studio credential |
+| `REPLICATE_API_TOKEN` / `BRUSHROUTER_REPLICATE_KEY` | Replicate credential |
+| `BRUSHROUTER_OPENAI_MODEL` / `BRUSHROUTER_GEMINI_API_MODEL` / `BRUSHROUTER_REPLICATE_MODEL` | direct API model defaults |
+| `BRUSHROUTER_COMFYUI_URL` / `BRUSHROUTER_COMFYUI_MODEL` / `BRUSHROUTER_COMFYUI_WORKFLOW` | ComfyUI server (default `http://127.0.0.1:8188`), model, and API-format workflow path |
 | `BRUSHROUTER_GPTWEB_COOKIE` | cookie fallback for the vendored gptweb2api route |
 | `BRUSHROUTER_GPTWEB_PROJECT_ID` | ChatGPT project (`g-p-...`) that anchors gptweb2api generations |
 | `BRUSHROUTER_CUSTOM_URL` / `BRUSHROUTER_CUSTOM_KEY` | custom HTTP |
-| `BRUSHROUTER_OPENAI_KEY` | fallback key name read for the OpenAI-compatible routes (`OPENAI_API_KEY` also works) |
 
 Discovery scans `$PATH`, `/Applications`, `~/Applications`, the npm global root, and `~/.cache/codex-runtimes`, so a Codex CLI installed any of the usual ways is found without configuration.
 

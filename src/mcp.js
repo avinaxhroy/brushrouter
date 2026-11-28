@@ -6,10 +6,11 @@
 // so the calling agent can make an informed choice (or let auto-routing decide).
 
 import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
+import { requireMaskImage } from "./providers/image-api.js";
 import { loadConfig } from "./config.js";
-import { saveImage, detectImageMime, batchVariantPath, batchItemPath, pngSize } from "./util/common.js";
+import { assertImageFile, saveImage, detectImageMime, batchVariantPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, resolveBatchItem, expandBrainstormBatch, getRecipe, loadRecipes } from "./library.js";
 import {
@@ -85,6 +86,7 @@ const TOOL_SCHEMA = {
         description:
           "Optional reference image paths (for image-to-image / editing). Each file is read from the local filesystem and sent to the chosen provider, so only pass paths the user has agreed to upload.",
       },
+      mask: { type: "string", description: "Optional inpainting mask file path for the first reference image. Requires images and a mask-capable route; only pass files the user has agreed to upload." },
       async: {
         type: "boolean",
         description:
@@ -140,9 +142,10 @@ const BATCH_TOOL_SCHEMA = {
               items: { type: "string" },
               description: "Optional reference image paths for this item.",
             },
+            mask: { type: "string", description: "Optional inpainting mask file path; requires a reference image in this item." },
           },
         },
-        description: "List of items with per-item options (prompt, recipe, look, values, twist, includeNegatives, out, size, quality, background, model, images).",
+        description: "List of items with per-item options (prompt, recipe, look, values, twist, includeNegatives, out, size, quality, background, model, images, mask).",
       },
       brainstorm: {
         type: "string",
@@ -301,7 +304,8 @@ const REPLAY_TOOL_SCHEMA = {
       prompt: { type: "string", description: "Override the prompt text." },
       twist: { type: "string", description: "Append extra creative direction to the original prompt." },
       images: { type: "array", items: { type: "string" }, description: "Override reference image paths." },
-      noImages: { type: "boolean", description: "Drop the original entry's reference images." },
+      mask: { type: "string", description: "Override the inpainting mask file path." },
+      noImages: { type: "boolean", description: "Drop the original entry's reference images and mask." },
       out: { type: "string", description: "Output file path for the replayed image." },
       fallback: { type: "boolean", description: "Allow falling back to other providers if the chosen provider fails." },
       async: { type: "boolean", description: "Return a jobId immediately and poll image_result when ready." },
@@ -452,6 +456,7 @@ async function mapLimited(items, limit, fn) {
 }
 
 function assertGenerateArgs(args, cwd = process.cwd()) {
+  requireMaskImage(args?.mask, args?.images);
   const hasRecipe = typeof args?.recipe === "string" && args.recipe.trim() !== "";
   const hasLook = typeof args?.look === "string" && args.look.trim() !== "";
   let resolvedPrompt = typeof args?.prompt === "string" ? args.prompt : "";
@@ -555,6 +560,7 @@ function validateBatchArgs(args) {
   const normalized = rawItems.map((item, idx) =>
     resolveBatchItem(item, batchDefaults, { index: idx, label: "batch_generate_images items" }),
   );
+  for (const item of normalized) requireMaskImage(item.mask, item.images);
   return { rawItems: normalized, concurrency, brainstorm: null };
 }
 
@@ -593,6 +599,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           ...recipeMeta,
           out: resolve(cwd, out),
           durationMs: e.durationMs ?? null,
@@ -605,7 +612,7 @@ async function runGenerate(args, ctx, onProgress) {
       );
       throw e;
     }
-    const saved = saveImage(out, result.buffer, cwd);
+    const saved = saveImage(out, result.buffer, cwd, { matchExtension: !args.out });
     const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
     const dims = pngSize(result.buffer);
     const histRec = tryRecordHistory(
@@ -623,6 +630,7 @@ async function runGenerate(args, ctx, onProgress) {
         background: args.background || null,
         seed: result.meta?.seed ?? args.seed ?? null,
         images: Array.isArray(args.images) ? args.images : [],
+        mask: args.mask,
         imagesUsed: result.meta?.imagesUsed,
         ...recipeMeta,
         out: saved.savedPath,
@@ -634,7 +642,7 @@ async function runGenerate(args, ctx, onProgress) {
         costUsd: result.meta?.costUsd,
         replayOf: args._replayOf || null,
       },
-      { cfg },
+      { cfg, cwd },
     );
     // SECURITY: every string handed back to the calling model passes through the
     // redactor, so a credential can never ride along inside a provider's message.
@@ -667,6 +675,7 @@ async function runGenerate(args, ctx, onProgress) {
   // refuses to overwrite, so two callers cannot collide.
   const batchId = generateBatchId();
   const targets = Array.from({ length: count }, (_, i) => batchVariantPath(out, i + 1, count));
+  const matchExtension = !args.out || !extname(out);
   const settled = await mapLimited(targets, concurrency, async (target, i) => {
     onProgress?.(`variation ${i + 1}/${count}...`, Math.round(((i + 1) / count) * 90));
     try {
@@ -674,7 +683,7 @@ async function runGenerate(args, ctx, onProgress) {
         { ...effectiveArgs, out: target, count: undefined, cwd, fallback: args.fallback === true },
         cfg,
       );
-      const saved = saveImage(target, result.buffer, cwd);
+      const saved = saveImage(target, result.buffer, cwd, { matchExtension });
       const mime = result.meta?.mime || detectImageMime(result.buffer) || "image/png";
       const dims = pngSize(result.buffer);
       const histRec = tryRecordHistory(
@@ -692,6 +701,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: result.meta?.seed ?? args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           imagesUsed: result.meta?.imagesUsed,
           ...recipeMeta,
           out: saved.savedPath,
@@ -725,6 +735,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           ...recipeMeta,
           out: resolve(cwd, target),
           durationMs: e.durationMs ?? null,
@@ -779,9 +790,9 @@ async function runBatchGenerate(args, ctx, onProgress) {
   const outDir = resolve(cwd, args.outDir || `brushrouter-batch-${timestamp}`);
   mkdirSync(outDir, { recursive: true });
 
-  const items = rawItems.map((item, idx) => ({
+  const items = rawItems.map((item) => ({
     ...item,
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.slugLabel || item.prompt),
+    out: item.out ? resolve(outDir, item.out) : undefined,
   }));
 
   const shouldEmbed = args.embedImages === true || (!("embedImages" in args) && rawItems.length <= 3);
@@ -796,7 +807,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
       onProgress,
-      onItemDone: (r) => {
+      onItemComplete: (r) => {
         tryRecordHistory(
           {
             source: "mcp",
@@ -812,6 +823,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
             background: r.item.background || null,
             seed: r.meta?.seed ?? r.item.seed ?? null,
             images: r.item.images || [],
+            mask: r.item.mask,
             imagesUsed: r.meta?.imagesUsed,
             out: r.savedPath,
             bytes: r.bytes ?? null,
@@ -840,6 +852,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
             background: r.item.background || null,
             seed: r.item.seed ?? null,
             images: r.item.images || [],
+            mask: r.item.mask,
             out: r.item.out || null,
             durationMs: r.durationMs ?? null,
             attempts: r.attempts || [],
@@ -1190,10 +1203,19 @@ function resolveReplayArgs(args = {}, ctx = {}) {
     out: args.out,
     fallback: args.fallback,
     images: args.images,
+    mask: args.mask,
     noImages: args.noImages === true,
     prompt: args.prompt,
     twist: args.twist,
   });
+  requireMaskImage(req.mask, req.images);
+  if (req.mask) {
+    try {
+      assertImageFile(req.mask, cwd);
+    } catch (e) {
+      throw new Error(`mask is unavailable (${redact(e.message)})`);
+    }
+  }
   return {
     prompt: req.prompt,
     provider: req.provider,
@@ -1203,6 +1225,7 @@ function resolveReplayArgs(args = {}, ctx = {}) {
     background: req.background,
     seed: req.seed,
     images: req.images,
+    mask: req.mask,
     out: req.out,
     fallback: req.fallback,
     _replayOf: entry.id,

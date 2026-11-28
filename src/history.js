@@ -237,6 +237,7 @@ export function buildHistoryRecord(entry, { cfg = null, cwd = process.cwd() } = 
           .map((s) => (isAbsolute(s) ? s : resolve(cwd, s)))
       : [],
     imagesUsed: Boolean(entry.imagesUsed),
+    ...(typeof entry.mask === "string" && entry.mask.trim() && { mask: isAbsolute(entry.mask) ? entry.mask : resolve(cwd, entry.mask) }),
     recipe: entry.recipe || null,
     look: entry.look || null,
     values: entry.values && typeof entry.values === "object" && !Array.isArray(entry.values) ? entry.values : null,
@@ -543,6 +544,7 @@ export function buildReplayRequest(entry, overrides = {}) {
     background: overrides.background !== undefined ? overrides.background : entry.background || undefined,
     seed: seed ?? undefined,
     images,
+    mask: overrides.noImages ? undefined : overrides.mask ?? entry.mask,
     provider,
     model,
     fallback: overrides.fallback === true,
@@ -977,11 +979,12 @@ export function renderHistoryDetail(entry) {
     lines.push(`  library:    ${[entry.recipe ? `recipe=${entry.recipe}` : null, entry.look ? `look=${entry.look}` : null].filter(Boolean).join(", ")}`);
   }
   if (entry.images?.length) {
-    lines.push(`  images:     ${entry.images.join(", ")} (used: ${entry.imagesUsed ? "yes" : "no"})`);
+    lines.push(`  images:     ${entry.images.map(sanitizeTerminalText).join(", ")} (used: ${entry.imagesUsed ? "yes" : "no"})`);
   }
+  if (entry.mask) lines.push(`  mask:       ${sanitizeTerminalText(entry.mask)}`);
   if (entry.out) {
     const kb = entry.bytes != null ? ` (${Math.round(entry.bytes / 1024)} KB${entry.mime ? `, ${entry.mime}` : ""})` : "";
-    lines.push(`  output:     ${entry.out}${kb}`);
+    lines.push(`  output:     ${sanitizeTerminalText(entry.out)}${kb}`);
   }
   if (entry.replayOf) lines.push(`  replay of:  ${entry.replayOf}`);
   if (entry.batchId) lines.push(`  batch:      ${entry.batchId}`);
