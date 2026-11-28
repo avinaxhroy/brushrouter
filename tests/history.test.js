@@ -570,6 +570,45 @@ test("CLI: history, replay --dry-run, stats, and --seed validation", async () =>
   }
 });
 
+test("masked history replays the original mask across working directories", async (t) => {
+  const dir = makeTempDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const historyPath = join(dir, "history.jsonl");
+  const previous = process.env.BRUSHROUTER_HISTORY_PATH;
+  process.env.BRUSHROUTER_HISTORY_PATH = historyPath;
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRUSHROUTER_HISTORY_PATH;
+    else process.env.BRUSHROUTER_HISTORY_PATH = previous;
+  });
+  const maskPath = join(dir, "mask.png");
+  const basePath = join(dir, "base.png");
+  for (const file of [basePath, maskPath]) writeFileSync(file, TINY_PNG);
+  const seen = [];
+  t.mock.method(PROVIDERS.fal, "generate", async ({ images, mask }) => {
+    seen.push({ images, mask });
+    return { buffer: TINY_PNG, meta: { model: "fixture" } };
+  });
+  await handleToolCall(TOOL_NAME, {
+    prompt: "edit", provider: "fal", images: ["base.png"], mask: "mask.png", out: "original.png",
+  }, { cwd: dir });
+  const entry = getHistoryEntry("last");
+  assert.equal(entry.mask, maskPath);
+  assert.deepEqual(entry.images, [basePath]);
+  const dry = await runCli(["replay", entry.id, "--dry-run", "--json"], { BRUSHROUTER_HISTORY_PATH: historyPath });
+  assert.equal(dry.code, 0, dry.stderr);
+  assert.equal(JSON.parse(dry.stdout).mask, maskPath);
+  await handleToolCall(REPLAY_TOOL_NAME, { id: entry.id, out: join(dir, "replayed.png") }, { cwd: tmpdir() });
+  assert.deepEqual(seen.at(-1), { images: [basePath], mask: maskPath });
+
+  rmSync(maskPath);
+  const missing = await runCli(["replay", entry.id, "--dry-run"], { BRUSHROUTER_HISTORY_PATH: historyPath });
+  assert.equal(missing.code, 2, missing.stderr);
+  assert.match(missing.stderr, /mask.*unavailable/i);
+  await assert.rejects(() => handleToolCall(REPLAY_TOOL_NAME, { id: entry.id }, { cwd: dir }), /mask.*unavailable/i);
+  assert.equal(seen.length, 2);
+  assert.equal(buildReplayRequest(entry, { noImages: true }).mask, undefined);
+});
+
 test("MCP: generation_history, usage_stats, replay_generation, and history/stats resources", async () => {
   const dir = makeTempDir();
   const histPath = join(dir, "history.jsonl");

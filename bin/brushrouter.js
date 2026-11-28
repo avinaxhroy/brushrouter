@@ -344,7 +344,7 @@ ${paint(C.bold, "OPTIONS")}
       --status <ok|failed> history: filter by outcome (or --failed)
       --keep <n>           history prune: keep the newest N entries
       --before <days>      history prune: remove entries older than N days (e.g. 30d)
-      --no-images          replay: drop original reference images
+      --no-images          replay: drop original reference images and mask
       --dry-run            gen: show the route it would take, send nothing.
                            routes/install: show what would change, apply nothing
       --force              gen: overwrite -o instead of saving a new version.
@@ -584,6 +584,7 @@ async function cmdGenerate(args) {
         background: values.background || null,
         seed: seed ?? null,
         images: imagePaths,
+        mask,
         ...recipeMeta,
         out: outAbs,
         durationMs: e.durationMs ?? null,
@@ -638,6 +639,7 @@ async function cmdGenerate(args) {
       background: values.background || null,
       seed: result.meta?.seed ?? seed ?? null,
       images: imagePaths,
+      mask,
       imagesUsed: result.meta?.imagesUsed,
       ...recipeMeta,
       out: saved.savedPath,
@@ -1145,6 +1147,7 @@ async function cmdBatch(args) {
               background: res.item.background || null,
               seed: res.meta?.seed ?? res.item.seed ?? null,
               images: res.item.images || [],
+              mask: res.item.mask,
               imagesUsed: res.meta?.imagesUsed,
               out: res.savedPath,
               bytes: res.bytes ?? null,
@@ -1198,6 +1201,7 @@ async function cmdBatch(args) {
               background: fail.item.background || null,
               seed: fail.item.seed ?? null,
               images: fail.item.images || [],
+              mask: fail.item.mask,
               out: fail.item.out || null,
               durationMs: fail.durationMs ?? null,
               attempts: fail.attempts,
@@ -1457,6 +1461,7 @@ async function cmdReplay(args) {
       out: values.out,
       fallback: values.fallback,
       images: values.images,
+      mask: values.mask,
       noImages: values["no-images"],
       prompt: values.prompt?.[0],
       twist: values.twist,
@@ -1482,11 +1487,21 @@ async function cmdReplay(args) {
       return exitAfterFlush(2);
     }
   }
+  if (req.mask != null) {
+    try {
+      if (!req.mask.trim() || !req.images.length) throw new Error("requires a mask file path and a base image");
+      assertImageFile(req.mask, cwd);
+    } catch (e) {
+      console.error(bad(`error: mask is unavailable (${redact(e.message)})`));
+      console.error(dim("  pass --mask <path> to supply a replacement, or --no-images to drop the references and mask"));
+      return exitAfterFlush(2);
+    }
+  }
 
   if (values["dry-run"]) {
     let order;
     try {
-      order = await planAttemptOrder(cfg, { provider: req.provider, fallback: req.fallback, images: req.images });
+      order = await planAttemptOrder(cfg, req);
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
       return exitAfterFlush(1);
@@ -1503,6 +1518,7 @@ async function cmdReplay(args) {
     if (req.size) console.log(`  size:     ${req.size}`);
     if (req.seed != null) console.log(`  seed:     ${req.seed}`);
     if (req.images?.length) console.log(`  images:   ${req.images.join(", ")}`);
+    if (req.mask) console.log(`  mask:     ${redact(req.mask)}`);
     console.log(`  would try: ${order.join(" → ")}\n`);
     return;
   }
@@ -1521,6 +1537,7 @@ async function cmdReplay(args) {
         background: req.background,
         seed: req.seed,
         images: req.images,
+        mask: req.mask,
         out,
         cwd,
         provider: req.provider,
@@ -1546,6 +1563,7 @@ async function cmdReplay(args) {
         background: req.background || null,
         seed: req.seed ?? null,
         images: req.images || [],
+        mask: req.mask,
         recipe: req.recipe,
         look: req.look,
         values: req.values,
@@ -1585,6 +1603,7 @@ async function cmdReplay(args) {
       background: req.background || null,
       seed: result.meta?.seed ?? req.seed ?? null,
       images: req.images || [],
+      mask: req.mask,
       imagesUsed: result.meta?.imagesUsed,
       recipe: req.recipe,
       look: req.look,

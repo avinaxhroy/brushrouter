@@ -10,7 +10,7 @@ import { extname, join, resolve } from "node:path";
 import { generate, probeAll, batchGenerate } from "./router.js";
 import { requireMaskImage } from "./providers/image-api.js";
 import { loadConfig } from "./config.js";
-import { saveImage, detectImageMime, batchVariantPath, pngSize } from "./util/common.js";
+import { assertImageFile, saveImage, detectImageMime, batchVariantPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
 import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, resolveBatchItem, expandBrainstormBatch, getRecipe, loadRecipes } from "./library.js";
 import {
@@ -304,7 +304,8 @@ const REPLAY_TOOL_SCHEMA = {
       prompt: { type: "string", description: "Override the prompt text." },
       twist: { type: "string", description: "Append extra creative direction to the original prompt." },
       images: { type: "array", items: { type: "string" }, description: "Override reference image paths." },
-      noImages: { type: "boolean", description: "Drop the original entry's reference images." },
+      mask: { type: "string", description: "Override the inpainting mask file path." },
+      noImages: { type: "boolean", description: "Drop the original entry's reference images and mask." },
       out: { type: "string", description: "Output file path for the replayed image." },
       fallback: { type: "boolean", description: "Allow falling back to other providers if the chosen provider fails." },
       async: { type: "boolean", description: "Return a jobId immediately and poll image_result when ready." },
@@ -598,6 +599,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           ...recipeMeta,
           out: resolve(cwd, out),
           durationMs: e.durationMs ?? null,
@@ -628,6 +630,7 @@ async function runGenerate(args, ctx, onProgress) {
         background: args.background || null,
         seed: result.meta?.seed ?? args.seed ?? null,
         images: Array.isArray(args.images) ? args.images : [],
+        mask: args.mask,
         imagesUsed: result.meta?.imagesUsed,
         ...recipeMeta,
         out: saved.savedPath,
@@ -639,7 +642,7 @@ async function runGenerate(args, ctx, onProgress) {
         costUsd: result.meta?.costUsd,
         replayOf: args._replayOf || null,
       },
-      { cfg },
+      { cfg, cwd },
     );
     // SECURITY: every string handed back to the calling model passes through the
     // redactor, so a credential can never ride along inside a provider's message.
@@ -698,6 +701,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: result.meta?.seed ?? args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           imagesUsed: result.meta?.imagesUsed,
           ...recipeMeta,
           out: saved.savedPath,
@@ -731,6 +735,7 @@ async function runGenerate(args, ctx, onProgress) {
           background: args.background || null,
           seed: args.seed ?? null,
           images: Array.isArray(args.images) ? args.images : [],
+          mask: args.mask,
           ...recipeMeta,
           out: resolve(cwd, target),
           durationMs: e.durationMs ?? null,
@@ -818,6 +823,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
             background: r.item.background || null,
             seed: r.meta?.seed ?? r.item.seed ?? null,
             images: r.item.images || [],
+            mask: r.item.mask,
             imagesUsed: r.meta?.imagesUsed,
             out: r.savedPath,
             bytes: r.bytes ?? null,
@@ -846,6 +852,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
             background: r.item.background || null,
             seed: r.item.seed ?? null,
             images: r.item.images || [],
+            mask: r.item.mask,
             out: r.item.out || null,
             durationMs: r.durationMs ?? null,
             attempts: r.attempts || [],
@@ -1196,10 +1203,19 @@ function resolveReplayArgs(args = {}, ctx = {}) {
     out: args.out,
     fallback: args.fallback,
     images: args.images,
+    mask: args.mask,
     noImages: args.noImages === true,
     prompt: args.prompt,
     twist: args.twist,
   });
+  requireMaskImage(req.mask, req.images);
+  if (req.mask) {
+    try {
+      assertImageFile(req.mask, cwd);
+    } catch (e) {
+      throw new Error(`mask is unavailable (${redact(e.message)})`);
+    }
+  }
   return {
     prompt: req.prompt,
     provider: req.provider,
@@ -1209,6 +1225,7 @@ function resolveReplayArgs(args = {}, ctx = {}) {
     background: req.background,
     seed: req.seed,
     images: req.images,
+    mask: req.mask,
     out: req.out,
     fallback: req.fallback,
     _replayOf: entry.id,

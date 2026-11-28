@@ -306,7 +306,7 @@ Exposed tools:
 - **`image_result`** — `{ jobId }`. Collects an async generation; poll again on a status while the job runs.
 - **`find_image_prompts`** — `{ query?, category?, kind?, input?, shape?, mode?, limit?, full?, id?, values?, seed? }`. Returns previews or a full skeleton to build from before generating. Its description tells the agent every entry works from text alone, that `{braces}` must be filled first, and to pass `input: "image"` only when it actually holds a photo.
 - **`generation_history`** — `{ id?, query?, provider?, model?, status?, source?, since?, until?, limit?, offset?, format? }`. Lists or inspects recorded generations from the persistent manifest log.
-- **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides.
+- **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, mask?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides. By default replay reuses recorded reference images and masks; `noImages` drops both.
 - **`usage_stats`** — `{ since?, until?, provider?, model?, source?, format? }`. Returns latency percentiles (`avg`/`p50`/`p95`/`min`/`max`), generation & attempt success rates, top error codes, model breakdown, daily trends, token totals, and USD spend.
 
 MCP resources also expose `brushrouter://history` (recent 50 generations) and `brushrouter://stats` (aggregated observability stats) alongside the prompt library resources.
