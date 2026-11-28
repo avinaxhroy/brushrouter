@@ -23,8 +23,24 @@ import { resolve, join, dirname, extname, basename, isAbsolute } from "node:path
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, DEFAULT_CONFIG } from "../src/config.js";
+import { loadConfig, getConfigDir, getUserConfigPath, getKeysPath, getHistoryPath, DEFAULT_CONFIG } from "../src/config.js";
 import { generate, probeAll, listProviderIds, setRouteEnabled, planAttemptOrder, PROVIDERS, batchGenerate, DEFAULT_PROVIDER_CONCURRENCY } from "../src/router.js";
+import {
+  tryRecordHistory,
+  listHistory,
+  getHistoryEntry,
+  buildReplayRequest,
+  pruneHistory,
+  clearHistory,
+  computeStats,
+  generateBatchId,
+  formatDurationMs,
+  formatUsd,
+  formatPct,
+  renderHistoryList,
+  renderHistoryDetail,
+  renderStats,
+} from "../src/history.js";
 import { saveImage, detectImageMime, assertImageFile, batchItemPath, pngSize } from "../src/util/common.js";
 import { redact, redactValue, registerSecret } from "../src/util/redact.js";
 import { discoverKey, saveKey, describeKey } from "../src/util/keys.js";
@@ -188,6 +204,15 @@ function parse(argv) {
         global: { type: "boolean", default: false },
         create: { type: "boolean", default: false },
         only: { type: "string" },
+        since: { type: "string" },
+        until: { type: "string" },
+        status: { type: "string" },
+        failed: { type: "boolean", default: false },
+        source: { type: "string" },
+        query: { type: "string" },
+        keep: { type: "string" },
+        before: { type: "string" },
+        "no-images": { type: "boolean", default: false },
         version: { type: "boolean", short: "V", default: false },
       },
     });
@@ -211,6 +236,7 @@ const VALUE_FLAGS = new Set([
   "--mode", "--limit", "-n", "--offset", "--id", "--seed", "--input", "--shape",
   "--recipe", "--look", "--twist", "--set",
   "--prompt", "--concurrency", "--agent", "--only",
+  "--since", "--until", "--status", "--source", "--query", "--keep", "--before",
 ]);
 
 // Find the command token in an argv that may put flags first:
@@ -263,6 +289,9 @@ ${paint(C.bold, "COMMANDS")}
                            a pinned source commit with the local Go toolchain)
   generate, gen <prompt>   Generate an image (auto-routes across providers)
   batch <prompts...|file>  Batch generate multiple prompts in parallel across backends
+  history [show|prune|clear] View or manage generation history & manifest log
+  replay [id|last|~N]      Re-run a past generation with its prompt & seed (or overrides)
+  stats                    Provider latency, success-rate, and spend/usage stats
   providers                List providers + connection status
   routes [enable|disable]  Show or toggle which routes auto-routing may use
   doctor                   Diagnose every provider's connectivity
@@ -301,7 +330,12 @@ ${paint(C.bold, "OPTIONS")}
       --set k=v            Recipes: fill a slot (repeatable; e.g. --set text=ACME)
       --full               Recipes: return the whole skeleton, not a preview
       --prompt-only, --raw Recipes: output only the filled prompt text (pipeable)
-      --seed <n>           Recipes: vary the pick for a vague query
+      --seed <n>           Integer seed for gen/replay, or pick seed for prompts
+      --since <win|date>   history/stats: filter window (e.g. 24h, 7d, 30d, ISO date)
+      --status <ok|failed> history: filter by outcome (or --failed)
+      --keep <n>           history prune: keep the newest N entries
+      --before <days>      history prune: remove entries older than N days (e.g. 30d)
+      --no-images          replay: drop original reference images
       --dry-run            gen: show the route it would take, send nothing.
                            routes/install: show what would change, apply nothing
       --force              gen: overwrite -o instead of saving a new version.
@@ -318,7 +352,10 @@ ${paint(C.bold, "EXAMPLES")}
   brushrouter gen "a red fox in snow" -o fox.png
   brushrouter gen "product shot" --provider fal --fallback
   brushrouter gen "logo" --provider openrouter --model x-ai/grok-imagine-image-2.0
-  brushrouter gen "logo" -s 1024x1024 -q high
+  brushrouter gen "logo" -s 1024x1024 -q high --seed 42
+  brushrouter history -n 10                # recent generations & outputs
+  brushrouter replay last --provider fal   # replay last prompt+seed on fal
+  brushrouter stats --since 7d             # provider latency, success rate & spend
   brushrouter routes disable gptweb2api   # keep a route out of auto-routing
   brushrouter models openrouter           # see models your key can reach
   brushrouter prompts                     # the map: ${LIB_COUNTS.job} recipes + ${LIB_COUNTS.look} looks
@@ -356,6 +393,7 @@ async function cmdGenerate(args) {
   }
   let prompt = values.prompt?.[0] || positionals.join(" ").trim();
   let autoSize = values.size;
+  let recipeMeta = {};
   if (values.recipe || values.look) {
     const slotValues = {};
     for (const pair of values.set || []) {
@@ -388,6 +426,21 @@ async function cmdGenerate(args) {
     }
     prompt = composed.text;
     if (!autoSize && composed.suggestedSize) autoSize = composed.suggestedSize;
+    recipeMeta = {
+      recipe: values.recipe || null,
+      look: values.look || null,
+      values: Object.keys(slotValues).length ? slotValues : null,
+      twist: extraTwist || null,
+    };
+  }
+  let seed;
+  if (values.seed !== undefined) {
+    const n = Number(values.seed);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) {
+      console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
+      return exitAfterFlush(2);
+    }
+    seed = n;
   }
   if (!prompt) {
     console.error(bad("error: no prompt given"));
@@ -481,6 +534,7 @@ async function cmdGenerate(args) {
         size: autoSize,
         quality: values.quality,
         background: values.background || undefined,
+        seed,
         images: imagePaths,
         out,
         cwd,
@@ -493,8 +547,31 @@ async function cmdGenerate(args) {
     );
   } catch (e) {
     const msg = redact(e.message);
+    const histRec = tryRecordHistory(
+      {
+        source: "cli",
+        ok: false,
+        prompt,
+        provider: values.provider || null,
+        requestedProvider: values.provider || null,
+        model: values.model || null,
+        requestedModel: values.model || null,
+        size: autoSize || null,
+        quality: values.quality || null,
+        background: values.background || null,
+        seed: seed ?? null,
+        images: imagePaths,
+        ...recipeMeta,
+        out: outAbs,
+        durationMs: e.durationMs ?? null,
+        attempts: e.attempts || [],
+        error: msg,
+        errorCode: e.code || null,
+      },
+      { cfg },
+    );
     if (values.json) {
-      console.log(JSON.stringify(redactValue({ ok: false, error: msg, code: e.code, attempts: e.attempts }), null, 2));
+      console.log(JSON.stringify(redactValue({ ok: false, id: histRec?.id || null, error: msg, code: e.code, durationMs: e.durationMs ?? null, attempts: e.attempts }), null, 2));
     } else {
       console.error(bad(`error: ${msg}`));
       if (e.attempts?.length) {
@@ -521,15 +598,49 @@ async function cmdGenerate(args) {
     }
     return exitAfterFlush(1);
   }
+  const mime = detectImageMime(result.buffer) || "image/png";
+  const dims = pngSize(result.buffer);
+  const histRec = tryRecordHistory(
+    {
+      source: "cli",
+      ok: true,
+      prompt,
+      provider: result.provider,
+      requestedProvider: values.provider || null,
+      model: result.meta?.model || null,
+      requestedModel: values.model || null,
+      size: autoSize || null,
+      actualSize: dims ? `${dims.width}x${dims.height}` : null,
+      quality: values.quality || null,
+      background: values.background || null,
+      seed: result.meta?.seed ?? seed ?? null,
+      images: imagePaths,
+      imagesUsed: result.meta?.imagesUsed,
+      ...recipeMeta,
+      out: saved.savedPath,
+      bytes: result.buffer.length,
+      mime,
+      durationMs: result.durationMs ?? null,
+      attempts: result.attempts || [],
+      usage: result.meta?.usage || null,
+      costUsd: result.meta?.costUsd,
+    },
+    { cfg },
+  );
   if (values.json) {
     console.log(
       JSON.stringify(
         redactValue({
           ok: true,
+          id: histRec?.id || null,
           provider: result.provider,
           model: result.meta?.model || null,
           path: saved.savedPath,
           bytes: result.buffer.length,
+          durationMs: result.durationMs ?? null,
+          seed: result.meta?.seed ?? seed ?? null,
+          costUsd: histRec?.costUsd ?? null,
+          costSource: histRec?.costSource ?? null,
           attempts: result.attempts,
         }),
         null,
@@ -537,10 +648,10 @@ async function cmdGenerate(args) {
       ),
     );
   } else {
-    const mime = detectImageMime(result.buffer) || "image/png";
-    const dims = pngSize(result.buffer);
     const dimText = dims ? `, ${dims.width}x${dims.height}` : "";
-    console.log(`${ok("✓")} generated with ${paint(C.cyan, result.provider)}${result.meta?.model ? dim(` (${result.meta.model})`) : ""}`);
+    const durText = result.durationMs != null ? ` in ${formatDurationMs(result.durationMs)}` : "";
+    const idText = histRec?.id ? dim(` [${histRec.id}]`) : "";
+    console.log(`${ok("✓")} generated with ${paint(C.cyan, result.provider)}${result.meta?.model ? dim(` (${result.meta.model})`) : ""}${dim(durText)}${idText}`);
     console.log(`  ${saved.savedPath} ${dim(`(${mime}${dimText}, ${(result.buffer.length / 1024).toFixed(0)} KB)`)}${saved.versioned ? warn("  [not overwritten — saved as new version]") : ""}`);
     if (result.attempts?.length > 1) {
       console.log(dim(`  routing: ${result.attempts.map((a) => `${a.provider}=${a.outcome}`).join(" → ")}`));
@@ -686,11 +797,22 @@ async function cmdBatch(args) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, values.out || `brushrouter-batch-${timestamp}`);
 
+  let batchSeed;
+  if (values.seed !== undefined) {
+    const n = Number(values.seed);
+    if (!Number.isInteger(n)) {
+      console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
+      return exitAfterFlush(2);
+    }
+    batchSeed = n;
+  }
+
   const items = rawItems.map((item, idx) => ({
     ...item,
     size: item.size || values.size,
     quality: item.quality || values.quality,
     background: item.background || values.background,
+    seed: item.seed !== undefined ? item.seed : batchSeed,
     model: item.model || values.model,
     images: item.images || values.images || [],
     out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.prompt),
@@ -757,6 +879,7 @@ async function cmdBatch(args) {
 
   mkdirSync(outDir, { recursive: true });
   const manifestPath = join(outDir, "manifest.jsonl");
+  const batchId = generateBatchId();
 
   if (!values.json) {
     console.log(paint(C.bold, `Starting batch generation: ${items.length} item(s)`) + dim(` -> ${outDir}\n`));
@@ -783,13 +906,47 @@ async function cmdBatch(args) {
           }
         },
         onItemComplete: (res) => {
+          const histRec = tryRecordHistory(
+            {
+              source: "batch",
+              ok: true,
+              prompt: res.item.prompt,
+              provider: res.provider,
+              requestedProvider: values.provider || null,
+              model: res.meta?.model || null,
+              requestedModel: res.item.model || null,
+              size: res.item.size || null,
+              actualSize: res.actualSize || null,
+              quality: res.item.quality || null,
+              background: res.item.background || null,
+              seed: res.meta?.seed ?? res.item.seed ?? null,
+              images: res.item.images || [],
+              imagesUsed: res.meta?.imagesUsed,
+              out: res.savedPath,
+              bytes: res.bytes ?? null,
+              mime: res.mime || null,
+              durationMs: res.durationMs ?? null,
+              attempts: res.attempts,
+              usage: res.meta?.usage || null,
+              costUsd: res.meta?.costUsd,
+              batchId,
+            },
+            { cfg },
+          );
           const record = {
             ok: true,
+            id: histRec?.id || null,
+            batchId,
             index: res.index + 1,
             prompt: res.item.prompt,
             savedPath: res.savedPath,
             provider: res.provider,
             model: res.meta?.model || null,
+            seed: res.meta?.seed ?? res.item.seed ?? null,
+            durationMs: res.durationMs ?? null,
+            costUsd: histRec?.costUsd ?? null,
+            costSource: histRec?.costSource ?? null,
+            usage: histRec?.usage || null,
             attempts: res.attempts,
           };
           appendFileSync(manifestPath, JSON.stringify(redactValue(record)) + "\n");
@@ -798,12 +955,38 @@ async function cmdBatch(args) {
           }
         },
         onItemFail: (fail) => {
+          const histRec = tryRecordHistory(
+            {
+              source: "batch",
+              ok: false,
+              prompt: fail.item.prompt,
+              provider: values.provider || null,
+              requestedProvider: values.provider || null,
+              model: fail.item.model || null,
+              requestedModel: fail.item.model || null,
+              size: fail.item.size || null,
+              quality: fail.item.quality || null,
+              background: fail.item.background || null,
+              seed: fail.item.seed ?? null,
+              images: fail.item.images || [],
+              out: fail.item.out || null,
+              durationMs: fail.durationMs ?? null,
+              attempts: fail.attempts,
+              batchId,
+              error: redact(fail.error),
+              errorCode: fail.code || null,
+            },
+            { cfg },
+          );
           const record = {
             ok: false,
+            id: histRec?.id || null,
+            batchId,
             index: fail.index + 1,
             prompt: fail.item.prompt,
             error: redact(fail.error),
             code: fail.code,
+            durationMs: fail.durationMs ?? null,
             attempts: fail.attempts,
           };
           appendFileSync(manifestPath, JSON.stringify(redactValue(record)) + "\n");
@@ -864,6 +1047,375 @@ async function cmdBatch(args) {
   if (result.completed === 0 && result.total > 0) {
     return exitAfterFlush(1);
   }
+}
+
+function parseNonNegInt(raw, flagName) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+    const e = new Error(`${flagName} expects a non-negative integer, got "${raw}"`);
+    e.code = "BAD_ARGS";
+    throw e;
+  }
+  return n;
+}
+
+function parseBeforeDays(raw) {
+  const m = /^(\d+(?:\.\d+)?)\s*d?$/i.exec(String(raw).trim());
+  if (!m) {
+    const e = new Error(`--before expects a number of days (e.g. 30 or 30d), got "${raw}"`);
+    e.code = "BAD_ARGS";
+    throw e;
+  }
+  return Number(m[1]);
+}
+
+async function cmdHistory(args) {
+  const { values, positionals } = args;
+  const cwd = process.cwd();
+  const cfg = loadConfig({ cwd });
+  const sub = positionals[0];
+
+  if (sub === "show" || sub === "get" || values.id) {
+    const selector = values.id || positionals[1] || "last";
+    try {
+      const entry = getHistoryEntry(selector, { cwd });
+      if (values.json) {
+        console.log(JSON.stringify(redactValue(entry), null, 2));
+      } else {
+        console.log(renderHistoryDetail(entry));
+      }
+      return;
+    } catch (e) {
+      if (values.json) {
+        console.log(JSON.stringify(redactValue({ ok: false, error: redact(e.message), code: e.code }), null, 2));
+      } else {
+        console.error(bad(`error: ${redact(e.message)}`));
+      }
+      return exitAfterFlush(1);
+    }
+  }
+
+  if (sub === "prune") {
+    try {
+      const keep = values.keep !== undefined
+        ? parseNonNegInt(values.keep, "--keep")
+        : values.before === undefined
+          ? (cfg.history?.maxEntries ?? 5000)
+          : null;
+      const beforeDays = values.before !== undefined ? parseBeforeDays(values.before) : null;
+      const res = pruneHistory({ keep, beforeDays, dryRun: values["dry-run"] });
+      if (values.json) {
+        console.log(JSON.stringify(redactValue({ ok: true, ...res }), null, 2));
+      } else if (res.dryRun) {
+        console.log(paint(C.bold, "Dry run") + dim(` — would remove ${res.removed} of ${res.before} entry/entries (${res.after} kept)`));
+      } else {
+        console.log(`${ok("✓")} pruned ${res.removed} entry/entries (${res.after} kept in ${dim(res.path)})`);
+      }
+      return;
+    } catch (e) {
+      if (values.json) {
+        console.log(JSON.stringify(redactValue({ ok: false, error: redact(e.message), code: e.code }), null, 2));
+      } else {
+        console.error(bad(`error: ${redact(e.message)}`));
+      }
+      return exitAfterFlush(2);
+    }
+  }
+
+  if (sub === "clear") {
+    if (!values.yes && !values.force) {
+      console.error(bad("error: clearing generation history is destructive — pass --yes or --force to confirm"));
+      return exitAfterFlush(2);
+    }
+    const res = clearHistory();
+    if (values.json) {
+      console.log(JSON.stringify(redactValue({ ok: true, ...res }), null, 2));
+    } else {
+      console.log(`${ok("✓")} cleared ${res.removed} history entry/entries from ${dim(res.path)}`);
+    }
+    return;
+  }
+
+  // Default: list history
+  let limit;
+  let offset;
+  try {
+    limit = values.limit !== undefined ? parseNonNegInt(values.limit, "--limit") : 20;
+    offset = values.offset !== undefined ? parseNonNegInt(values.offset, "--offset") : 0;
+  } catch (e) {
+    console.error(bad(`error: ${e.message}`));
+    return exitAfterFlush(2);
+  }
+  const status = values.failed ? "failed" : values.status || undefined;
+  if (status && status !== "ok" && status !== "failed") {
+    console.error(bad(`error: --status must be "ok" or "failed", got "${status}"`));
+    return exitAfterFlush(2);
+  }
+  const query = values.query || (sub && sub !== "list" ? positionals.join(" ") : undefined);
+
+  let res;
+  try {
+    res = listHistory({
+      provider: values.provider,
+      model: values.model,
+      status,
+      source: values.source,
+      query,
+      since: values.since,
+      until: values.until,
+      limit,
+      offset,
+    });
+  } catch (e) {
+    console.error(bad(`error: ${redact(e.message)}`));
+    return exitAfterFlush(2);
+  }
+
+  if (values.json) {
+    console.log(JSON.stringify(redactValue(res), null, 2));
+    return;
+  }
+  console.log(renderHistoryList(res));
+}
+
+async function cmdReplay(args) {
+  const { values, positionals } = args;
+  const cwd = process.cwd();
+  const cfg = loadConfig({ cwd });
+  const selector = values.id || positionals[0] || "last";
+
+  let entry;
+  try {
+    entry = getHistoryEntry(selector, { cwd });
+  } catch (e) {
+    if (values.json) {
+      console.log(JSON.stringify(redactValue({ ok: false, error: redact(e.message), code: e.code }), null, 2));
+    } else {
+      console.error(bad(`error: ${redact(e.message)}`));
+    }
+    return exitAfterFlush(1);
+  }
+
+  let seedOverride;
+  if (values.seed !== undefined) {
+    const n = Number(values.seed);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) {
+      console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
+      return exitAfterFlush(2);
+    }
+    seedOverride = n;
+  }
+  if (values.background && values.background !== "transparent" && values.background !== "opaque") {
+    console.error(bad("error: --background must be opaque or transparent"));
+    return exitAfterFlush(2);
+  }
+
+  let req;
+  try {
+    req = buildReplayRequest(entry, {
+      provider: values.provider,
+      model: values.model,
+      size: values.size,
+      quality: values.quality,
+      background: values.background,
+      seed: seedOverride,
+      out: values.out,
+      fallback: values.fallback,
+      images: values.images,
+      noImages: values["no-images"],
+      prompt: values.prompt?.[0],
+      twist: values.twist,
+    });
+  } catch (e) {
+    console.error(bad(`error: ${redact(e.message)}`));
+    return exitAfterFlush(2);
+  }
+
+  const out = req.out || `brushrouter-replay-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+  const outAbs = isAbsolute(out) ? out : resolve(cwd, out);
+  if (existsSync(outAbs) && statSync(outAbs).isDirectory()) {
+    console.error(bad(`error: -o "${out}" is a directory — replay writes one file`));
+    return exitAfterFlush(2);
+  }
+
+  for (const p of req.images || []) {
+    try {
+      assertImageFile(p, cwd);
+    } catch (e) {
+      console.error(bad(`error: reference image "${p}" from original generation is unavailable (${redact(e.message)})`));
+      console.error(dim("  pass --no-images to replay without reference images, or --images <path> to supply a replacement"));
+      return exitAfterFlush(2);
+    }
+  }
+
+  if (values["dry-run"]) {
+    let order;
+    try {
+      order = await planAttemptOrder(cfg, { provider: req.provider, fallback: req.fallback, images: req.images });
+    } catch (e) {
+      console.error(bad(`error: ${redact(e.message)}`));
+      return exitAfterFlush(1);
+    }
+    if (values.json) {
+      console.log(JSON.stringify(redactValue({ dryRun: true, replayOf: entry.id, ...req, out, wouldTry: order }), null, 2));
+      return;
+    }
+    console.log(paint(C.bold, `Replay Dry Run (${entry.id})`) + dim(" — no request sent, no quota used\n"));
+    console.log(`  prompt:   ${req.prompt}`);
+    console.log(`  out:      ${out}`);
+    if (req.provider) console.log(`  provider: ${req.provider}${req.fallback ? " (+fallback)" : ""}`);
+    if (req.model) console.log(`  model:    ${req.model}`);
+    if (req.size) console.log(`  size:     ${req.size}`);
+    if (req.seed != null) console.log(`  seed:     ${req.seed}`);
+    if (req.images?.length) console.log(`  images:   ${req.images.join(", ")}`);
+    console.log(`  would try: ${order.join(" → ")}\n`);
+    return;
+  }
+
+  const onProgress = values.verbose
+    ? (msg) => process.stderr.write(dim(`  · ${redact(msg)}\n`))
+    : null;
+
+  let result;
+  try {
+    result = await generate(
+      {
+        prompt: req.prompt,
+        size: req.size,
+        quality: req.quality,
+        background: req.background,
+        seed: req.seed,
+        images: req.images,
+        out,
+        cwd,
+        provider: req.provider,
+        model: req.model,
+        fallback: req.fallback,
+        onProgress,
+      },
+      cfg,
+    );
+  } catch (e) {
+    const msg = redact(e.message);
+    const histRec = tryRecordHistory(
+      {
+        source: "replay",
+        ok: false,
+        prompt: req.prompt,
+        provider: req.provider || null,
+        requestedProvider: req.provider || null,
+        model: req.model || null,
+        requestedModel: req.model || null,
+        size: req.size || null,
+        quality: req.quality || null,
+        background: req.background || null,
+        seed: req.seed ?? null,
+        images: req.images || [],
+        recipe: req.recipe,
+        look: req.look,
+        values: req.values,
+        twist: req.twist,
+        out: outAbs,
+        durationMs: e.durationMs ?? null,
+        attempts: e.attempts || [],
+        replayOf: entry.id,
+        error: msg,
+        errorCode: e.code || null,
+      },
+      { cfg },
+    );
+    if (values.json) {
+      console.log(JSON.stringify(redactValue({ ok: false, id: histRec?.id || null, replayOf: entry.id, error: msg, code: e.code, attempts: e.attempts }), null, 2));
+    } else {
+      console.error(bad(`error: replay of ${entry.id} failed: ${msg}`));
+    }
+    return exitAfterFlush(1);
+  }
+
+  const saved = saveImage(out, result.buffer, cwd, { force: values.force });
+  const mime = detectImageMime(result.buffer) || "image/png";
+  const dims = pngSize(result.buffer);
+  const histRec = tryRecordHistory(
+    {
+      source: "replay",
+      ok: true,
+      prompt: req.prompt,
+      provider: result.provider,
+      requestedProvider: req.provider || null,
+      model: result.meta?.model || null,
+      requestedModel: req.model || null,
+      size: req.size || null,
+      actualSize: dims ? `${dims.width}x${dims.height}` : null,
+      quality: req.quality || null,
+      background: req.background || null,
+      seed: result.meta?.seed ?? req.seed ?? null,
+      images: req.images || [],
+      imagesUsed: result.meta?.imagesUsed,
+      recipe: req.recipe,
+      look: req.look,
+      values: req.values,
+      twist: req.twist,
+      out: saved.savedPath,
+      bytes: result.buffer.length,
+      mime,
+      durationMs: result.durationMs ?? null,
+      attempts: result.attempts || [],
+      usage: result.meta?.usage || null,
+      costUsd: result.meta?.costUsd,
+      replayOf: entry.id,
+    },
+    { cfg },
+  );
+
+  if (values.json) {
+    console.log(
+      JSON.stringify(
+        redactValue({
+          ok: true,
+          id: histRec?.id || null,
+          replayOf: entry.id,
+          provider: result.provider,
+          model: result.meta?.model || null,
+          path: saved.savedPath,
+          bytes: result.buffer.length,
+          durationMs: result.durationMs ?? null,
+          seed: result.meta?.seed ?? req.seed ?? null,
+          costUsd: histRec?.costUsd ?? null,
+          costSource: histRec?.costSource ?? null,
+          attempts: result.attempts,
+        }),
+        null,
+        2,
+      ),
+    );
+  } else {
+    const dimText = dims ? `, ${dims.width}x${dims.height}` : "";
+    const durText = result.durationMs != null ? ` in ${formatDurationMs(result.durationMs)}` : "";
+    console.log(`${ok("✓")} replayed ${dim(entry.id)} with ${paint(C.cyan, result.provider)}${result.meta?.model ? dim(` (${result.meta.model})`) : ""}${dim(durText)}${histRec?.id ? dim(` [${histRec.id}]`) : ""}`);
+    console.log(`  ${saved.savedPath} ${dim(`(${mime}${dimText}, ${(result.buffer.length / 1024).toFixed(0)} KB)`)}`);
+  }
+}
+
+async function cmdStats(args) {
+  const { values } = args;
+  let stats;
+  try {
+    stats = computeStats({
+      since: values.since,
+      until: values.until,
+      provider: values.provider,
+      model: values.model,
+      source: values.source,
+    });
+  } catch (e) {
+    console.error(bad(`error: ${redact(e.message)}`));
+    return exitAfterFlush(2);
+  }
+  if (values.json) {
+    console.log(JSON.stringify(redactValue(stats), null, 2));
+    return;
+  }
+  console.log(renderStats(stats));
 }
 
 async function cmdProviders(args) {
@@ -1856,6 +2408,17 @@ async function main() {
       break;
     case "batch":
       await cmdBatch(args);
+      break;
+    case "history":
+    case "hist":
+      await cmdHistory(args);
+      break;
+    case "replay":
+      await cmdReplay(args);
+      break;
+    case "stats":
+    case "usage":
+      await cmdStats(args);
       break;
     case "providers":
     case "list":

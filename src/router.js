@@ -9,7 +9,8 @@
 import { loadConfig, providerConfig, getUserConfigPath } from "./config.js";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { saveImage, batchItemPath } from "./util/common.js";
+import { saveImage, batchItemPath, detectImageMime, pngSize } from "./util/common.js";
+import { tryRecordHistory } from "./history.js";
 import { codexCliProvider } from "./providers/codex-cli.js";
 import { codexProvider, readAuth } from "./providers/codex.js";
 import { gptweb2apiProvider } from "./providers/gptweb2api.js";
@@ -141,8 +142,9 @@ function promptForBackground(prompt, background, providerId) {
     : prompt;
 }
 
-export async function generate({ prompt, size, quality, background, images, out, cwd = process.cwd(), provider, model, fallback = false, onProgress }, cfgIn) {
+export async function generate({ prompt, size, quality, background, seed, images, out, cwd = process.cwd(), provider, model, fallback = false, onProgress, history = false }, cfgIn) {
   const cfg = cfgIn || loadConfig({ cwd });
+  const genStartedAt = Date.now();
   const order = await attemptOrder(cfg, { provider, fallback, images });
   if (!order.length) {
     const err = new Error("no providers enabled — check your config");
@@ -156,17 +158,19 @@ export async function generate({ prompt, size, quality, background, images, out,
     const pcfg = providerConfig(cfg, id);
     if (!provider || id !== provider) {
       // In auto mode (or fallback mode for secondary providers), skip providers that are clearly unavailable.
+      const probeStart = Date.now();
       const status = await p.probe(pcfg).catch((e) => ({ available: false, detail: e.message }));
       if (!status.available) {
-        attempts.push({ provider: id, outcome: "skipped", reason: status.detail });
+        attempts.push({ provider: id, outcome: "skipped", reason: status.detail, durationMs: Date.now() - probeStart });
         notify(onProgress, `skipping ${id}: ${status.detail}`, 5);
         continue;
       }
     }
     notify(onProgress, `using ${id}...`, 10);
     const promptForProvider = promptForBackground(prompt, background, id);
+    const attemptStart = Date.now();
     try {
-      const result = await p.generate({ prompt: promptForProvider, size, quality, background, images, out, cwd, model, onProgress }, pcfg);
+      const result = await p.generate({ prompt: promptForProvider, size, quality, background, seed, images, out, cwd, model, onProgress }, pcfg);
       // Contract check: a provider must return actual image bytes. A provider
       // that accidentally returns an Error object (or nothing) must be treated
       // as a failure here, not silently spread into a buffer-less result.
@@ -175,23 +179,101 @@ export async function generate({ prompt, size, quality, background, images, out,
         e.code = "FAILED";
         throw e;
       }
-      attempts.push({ provider: id, outcome: "ok", model: result.meta?.model });
+      const attemptDurationMs = Date.now() - attemptStart;
+      attempts.push({ provider: id, outcome: "ok", model: result.meta?.model, durationMs: attemptDurationMs });
       // Tell the caller whether the reference images it passed actually reached
       // the provider, so a drop is reportable instead of silent.
-      const meta = { ...result.meta, imagesUsed: p.supportsImages !== false && Boolean(images?.length) };
-      return { ...result, meta, provider: id, attempts };
+      const resolvedSeed = Number.isInteger(result.meta?.seed) ? result.meta.seed : Number.isInteger(seed) ? seed : undefined;
+      const meta = {
+        ...result.meta,
+        imagesUsed: p.supportsImages !== false && Boolean(images?.length),
+        ...(resolvedSeed !== undefined ? { seed: resolvedSeed } : {}),
+      };
+      const durationMs = Date.now() - genStartedAt;
+      let historyRecord = null;
+      if (history) {
+        const hOpts = typeof history === "object" ? history : {};
+        const dims = pngSize(result.buffer);
+        historyRecord = tryRecordHistory(
+          {
+            source: hOpts.source || "api",
+            ok: true,
+            prompt,
+            provider: id,
+            requestedProvider: provider || null,
+            model: meta.model || null,
+            requestedModel: model || null,
+            size: size || null,
+            actualSize: dims ? `${dims.width}x${dims.height}` : null,
+            quality: quality || null,
+            background: background || null,
+            seed: resolvedSeed ?? null,
+            images,
+            imagesUsed: meta.imagesUsed,
+            recipe: hOpts.recipe || null,
+            look: hOpts.look || null,
+            values: hOpts.values || null,
+            twist: hOpts.twist || null,
+            out: hOpts.out || out || null,
+            bytes: result.buffer.length,
+            mime: meta.mime || detectImageMime(result.buffer) || null,
+            durationMs,
+            attempts,
+            usage: meta.usage || null,
+            costUsd: meta.costUsd,
+            replayOf: hOpts.replayOf || null,
+            batchId: hOpts.batchId || null,
+          },
+          { cfg, cwd, ...(hOpts.path ? { path: hOpts.path } : {}) },
+        );
+      }
+      return { ...result, meta, provider: id, attempts, durationMs, ...(historyRecord ? { historyId: historyRecord.id } : {}) };
     } catch (e) {
       lastErr = e;
-      attempts.push({ provider: id, outcome: "failed", reason: e.message, code: e.code });
+      attempts.push({ provider: id, outcome: "failed", reason: e.message, code: e.code, durationMs: Date.now() - attemptStart });
       notify(onProgress, `${id} failed: ${e.message}`, 10);
       if (provider && !fallback) break; // explicit request, no fallback asked for
     }
   }
+  const durationMs = Date.now() - genStartedAt;
   const summary = attempts.map((a) => `${a.provider}: ${a.outcome}${a.reason ? ` (${a.reason})` : ""}`).join("; ");
   const err = new Error(`all providers failed -> ${summary}`);
   err.attempts = attempts;
   err.cause = lastErr;
   err.code = lastErr?.code || "ALL_FAILED";
+  err.durationMs = durationMs;
+  if (history) {
+    const hOpts = typeof history === "object" ? history : {};
+    const rec = tryRecordHistory(
+      {
+        source: hOpts.source || "api",
+        ok: false,
+        prompt,
+        provider: provider || null,
+        requestedProvider: provider || null,
+        model: model || null,
+        requestedModel: model || null,
+        size: size || null,
+        quality: quality || null,
+        background: background || null,
+        seed: Number.isInteger(seed) ? seed : null,
+        images,
+        recipe: hOpts.recipe || null,
+        look: hOpts.look || null,
+        values: hOpts.values || null,
+        twist: hOpts.twist || null,
+        out: hOpts.out || out || null,
+        durationMs,
+        attempts,
+        replayOf: hOpts.replayOf || null,
+        batchId: hOpts.batchId || null,
+        error: err.message,
+        errorCode: err.code,
+      },
+      { cfg, cwd, ...(hOpts.path ? { path: hOpts.path } : {}) },
+    );
+    if (rec) err.historyId = rec.id;
+  }
   throw err;
 }
 
@@ -287,11 +369,13 @@ export async function batchGenerate(
       size: obj.size,
       quality: obj.quality,
       background: obj.background,
+      seed: obj.seed,
       model: obj.model,
       images: obj.images || [],
       out: outPath,
       attempts: [],
       failedProviders: new Set(),
+      startedAt: null,
     };
   });
 
@@ -397,6 +481,8 @@ export async function batchGenerate(
     }
 
     async function executeItem(item, pId) {
+      if (item.startedAt == null) item.startedAt = Date.now();
+      const attemptStart = Date.now();
       notify(onItemStart, { item, index: item.index, provider: pId });
       const p = PROVIDERS[pId];
       const pcfg = providerConfig(cfg, pId);
@@ -408,6 +494,7 @@ export async function batchGenerate(
             size: item.size,
             quality: item.quality,
             background: item.background,
+            seed: item.seed,
             images: item.images,
             out: item.out,
             cwd,
@@ -421,23 +508,33 @@ export async function batchGenerate(
           throw new Error(`${pId} returned no image data`);
         }
 
-        item.attempts.push({ provider: pId, outcome: "ok", model: res.meta?.model });
+        const attemptDurationMs = Date.now() - attemptStart;
+        item.attempts.push({ provider: pId, outcome: "ok", model: res.meta?.model, durationMs: attemptDurationMs });
 
         let saved = null;
         if (item.out) {
           saved = saveImage(item.out, res.buffer, cwd, { force });
         }
 
+        const resolvedSeed = Number.isInteger(res.meta?.seed) ? res.meta.seed : Number.isInteger(item.seed) ? item.seed : undefined;
+        const dims = pngSize(res.buffer);
+        const bytes = res.buffer.length;
+        const mime = res.meta?.mime || detectImageMime(res.buffer) || null;
         const success = {
           ok: true,
           index: item.index,
           item,
           buffer: retainBuffers ? res.buffer : null,
           savedPath: saved?.savedPath || null,
+          bytes,
+          mime,
+          actualSize: dims ? `${dims.width}x${dims.height}` : null,
+          durationMs: Date.now() - item.startedAt,
           provider: pId,
           meta: {
             ...res.meta,
             imagesUsed: p.supportsImages !== false && Boolean(item.images?.length),
+            ...(resolvedSeed !== undefined ? { seed: resolvedSeed } : {}),
           },
           attempts: item.attempts,
         };
@@ -452,7 +549,7 @@ export async function batchGenerate(
         completedCount++;
         notify(onItemComplete, success);
       } catch (err) {
-        item.attempts.push({ provider: pId, outcome: "failed", reason: err.message, code: err.code });
+        item.attempts.push({ provider: pId, outcome: "failed", reason: err.message, code: err.code, durationMs: Date.now() - attemptStart });
         item.failedProviders.add(pId);
 
         if (isRateLimitError(err)) {
@@ -475,6 +572,7 @@ export async function batchGenerate(
             item,
             error: err.message,
             code: err.code,
+            durationMs: Date.now() - item.startedAt,
             attempts: item.attempts,
           };
           results[item.index] = failure;
@@ -541,3 +639,20 @@ export {
   MODES,
   STRICT_SLOTS,
 } from "./library.js";
+
+export {
+  recordHistory,
+  tryRecordHistory,
+  readHistory,
+  listHistory,
+  getHistoryEntry,
+  buildReplayRequest,
+  pruneHistory,
+  clearHistory,
+  computeStats,
+  estimateCost,
+  parseSince,
+  renderHistoryList,
+  renderHistoryDetail,
+  renderStats,
+} from "./history.js";

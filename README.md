@@ -72,6 +72,7 @@ brushrouter gen "<prompt>" [options]
                         other routes ask for it in the prompt)
       --images <path>   Reference image for image-to-image (repeatable)
   -m, --model <id>      Pin a model for this call
+      --seed <int>      Optional integer seed for reproducible generation
       --dry-run         Print the route order that would be attempted, then stop
       --force           Overwrite --out instead of writing a new versioned file
       --json            Machine-readable output
@@ -90,6 +91,9 @@ br setup            # first-run auto-connect
 br login            # sign in to ChatGPT for the codex route (browser OAuth, no API key)
 br vendor gptweb2api  # install the browserless ChatGPT-web gateway binary
 br batch            # generate several prompts in parallel across backends
+br history          # inspect, search, prune, or clear generation history
+br replay [id|last] # replay a past generation with its prompt & seed (and optional overrides)
+br stats            # provider latency (avg/p50/p95), success rates, and spend/usage stats
 br init             # write a starter config
 br install          # add brushrouter to detected agent MCP configs
 br rules            # inject compact guidance into AGENTS.md / .cursorrules
@@ -142,6 +146,25 @@ brushrouter routes enable  gptweb2api
 ```
 
 A disabled route is still reachable with `--provider <id>`. Non-interactive: `BRUSHROUTER_DISABLE=gemini,fal` and `BRUSHROUTER_ENABLE=openrouter`.
+
+### History, replay, and usage stats
+
+Every CLI, batch, replay, and MCP generation is recorded to an append-only JSONL manifest at `~/.config/brushrouter/history.jsonl` (mode `0600`, passed through the secret redactor before writing). Override the path with `BRUSHROUTER_HISTORY_PATH`, or disable logging with `BRUSHROUTER_NO_HISTORY=1` or `history.enabled: false` in config.
+
+```bash
+brushrouter history                         # recent 20 generations
+brushrouter history show last               # full manifest + replay command for latest run
+brushrouter history --provider openrouter --since 7d --failed
+brushrouter history prune --keep 500        # or --before 30d (--dry-run to preview)
+
+brushrouter replay last                     # replay latest prompt + seed + settings
+brushrouter replay ~2 --provider fal --seed 42 --twist "at sunset"
+
+brushrouter stats                           # latency (avg/p50/p95), success rate, spend
+brushrouter stats --since 30d --json
+```
+
+Spend tracking prefers provider-reported costs (e.g. OpenRouter `usage.cost`), then custom per-image `pricing` overrides in config (e.g. `{ "openrouter/google/gemini-3.1-flash-image": 0.039 }`), marks subscription routes (`codex-cli`, `codex`, `gemini`, `gptweb2api`) as `$0 (subscription)`, and falls back to built-in estimates for common API models.
 
 ## Auth sources for ChatGPT routes
 
@@ -251,9 +274,14 @@ DeepSeek Harness (DSH) has no mcpServers JSON — its servers are YAML patch ent
 ```
 Exposed tools:
 
-- **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, out?, images?, async? }`. Returns the saved path plus the image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
+- **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, seed?, out?, images?, async? }`. Returns the saved path, history id, and image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
 - **`image_result`** — `{ jobId }`. Collects an async generation; poll again on a status while the job runs.
 - **`find_image_prompts`** — `{ query?, category?, kind?, input?, shape?, mode?, limit?, full?, id?, values?, seed? }`. Returns previews or a full skeleton to build from before generating. Its description tells the agent every entry works from text alone, that `{braces}` must be filled first, and to pass `input: "image"` only when it actually holds a photo.
+- **`generation_history`** — `{ id?, query?, provider?, model?, status?, source?, since?, until?, limit?, offset?, format? }`. Lists or inspects recorded generations from the persistent manifest log.
+- **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides.
+- **`usage_stats`** — `{ since?, until?, provider?, model?, source?, format? }`. Returns latency percentiles (`avg`/`p50`/`p95`/`min`/`max`), generation & attempt success rates, top error codes, model breakdown, daily trends, token totals, and USD spend.
+
+MCP resources also expose `brushrouter://history` (recent 50 generations) and `brushrouter://stats` (aggregated observability stats) alongside the prompt library resources.
 
 An agent's normal loop is `find_image_prompts` → fill the skeleton → `generate_image`. Two separate tools on purpose: the agent reads and changes the prompt instead of a router substituting one.
 
