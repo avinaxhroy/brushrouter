@@ -150,3 +150,14 @@ test("CLI rules --dry-run respects --only and succeeds", () => {
   assert.equal(pkg.bin.brushrouter, "./bin/brushrouter.js");
   assert.equal(pkg.bin.br, "./bin/brushrouter.js");
 });
+
+test("CLI --help and README stay in sync with prompt-library flags and agent rules", () => {
+  const binPath = resolve("./bin/brushrouter.js");
+  const helpRes = spawnSync(process.execPath, [binPath, "--help"], { encoding: "utf8" });
+  assert.equal(helpRes.status, 0);
+  for (const token of ["--recipe", "--look", "--twist", "--no-negatives", "--diverse", "--offset", "brainstorm"]) {
+    assert.ok(helpRes.stdout.includes(token), `--help should document ${token}`);
+  }
+  const readme = readFileSync(resolve("./README.md"), "utf8").replace(/\r\n/g, "\n");
+  assert.ok(readme.includes(BRUSHROUTER_RULE_SNIPPET), "README.md rule snippet should match BRUSHROUTER_RULE_SNIPPET");
+});
