@@ -8,15 +8,32 @@
     "br": "./bin/brushrouter.js"
   },
   "main": "./src/router.js",
+  "types": "./src/router.d.ts",
   "exports": {
-    ".": "./src/router.js",
-    "./config": "./src/config.js",
-    "./redact": "./src/util/redact.js",
-    "./library": "./src/library.js",
-    "./history": "./src/history.js"
+    ".": {
+      "types": "./src/router.d.ts",
+      "default": "./src/router.js"
+    },
+    "./config": {
+      "types": "./src/config.d.ts",
+      "default": "./src/config.js"
+    },
+    "./redact": {
+      "types": "./src/util/redact.d.ts",
+      "default": "./src/util/redact.js"
+    },
+    "./library": {
+      "types": "./src/library.d.ts",
+      "default": "./src/library.js"
+    },
+    "./history": {
+      "types": "./src/history.d.ts",
+      "default": "./src/history.js"
+    }
   },
   "scripts": {
     "test": "node --test",
+    "test:types": "tsc -p tsconfig.types.json",
     "doctor": "node bin/brushrouter.js doctor",
     "setup": "node bin/brushrouter.js setup",
     "install:mcp": "node bin/brushrouter.js install",
@@ -42,6 +59,18 @@
   ],
   "engines": {
     "node": ">=20"
+  },
+  "peerDependencies": {
+    "@types/node": "*"
+  },
+  "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.3"
   },
   "keywords": [
     "image-generation",
