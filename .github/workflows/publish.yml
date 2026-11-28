@@ -70,7 +70,10 @@ jobs:
 
       - name: Test
         if: steps.gate.outputs.skip == 'false'
-        run: npm test
+        run: |
+          npm test
+          npm run recipes:check
+          npm run styles:check
 
       - name: Stamp package.json from CHANGELOG
         if: steps.gate.outputs.skip == 'false'

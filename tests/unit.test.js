@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 import { detectImageMime, extForMime, freePath, saveImage, decodeJwt, jwtClientId, jwtExpiryMs, normalizeSize, appendTailed, readImageAsDataUrl, readBodyCapped, pngSize, MAX_REF_IMAGE_BYTES } from "../src/util/common.js";
 import { resolvePath } from "../src/providers/http.js";
@@ -15,6 +16,20 @@ process.env.BRUSHROUTER_CONFIG_DIR = mkdtempSync(join(tmpdir(), "br-unit-config-
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+function writeFakeCli(dir, name, jsBody) {
+  if (process.platform === "win32") {
+    const jsPath = join(dir, `${name}.cjs`);
+    const cmdPath = join(dir, `${name}.cmd`);
+    writeFileSync(jsPath, jsBody, "utf8");
+    writeFileSync(cmdPath, `@"${process.execPath}" "${jsPath}" %*\r\n`, "utf8");
+    return cmdPath;
+  }
+  const binPath = join(dir, name);
+  writeFileSync(binPath, `#!${process.execPath}\n${jsBody}\n`, { mode: 0o755 });
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
 
 test("detectImageMime recognizes png and jpeg", () => {
   assert.equal(detectImageMime(PNG), "image/png");
@@ -964,7 +979,7 @@ test("brushrouter's own auth.json outranks the borrowed ones", async () => {
     mkdirSync(join(dir, ".codex"), { recursive: true });
     writeFileSync(join(dir, ".codex", "auth.json"), JSON.stringify({ tokens: { access_token: codexToken } }));
     writeFileSync(join(cfg, "auth.json"), JSON.stringify({ tokens: { access_token: own } }));
-    const auth = withEnv({ HOME: dir, BRUSHROUTER_CONFIG_DIR: cfg, XDG_DATA_HOME: undefined }, () => readAuth());
+    const auth = withEnv({ HOME: dir, USERPROFILE: dir, BRUSHROUTER_CONFIG_DIR: cfg, XDG_DATA_HOME: undefined }, () => readAuth());
     assert.equal(auth.plan, "pro", "expected brushrouter's own auth to win over ~/.codex");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1098,14 +1113,15 @@ test("findCodexCli discovers bundled CLI in desktop ChatGPT app", async () => {
 
 test("batchItemPath formats slug and padding correctly", async () => {
   const { batchItemPath } = await import("../src/util/common.js");
-  const p1 = batchItemPath("/tmp/out", 1, 10, "A Red Fox in the Snow!");
-  assert.equal(p1, "/tmp/out/01-a-red-fox-in-the-snow.png");
+  const outDir = resolve("/tmp/out");
+  const p1 = batchItemPath(outDir, 1, 10, "A Red Fox in the Snow!");
+  assert.equal(p1, resolve(outDir, "01-a-red-fox-in-the-snow.png"));
 
-  const p2 = batchItemPath("/tmp/out", 12, 100, "Isometric Coffee Shop");
-  assert.equal(p2, "/tmp/out/012-isometric-coffee-shop.png");
+  const p2 = batchItemPath(outDir, 12, 100, "Isometric Coffee Shop");
+  assert.equal(p2, resolve(outDir, "012-isometric-coffee-shop.png"));
 
-  const p3 = batchItemPath("/tmp/out", 1, 5, "");
-  assert.equal(p3, "/tmp/out/01-image.png");
+  const p3 = batchItemPath(outDir, 1, 5, "");
+  assert.equal(p3, resolve(outDir, "01-image.png"));
 });
 
 test("batchVariantPath suffixes index before extension", async () => {
@@ -1369,8 +1385,9 @@ test("readImageAsDataUrl rejects oversized files", () => {
 });
 
 test("readImageAsDataUrl rejects special files (no EOF, unbounded read)", () => {
-  // /dev/null exists everywhere and fstat reports a non-regular file.
-  assert.throws(() => readImageAsDataUrl("/dev/null"), /not a regular file/);
+  // /dev/null (or \\.\NUL on Windows) exists everywhere and fstat reports a non-regular file.
+  const special = process.platform === "win32" ? "\\\\.\\NUL" : "/dev/null";
+  assert.throws(() => readImageAsDataUrl(special), /not a regular file/);
 });
 
 test("readImageAsDataUrl accepts a small valid image", () => {
@@ -1589,16 +1606,15 @@ test("gemini run() declares stdout and survives a child that writes output", asy
   // before generate() could settle.
   const { geminiProvider } = await import("../src/providers/gemini.js");
   const dir = mkdtempSync(join(tmpdir(), "br-gemini-run-"));
-  const cli = join(dir, "fake-gemini-cli.js");
   const uncaught = [];
   const onUncaught = (e) => uncaught.push(e);
   process.on("uncaughtException", onUncaught);
   try {
-    writeFileSync(
-      cli,
-      `#!${process.execPath}\nconsole.log("generating image -> /nonexistent/${"x"}.png");\nconsole.error("no image produced");\nprocess.exit(3);\n`,
+    const cli = writeFakeCli(
+      dir,
+      "fake-gemini-cli",
+      `console.log("generating image -> /nonexistent/x.png");\nconsole.error("no image produced");\nprocess.exit(3);`,
     );
-    chmodSync(cli, 0o755);
     // The child produces no image, so generate() rejects — what matters is that
     // it rejects with a real cli error instead of crashing on a ReferenceError.
     await assert.rejects(
@@ -1840,7 +1856,7 @@ test("a corrupt keys.json is backed up, not silently overwritten", async () => {
     const script = join(dir, "save.mjs");
     writeFileSync(
       script,
-      `import { saveKey } from ${JSON.stringify(join(process.cwd(), "src", "util", "keys.js"))};
+      `import { saveKey } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "src", "util", "keys.js")).href)};
        console.log(saveKey("fal", "fal-test-key-abcdefghijklmnop"));\n`,
     );
     const stdout = execFileSync(process.execPath, [script], {
@@ -2062,8 +2078,10 @@ test("runLogin writes auth.json 0600 in a 0700 dir even when both already existe
       },
     });
     assert.equal(out.path, authPath);
-    assert.equal(statSync(dir).mode & 0o777, 0o700, "auth dir was left world-traversable");
-    assert.equal(statSync(authPath).mode & 0o777, 0o600, "auth.json was left world-readable");
+    if (process.platform !== "win32") {
+      assert.equal(statSync(dir).mode & 0o777, 0o700, "auth dir was left world-traversable");
+      assert.equal(statSync(authPath).mode & 0o777, 0o600, "auth.json was left world-readable");
+    }
   } finally {
     globalThis.fetch = realFetch;
     rmSync(dir, { recursive: true, force: true });
@@ -2518,11 +2536,12 @@ async function cliHarness() {
       env: {
         ...process.env,
         HOME: env.home,
+        USERPROFILE: env.home,
         BRUSHROUTER_CONFIG_DIR: env.cfgDir,
         BRUSHROUTER_USER_CONFIG: env.userConfig,
         BRUSHROUTER_KEYS_PATH: env.keys,
         // Keep provider probes cheap and deterministic: no real CLI on PATH.
-        PATH: "/usr/bin:/bin",
+        PATH: process.platform === "win32" ? env.home : "/usr/bin:/bin",
       },
       timeout: 60000,
     });
@@ -2606,7 +2625,7 @@ test("CLI setup --dry-run does not run the interactive login", async () => {
 };
 fake(process.stdin); fake(process.stdout); fake(process.stderr);
 process.argv = [process.argv[0], ${JSON.stringify(bin)}, "setup", "--dry-run"];
-await import(${JSON.stringify(bin)});
+await import(${JSON.stringify(pathToFileURL(bin).href)});
 `,
   );
   const child = spawn(process.execPath, [shim], {
@@ -2614,6 +2633,7 @@ await import(${JSON.stringify(bin)});
     env: {
       ...process.env,
       HOME: home.home,
+      USERPROFILE: home.home,
       BRUSHROUTER_CONFIG_DIR: home.cfgDir,
       BRUSHROUTER_USER_CONFIG: home.userConfig,
       BRUSHROUTER_KEYS_PATH: home.keys,
@@ -3045,13 +3065,14 @@ const modes = [];
 process.stdin.setRawMode = (v) => { modes.push(v); return setRaw(v); };
 process.argv = [process.argv[0], ${JSON.stringify(bin)}, "setup"];
 process.on("exit", (c) => process.stderr.write("\\nMODES:" + JSON.stringify(modes) + " CODE:" + c + "\\n"));
-await import(${JSON.stringify(bin)});
+await import(${JSON.stringify(pathToFileURL(bin).href)});
 `,
   );
   const child = spawn(process.execPath, [shim], {
     env: {
       ...process.env,
       HOME: home.home,
+      USERPROFILE: home.home,
       BRUSHROUTER_CONFIG_DIR: home.cfgDir,
       BRUSHROUTER_USER_CONFIG: home.userConfig,
       BRUSHROUTER_KEYS_PATH: home.keys,
@@ -3330,9 +3351,11 @@ test("gptweb2api probe returns needs-login without throwing and supports cookie-
   const fakeBin = join(dir, "gptweb2api");
   writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   const prevHome = process.env.HOME;
+  const prevUserProfile = process.env.USERPROFILE;
   const prevCfg = process.env.BRUSHROUTER_CONFIG_DIR;
   const prevCookie = process.env.BRUSHROUTER_GPTWEB_COOKIE;
   process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
   process.env.BRUSHROUTER_CONFIG_DIR = join(dir, "cfg");
   delete process.env.BRUSHROUTER_GPTWEB_COOKIE;
   try {
@@ -3345,7 +3368,10 @@ test("gptweb2api probe returns needs-login without throwing and supports cookie-
     assert.equal(cookieOnly.auth, "builtin");
     assert.match(cookieOnly.detail, /cookie/);
   } finally {
-    process.env.HOME = prevHome;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
     if (prevCfg === undefined) delete process.env.BRUSHROUTER_CONFIG_DIR;
     else process.env.BRUSHROUTER_CONFIG_DIR = prevCfg;
     if (prevCookie === undefined) delete process.env.BRUSHROUTER_GPTWEB_COOKIE;
@@ -3647,9 +3673,12 @@ test("batchGenerate does not sleep for cooldown on providers incompatible with p
 test("codexCliProvider.generate validates reference images before spawning CLI", async () => {
   const { codexCliProvider } = await import("../src/providers/codex-cli.js");
   const dir = mkdtempSync(join(tmpdir(), "br-codexcli-ref-"));
-  const fakeCli = join(dir, "fake-codex");
   const badRef = join(dir, "not-an-image.png");
-  writeFileSync(fakeCli, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex 0.1.0\"; exit 0; fi\nexit 99\n", { mode: 0o755 });
+  const fakeCli = writeFakeCli(
+    dir,
+    "fake-codex",
+    `if (process.argv[2] === "--version") { console.log("codex 0.1.0"); process.exit(0); }\nprocess.exit(99);`,
+  );
   writeFileSync(badRef, "plain text, not png");
   try {
     await assert.rejects(
@@ -3812,18 +3841,18 @@ test("isPathInside rejects outside paths and codex-cli refuses JSON-reported pat
   const outside = mkdtempSync(join(tmpdir(), "br-sec-outside-"));
   const secretImg = join(outside, "secret.png");
   const dotdotImg = join(dir, "..preview.png");
-  const fakeCli = join(dir, "codex");
+  const missingCli = join(dir, "nonexistent-codex");
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   try {
     writeFileSync(secretImg, pngBytes);
     writeFileSync(dotdotImg, pngBytes);
     assert.equal(isPathInside(secretImg, dir), false);
     assert.equal(isPathInside(dotdotImg, dir), true, "filenames starting with .. inside dir are valid");
-    assert.equal(isPathInside(fakeCli, dir), false); // non-existent
-    writeFileSync(
-      fakeCli,
-      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.1.0"; exit 0; fi\nln -s "${secretImg}" brushrouter-out.png\necho '{"path":"${secretImg}"}'\nexit 0\n`,
-      { mode: 0o755 },
+    assert.equal(isPathInside(missingCli, dir), false); // non-existent
+    const fakeCli = writeFakeCli(
+      dir,
+      "codex",
+      `const fs = require("node:fs");\nif (process.argv[2] === "--version") { console.log("codex-cli 0.1.0"); process.exit(0); }\ntry { fs.symlinkSync(${JSON.stringify(secretImg)}, "brushrouter-out.png"); } catch {}\nconsole.log(JSON.stringify({ path: ${JSON.stringify(secretImg)} }));\nprocess.exit(0);`,
     );
     await assert.rejects(
       () => codexCliProvider.generate({ prompt: "test", cwd: dir }, { cli: fakeCli }),
@@ -3840,15 +3869,14 @@ test("gemini provider contains output paths, validates image magic bytes, and re
   const dir = mkdtempSync(join(tmpdir(), "br-sec-gemini-"));
   const outside = mkdtempSync(join(tmpdir(), "br-sec-gemini-out-"));
   const secretImg = join(outside, "secret.png");
-  const fakeAgy = join(dir, "agy");
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   try {
     writeFileSync(secretImg, pngBytes);
     // 1. Reports an outside image path + leaks a token shape on stderr -> must refuse outside path and redact error
-    writeFileSync(
-      fakeAgy,
-      `#!/bin/sh\necho "saved at ${secretImg}"\necho "err sk-secret1234567890abcdef" >&2\nexit 1\n`,
-      { mode: 0o755 },
+    let fakeAgy = writeFakeCli(
+      dir,
+      "agy-1",
+      `console.log("saved at " + ${JSON.stringify(secretImg)});\nconsole.error("err sk-secret1234567890abcdef");\nprocess.exit(1);`,
     );
     await assert.rejects(
       () => geminiProvider.generate({ prompt: "test" }, { cli: fakeAgy }),
@@ -3859,10 +3887,10 @@ test("gemini provider contains output paths, validates image magic bytes, and re
       },
     );
     // 2. Writes a non-image payload into brushrouter-out.png -> rejected with BAD_IMAGE_PAYLOAD
-    writeFileSync(
-      fakeAgy,
-      `#!/bin/sh\necho "not a png" > brushrouter-out.png\nexit 0\n`,
-      { mode: 0o755 },
+    fakeAgy = writeFakeCli(
+      dir,
+      "agy-2",
+      `require("node:fs").writeFileSync("brushrouter-out.png", "not a png\\n");\nprocess.exit(0);`,
     );
     await assert.rejects(
       () => geminiProvider.generate({ prompt: "test" }, { cli: fakeAgy }),
