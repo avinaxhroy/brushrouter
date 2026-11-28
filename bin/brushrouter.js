@@ -324,11 +324,13 @@ ${paint(C.bold, "OPTIONS")}
                            (a vendored visual system, ${LIB_COUNTS.look}). Omit for both
       --mode <m>           Recipes: categories | related (default) | one | brainstorm
   -n, --limit <n>          Recipes/brainstorm: how many to return (default 4, max 10)
+      --offset <n>         Recipes: skip rows before the page (for pagination past 10)
       --prompt <text>      Prompt to generate (repeatable for multiple prompts in gen/batch)
       --recipe <id>        gen/batch: generate directly from a recipe or look id
-      --look <id>          gen/batch/prompts: layer a visual look onto a recipe
-      --twist <text>       gen/batch/prompts: extra creative direction before STYLE LOCK
-      --no-negatives       gen/batch/prompts: omit DO NOT REPRODUCE and AVOID blocks
+                           (auto-maps ratio to exact aspect-ratio size)
+      --look <id>          gen/batch/prompts: layer a visual look onto a recipe (or standalone)
+      --twist <text>       gen/batch/prompts: creative direction injected before STYLE LOCK/AVOID
+      --no-negatives       gen/batch/prompts: omit DO NOT REPRODUCE and AVOID (keeps STYLE LOCK)
       --brainstorm         batch: fan out a brainstorm query straight into contrasting items
       --diverse            prompts: diversify results across categories and kinds
       --concurrency <n>    Batch: max concurrent requests across providers
@@ -336,7 +338,7 @@ ${paint(C.bold, "OPTIONS")}
                            already have a reference photo
       --shape <s>          Recipes: single | grid | sheet | document
       --id <id>            Recipes: fetch one exact recipe
-      --set k=v            Recipes: fill a slot (repeatable; e.g. --set text=ACME)
+      --set k=v            gen/prompts: fill a slot (repeatable; e.g. --set text=ACME)
       --full               Recipes: return the whole skeleton, not a preview
       --prompt-only, --raw Recipes: output only the filled prompt text (pipeable)
       --seed <n>           Integer seed for gen/replay, or pick seed for prompts
@@ -359,6 +361,8 @@ ${paint(C.bold, "OPTIONS")}
 ${paint(C.bold, "EXAMPLES")}
   brushrouter setup                        # first run: connect automatically
   brushrouter gen "a red fox in snow" -o fox.png
+  brushrouter gen --recipe logo-mark --set text=ACME --twist "embossed brass foil" -o logo.png
+  brushrouter gen --recipe product-hero --look acid-burst-motion-type --set subject="ceramic kettle"
   brushrouter gen "product shot" --provider fal --fallback
   brushrouter gen "logo" --provider openrouter --model x-ai/grok-imagine-image-2.0
   brushrouter gen "logo" -s 1024x1024 -q high --seed 42
@@ -371,6 +375,7 @@ ${paint(C.bold, "EXAMPLES")}
   brushrouter models openrouter           # see models your key can reach
   brushrouter prompts                     # the map: ${LIB_COUNTS.job} recipes + ${LIB_COUNTS.look} looks
   brushrouter prompts "product hero shot" # best match + similar alternatives
+  brushrouter prompts --mode brainstorm "editorial portrait" -n 4
   brushrouter prompts --kind look "mono noir editorial"
   brushrouter prompts -c infographic -n 2 --full
   brushrouter prompts --id character-sheet --full --set subject="a courier"

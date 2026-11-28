@@ -309,11 +309,21 @@ The invariants are asserted by `scripts/check-recipes.mjs`: `text` must exist an
 
 Current shape: 27 recipes, 19 image-capable and 8 text-only, across `single` 17 / `grid` 7 / `sheet` 1 / `document` 2; plus 137 looks, all `single`, in 6 categories. `check-recipes.mjs` validates both — a malformed `styles.json` is a hard failure, an absent one is not.
 
-### Free slots
+### Free slots & open aesthetic suggestions
 
 Of the 17 slots, nine carry a curated option list and are filled for the caller. Eight are deliberately free — `subject`, `subject_action`, `text`, `secondary_text`, `prop`, `location`, `wardrobe`, `accent_symbol` — because only the caller knows them. Unfilled, they are returned in `missing` and **left visible as placeholders**; `fill()` never silently emits a literal `{subject}` into a prompt destined for an image model, where it would render as meaningless text.
 
+Only structural slots in `STRICT_SLOTS` (`ratio`) are strictly validated against their option list; aesthetic slots (`lighting`, `mood`, `surface`, `grading`, `render`, `background`, `composition`, `type`) treat their curated `options` as creative suggestions so agents can pass arbitrary creative strings without `invalidValues` warnings. `ratioToSize()` maps each supported `ratio` to exact aspect-ratio pixel dimensions (multiples of 16, e.g. `16:9 → 1536x864`, `4:3 → 1344x1008`, `4:5 → 1024x1280`) so downstream providers like OpenRouter reduce back to the exact ratio.
+
 A look draws **no defaults at all**. The shared slot vocabulary is our studio set (`ratio: "1:1"`, `background: "seamless white"`), and a vendored style's slots are the caller's content: auto-filling them once injected studio defaults into a zine collage. So `fill()` consults the vocabulary only when `kind === "job"`.
+
+### Composition, creative `twist`, and layered custom recipes
+
+- **Job + Look composition (`composePrompt()`):** combines any `job` layout with any `look` (`recipe` + `look`), preserving the job's composition skeleton while layering the look's visual-system guidance (`VISUAL LOOK — ...`), merged `STYLE LOCK` and `DO NOT REPRODUCE` guards, and MIT attribution.
+- **First-class `twist`:** optional `twist` text is emitted as `CREATIVE DIRECTION — ...` *before* `STYLE LOCK`, `DO NOT REPRODUCE`, and `AVOID` so creative direction is never buried after negative lists.
+- **Direct generation:** MCP `generate_image` and CLI `gen` accept `recipe`, `look`, `values`/`--set`, `twist`, and `includeNegatives`/`--no-negatives`, composing in one call, failing fast on missing free slots, and auto-mapping `ratio` to `size` when `size` is omitted.
+- **Layered custom recipes:** `loadRecipes()` layers optional JSON files (single entries or category bundles) from `~/.config/brushrouter/recipes/`, `BRUSHROUTER_EXTRA_RECIPES_DIRS`, and `.brushrouter/recipes/` on top of built-ins (unless `BRUSHROUTER_NO_CUSTOM_RECIPES=1`). Trusted user/env directories may override built-in ids; project-local `.brushrouter/recipes/` is restricted to adding new ids so an untrusted git checkout cannot hijack built-in prompts. Malformed custom files/entries are skipped with redacted warnings rather than failing library load.
+- **Native MCP `prompts` & `resources`:** alongside tools, `src/mcp.js` advertises `prompts` (`prompts/list`, `prompts/get` with `_look`/`_twist`/`_input`/`_noNegatives`) and `resources` (`brushrouter://categories`, `brushrouter://slots`, `brushrouter://recipes`, `brushrouter://recipes/<id>`).
 
 ### Search: no index, no embeddings
 
@@ -339,7 +349,7 @@ What makes search feel semantic is a hand-written alias map: an agent says *hero
 
 Name matching is fraction-weighted (`3 * nameHits / queryTokens`) because a flat cap tied a 3-of-3 match to a 2-of-3 match, which made "product hero shot" resolve by seed coin-flip instead of by evidence. Matching is prefix-tolerant over words of four or more characters (`explain` finds `explainer`), but a prefix only counts when the shorter word is ≥ 60% of the longer word's length — so *watercolour* rejects *water* (0.45) while *logos* accepts *logo* (0.8). The exact-default bonus at +5 exists because prefix matching widened recall enough that an entry merely mentioning *film* in prose could outrank the entry whose default value *is* "analogue film photograph".
 
-A query that scores zero everywhere returns nothing, with a pointer to `mode: "categories"`. Falling back to a seed-random recipe would look like an answer and be worse than no answer.
+A query that scores zero everywhere still returns `matched: false` with empty `rows` (falling back to a seed-random recipe would look like an answer and be worse than no answer), plus a `suggestions` object (`nearMatches` from `styleLock` hits and nearest `categories`) and a pointer to `mode: "categories"` / `mode: "brainstorm"` so callers can recover without guessing.
 
 ### Modes
 
@@ -348,6 +358,7 @@ A query that scores zero everywhere returns nothing, with a pointer to `mode: "c
 | `categories` | the map — cheap, queryless; why an agent knows what to ask for |
 | `related` (default) | one best match + alternatives; `limit` sizes the rail |
 | `one` | exactly one; a named mode so an agent reading an enum never reasons about `limit: 1` |
+| `brainstorm` | diverse contrasting directions — round-robins across categories and alternates `job`/`look` kinds (also available via `diverse: true`) |
 
 - `input: "image"` narrows to recipes that can use a reference photo. Every **job** category retains at least one such recipe, so the filter never dead-ends an agent. `input: "text"` (default) keeps everything.
 - `kind` narrows to `job` or `look`. Job-specific invariants are tested against the job subset, because a guarantee holding for 27 of 164 entries is not a guarantee.

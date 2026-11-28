@@ -247,16 +247,21 @@ An agent asked for "a nice product shot" will invent a worse prompt than one alr
 ```bash
 brushrouter prompts                        # the map: what kinds of image exist
 brushrouter prompts "product hero shot"    # 1 best match + 3 similar
+brushrouter prompts --mode brainstorm "editorial" -n 4  # diverse contrasting directions
 brushrouter prompts "flyer" -n 1           # force exactly one
 brushrouter prompts -c infographic --full  # a whole category, full skeletons
 brushrouter prompts --input image          # only recipes that can use a photo
 brushrouter prompts --kind look "mono noir editorial"
-brushrouter prompts --id logo-mark --full --set text=ACME --set subject="a peak"
+brushrouter prompts --id logo-mark --full --set text=ACME --set subject="a peak" --twist "embossed foil"
+brushrouter gen --recipe logo-mark --set text=ACME --twist "embossed foil" -o logo.png
+brushrouter gen --recipe product-hero --look <look-id> --set subject="ceramic kettle" -o kettle.png
 ```
 
-Design facts, briefly: every recipe works with no reference image (each has a text skeleton, plus an optional `image` upgrade naming what it accepts); unfilled `{slots}` are reported in `missing` rather than shipped to the image model; a query that matches nothing returns nothing — search is lexical with a hand-written alias map (*hero shot* → `product-hero`, *dashboard* → `app-screen`). Results are previews by default (id, goal, when to use it, missing slots, credit); `--full` for the skeleton; `limit` is capped at 10 because this fills the caller's context window.
+Design facts, briefly: every recipe works with no reference image (each has a text skeleton, plus an optional `image` upgrade naming what it accepts); unfilled `{slots}` are reported in `missing` rather than shipped to the image model; aesthetic slots (`lighting`, `mood`, `surface`, `grading`, `render`, `background`, `composition`, `type`) treat their curated options as creative suggestions so agents can invent freely while `ratio` stays strictly validated and auto-maps to exact aspect-ratio pixel dimensions on `gen`/`generate_image`. Any `job` layout can be composed with any `look` (`--look` / `look` / `composePrompt()`), merging the look's visual system, `STYLE LOCK`, `DO NOT REPRODUCE`, and MIT attribution; `--twist` / `twist` injects `CREATIVE DIRECTION — ...` right before `STYLE LOCK` and `AVOID`, and `--no-negatives` / `includeNegatives: false` drops `DO NOT REPRODUCE` / `AVOID` while keeping `STYLE LOCK`. A query that matches nothing still reports `matched: false` (never a random recipe), and returns `suggestions` (style-lock near-matches + nearest categories) so callers don't hit a dead end. Results are previews by default; `--full` returns the skeleton; `limit` is capped at 10 with `--offset` / `offset` for pagination.
 
-Modes: `--mode categories` for a vague request, `--mode related` (default) for one best match plus alternatives, `--mode one` for a single entry.
+Modes: `--mode categories` for a vague request, `--mode related` (default) for one best match plus alternatives, `--mode one` for a single entry, `--mode brainstorm` (or `--diverse` / `diverse: true`) for contrasting directions round-robined across categories and `job`/`look` kinds.
+
+Custom recipes & looks: layer your own JSON files (single-entry or category bundles) on top of built-ins in `~/.config/brushrouter/recipes/` (or `BRUSHROUTER_EXTRA_RECIPES_DIRS`, colon/semicolon-separated) and project-local `.brushrouter/recipes/`. Trusted user/env dirs may override built-in ids; project-local `.brushrouter/recipes/` may only add new ids so an untrusted checkout cannot hijack built-in prompts. Set `BRUSHROUTER_NO_CUSTOM_RECIPES=1` to load built-ins only.
 
 ### Attribution
 
@@ -301,17 +306,20 @@ DeepSeek Harness (DSH) has no mcpServers JSON — its servers are YAML patch ent
 ```
 Exposed tools:
 
-- **`generate_image`** — `{ prompt, provider?, model?, fallback?, size?, quality?, seed?, out?, images?, mask?, async? }`. Returns the saved path, history id, and image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
-- **`batch_generate_images`** — pass `items` with `prompt` and optional per-item `images` and `mask`; masks require a base image.
-- **`image_result`** — `{ jobId }`. Collects an async generation; poll again on a status while the job runs.
-- **`find_image_prompts`** — `{ query?, category?, kind?, input?, shape?, mode?, limit?, full?, id?, values?, seed? }`. Returns previews or a full skeleton to build from before generating. Its description tells the agent every entry works from text alone, that `{braces}` must be filled first, and to pass `input: "image"` only when it actually holds a photo.
+- **`generate_image`** — `{ prompt?, recipe?, look?, values?, twist?, includeNegatives?, provider?, model?, fallback?, size?, quality?, background?, seed?, out?, images?, mask?, count?, concurrency?, async? }`. Accepts either a plain `prompt` or a direct `recipe`/`look` (failing fast if free slots are missing and auto-mapping `ratio` to `size`). Returns the saved path, history id, and image, all text through the redactor. `async: true` returns a `jobId` immediately instead of blocking for a minute or two.
+- **`batch_generate_images`** — `{ prompts?, items?, outDir?, provider?, fallback?, concurrency?, embedImages?, async? }`. Generates multiple prompts in parallel across available providers; pass `items` with `prompt` (or `recipe`/`look`) and optional per-item `images` and `mask` (masks require a base image).
+- **`image_result`** — `{ jobId }`. Collects an async `generate_image` or `batch_generate_images` job; poll again on a status while the job runs.
+- **`find_image_prompts`** — `{ query?, category?, kind?, input?, shape?, mode?, diverse?, limit?, offset?, full?, id?, look?, twist?, includeNegatives?, format?, values?, seed? }`. Returns previews or a full skeleton (as text or structured JSON) to explore, brainstorm, or compose before generating.
 - **`generation_history`** — `{ id?, query?, provider?, model?, status?, source?, since?, until?, limit?, offset?, format? }`. Lists or inspects recorded generations from the persistent manifest log.
 - **`replay_generation`** — `{ id?, provider?, model?, seed?, size?, quality?, background?, prompt?, twist?, images?, mask?, noImages?, out?, fallback?, async? }`. Replays a past generation by id, prefix, `"last"`, `"~N"`, or saved path with optional overrides. By default replay reuses recorded reference images and masks; `noImages` drops both.
 - **`usage_stats`** — `{ since?, until?, provider?, model?, source?, format? }`. Returns latency percentiles (`avg`/`p50`/`p95`/`min`/`max`), generation & attempt success rates, top error codes, model breakdown, daily trends, token totals, and USD spend.
 
-MCP resources also expose `brushrouter://history` (recent 50 generations) and `brushrouter://stats` (aggregated observability stats) alongside the prompt library resources.
+Native MCP `prompts` and `resources` are also advertised on `initialize`:
 
-An agent's normal loop is `find_image_prompts` → fill the skeleton → `generate_image`. Two separate tools on purpose: the agent reads and changes the prompt instead of a router substituting one.
+- **`prompts/list`** & **`prompts/get`** — exposes every recipe and look as an MCP prompt with its slot arguments (plus optional `_look`, `_twist`, `_input`, `_noNegatives`).
+- **`resources/list`** & **`resources/read`** — serves `brushrouter://categories`, `brushrouter://slots`, `brushrouter://recipes`, `brushrouter://recipes/<id>`, `brushrouter://history` (recent 50 generations), and `brushrouter://stats` (aggregated observability stats) as `application/json`.
+
+An agent can either browse via `find_image_prompts` / native MCP `prompts` & `resources`, or pass `recipe`/`look`/`values`/`twist` directly to `generate_image` in a single tool call.
 
 The `initialize` result also carries an `instructions` string telling the model when to use brushrouter (configurable via `instructions` in config or `BRUSHROUTER_INSTRUCTIONS`; `""` disables). And for rule-file agents, `brushrouter rules` injects ~60 tokens of guidance into the rule files of 12+ harnesses — AGENTS.md (Codex, OpenCode, Zed, Pi, Oh-My-Pi, DeepSeek Harness), CLAUDE.md (Claude Code), GEMINI.md (Gemini CLI), .cursorrules / .cursor rules (Cursor), .windsurfrules (Windsurf), .github/copilot-instructions.md (Copilot), .junie/guidelines.md (Junie) — demarcated so it updates in place:
 
@@ -330,7 +338,7 @@ brushrouter rules --only codex-global,project-agents  # cherry-pick by target id
 ```markdown
 <!-- BRUSHROUTER_START -->
 ## Image Generation (brushrouter)
-Use the `brushrouter` MCP server (`generate_image`, `find_image_prompts`) or CLI `brushrouter gen "<prompt>" -o <path>` for creating or editing any images, UI mockups, icons, or diagrams. Avoid manual script creation or ad-hoc web scraping for image tasks. For long generations, pass `async: true` and check `image_result`.
+Use the `brushrouter` MCP server (`generate_image`, `find_image_prompts`, or native MCP `prompts`/`resources`) or CLI `brushrouter gen "<prompt>" -o <path>` for creating or editing any images, UI mockups, icons, or diagrams. Avoid manual script creation or ad-hoc web scraping for image tasks. Pass `recipe`, `look`, `values`, and `twist` directly to `generate_image` (or `brushrouter gen --recipe`), use `mode: "brainstorm"` for diverse directions, and pass `async: true` with `image_result` for long generations.
 <!-- BRUSHROUTER_END -->
 ```
 
@@ -395,6 +403,8 @@ One exception: a *project* config may not set `baseUrl`, `url`, `cli`, `command`
 | `BRUSHROUTER_INSTRUCTIONS` | session guidance sent to MCP agents in `initialize` (empty string disables) |
 | `BRUSHROUTER_DISABLE` / `BRUSHROUTER_ENABLE` | comma-separated routes to turn off / on (unknown name is an error, not a silent no-op) |
 | `BRUSHROUTER_RECIPES_DIR` | use a different recipe directory (same schema) |
+| `BRUSHROUTER_EXTRA_RECIPES_DIRS` | extra trusted custom recipe/look directories (path-delimiter separated) layered on top of built-ins |
+| `BRUSHROUTER_NO_CUSTOM_RECIPES` | set to `1` to disable layered user/project custom recipe loading |
 | `BRUSHROUTER_STYLES_FILE` | use a different vendored styles file |
 | `BRUSHROUTER_APP_DIRS` | extra dirs to scan for app bundles (auto-discovery) |
 | `BRUSHROUTER_MCP_CONFIGS` | extra agent MCP config paths for `install` |
