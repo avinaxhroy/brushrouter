@@ -807,7 +807,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
       fallback: args.fallback === true,
       retainBuffers: shouldEmbed,
       onProgress,
-      onItemDone: (r) => {
+      onItemComplete: (r) => {
         tryRecordHistory(
           {
             source: "mcp",
