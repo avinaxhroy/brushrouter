@@ -970,7 +970,7 @@ async function cmdBatch(args) {
   const outDir = resolve(cwd, values.out || `brushrouter-batch-${timestamp}`);
 
   let batchSeed;
-  if (values.seed !== undefined) {
+  if (!isBrainstorm && values.seed !== undefined) {
     const n = Number(values.seed);
     if (!Number.isInteger(n)) {
       console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
@@ -981,7 +981,7 @@ async function cmdBatch(args) {
 
   const items = resolvedItems.map((item, idx) => ({
     ...item,
-    seed: item.seed !== undefined ? item.seed : batchSeed,
+    ...(item.seed !== undefined ? { seed: item.seed } : batchSeed !== undefined ? { seed: batchSeed } : {}),
     out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, resolvedItems.length, item.slugLabel || item.prompt),
   }));
 

@@ -4273,6 +4273,26 @@ test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, l
     assert.equal(emptyPipedRes.status, 2);
     assert.match(emptyPipedRes.stderr, /batch input contains no prompts/);
 
+    // 9d. Brainstorm --seed is a pick seed, not a generation seed (accepts finite floats and does not stamp item.seed)
+    const bsFloatSeedOut = execFileSync(
+      process.execPath,
+      [bin, "batch", "--brainstorm", "product", "--set", "subject=mug", "-n", "2", "--seed", "1.5", "--dry-run", "--json"],
+      { encoding: "utf8", cwd: dir },
+    );
+    const bsFloatSeedJson = JSON.parse(bsFloatSeedOut);
+    assert.equal(bsFloatSeedJson.totalItems, 2);
+    assert.equal(bsFloatSeedJson.brainstorm.seed, 1.5);
+    assert.equal(bsFloatSeedJson.items.every((it) => it.seed === undefined), true);
+
+    const bsIntSeedOut = execFileSync(
+      process.execPath,
+      [bin, "batch", "--brainstorm", "product", "--set", "subject=mug", "-n", "2", "--seed", "7", "--dry-run", "--json"],
+      { encoding: "utf8", cwd: dir },
+    );
+    const bsIntSeedJson = JSON.parse(bsIntSeedOut);
+    assert.equal(bsIntSeedJson.brainstorm.seed, 7);
+    assert.equal(bsIntSeedJson.items.every((it) => it.seed === undefined), true);
+
     // 10. MCP batch_generate_images redacts secret-shaped tokens in recipe tags and look credits
     const { resetRecipesCache } = await import("../src/library.js");
     const extraDir = join(dir, "extra-recipes");
