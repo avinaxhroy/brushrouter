@@ -2,12 +2,14 @@ import type { Buffer } from "node:buffer";
 import {
   PROVIDERS,
   batchGenerate,
+  batchProbeAllowsModel,
   buildReplayRequest,
   computeStats,
   expandBrainstormBatch as expandBrainstormBatchFromRoot,
   generate,
   listProviderIds,
   planAttemptOrder,
+  probeAll,
   resolveBatchItem as resolveBatchItemFromRoot,
   findRecipes as findRecipesFromRoot,
   type ProviderId,
@@ -23,9 +25,11 @@ import {
   findRecipes,
   getRecipe,
   listCategories,
+  loadRecipes,
   publicRecipe,
   renderResult,
   resolveBatchItem,
+  validateCustomRecipes,
   type RecipeSource,
 } from "brushrouter/library";
 
@@ -50,6 +54,14 @@ const clearedProviders = loadConfig({ userConfig: { providers: undefined } }).pr
 // @ts-expect-error The provider map may no longer include the default entries.
 clearedProviders?.fal.enabled;
 const ids: ProviderId[] = await planAttemptOrder(config, { images: ["reference.png"] });
+const directProvider: ProviderId = "comfyui";
+const statuses = await probeAll(config, { skipDisabled: true });
+const localStatus = statuses.find(({ id }) => id === directProvider);
+const localVerification: "verified" | undefined = localStatus?.verification;
+const supportsMask: boolean | undefined = localStatus?.supportsMask;
+const eligible: boolean = batchProbeAllowsModel(localStatus, "fixture/pinned");
+const fileErrors: string[] | undefined = validateCustomRecipes(["recipes"]).files[0]?.errors;
+const customWarning: string | undefined = loadRecipes().customWarnings[0]?.message;
 const models: string[] = PROVIDERS.openrouter.defaultModels;
 const generated = await generate({
   prompt: "A snowy owl",

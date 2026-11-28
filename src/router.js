@@ -63,7 +63,7 @@ export async function probeAll(cfg, { skipDisabled = false } = {}) {
       let status;
       try {
         status = skipDisabled && pcfg.enabled === false
-          ? { available: false, auth: "disabled" }
+          ? { available: false, auth: "disabled", detail: "" }
           : await p.probe(pcfg);
       } catch (e) {
         status = { available: false, auth: "error", detail: e.message };

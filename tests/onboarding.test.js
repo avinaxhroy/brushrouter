@@ -140,6 +140,24 @@ test("doctor skips disabled providers and labels local checks as unverified", (t
   assert.equal(JSON.parse(none.stdout).ready, 0);
 });
 
+test("doctor verifies a reachable ComfyUI service only when enabled", (t) => {
+  const { run } = fixture(t);
+  const shim = `
+    globalThis.fetch = async (url) => {
+      if (String(url) !== "http://127.0.0.1:8188/system_stats") throw Error("unexpected URL");
+      console.error("probed ComfyUI");
+      return new Response("{}");
+    };
+  `;
+  const disabled = run(["doctor", "--json"], { shim });
+  assert.equal(disabled.status, 1, disabled.stderr);
+  assert.doesNotMatch(disabled.stderr, /probed ComfyUI/);
+  const enabled = run(["doctor", "--json"], { shim, extraEnv: { BRUSHROUTER_ENABLE: "comfyui" } });
+  assert.equal(enabled.status, 0, enabled.stderr);
+  assert.match(enabled.stderr, /probed ComfyUI/);
+  assert.equal(JSON.parse(enabled.stdout).providers.find(({ id }) => id === "comfyui").verification, "verified");
+});
+
 test("doctor --fix plans and applies only local user-config changes", (t) => {
   const { run, configDir, config } = fixture(t);
   const diagnose = (...args) => {
@@ -224,6 +242,20 @@ test("batch still tries pinned OpenRouter models when the model catalogue is emp
   assert.equal(results[0].provider, "openrouter");
   const failedItem = readFileSync(manifest, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find(({ ok }) => !ok);
   assert.deepEqual(failedItem.attempts, []);
+
+  const image = join(cwd, "reference.png");
+  writeFileSync(image, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jA5cAAAAASUVORK5CYII=", "base64"));
+  writeFileSync(items, JSON.stringify([
+    { prompt: "Pinned with mask", model: "fixture/pinned", images: [image], mask: image },
+    { prompt: "Unpinned" },
+  ]));
+  const masked = run(["batch", items, "--dry-run", "--json"], {
+    shim, extraEnv: { ...extraEnv, BRUSHROUTER_PRIORITY: "openrouter" },
+  });
+  assert.equal(masked.status, 0, masked.stderr);
+  const preview = JSON.parse(masked.stdout);
+  assert.equal(preview.items[0].code, "UNSUPPORTED");
+  assert.deepEqual(preview.readyProviders, []);
 });
 
 test("models JSON redacts a credential echoed as a gateway model ID", (t) => {
