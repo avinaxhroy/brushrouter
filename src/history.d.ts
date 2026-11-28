@@ -1,4 +1,4 @@
-import type { HistoryConfig, PricingConfig, ProviderId } from "./config.js";
+import type { HistoryConfig, PricingConfig } from "./config.js";
 
 export const HISTORY_SCHEMA_VERSION: 1;
 export const SUBSCRIPTION_PROVIDERS: Set<string>;
@@ -42,7 +42,7 @@ export interface HistoryMetadata {
 }
 
 export interface HistoryAttempt {
-  provider: ProviderId | null;
+  provider: string | null;
   outcome: string;
   model?: string | null;
   reason?: string;
@@ -57,8 +57,8 @@ export interface HistoryRecord extends Required<HistoryMetadata>, CostEstimate {
   source: string;
   ok: boolean;
   prompt: string;
-  provider: ProviderId | null;
-  requestedProvider: ProviderId | null;
+  provider: string | null;
+  requestedProvider: string | null;
   model: string | null;
   requestedModel: string | null;
   size: string | null;
@@ -137,7 +137,7 @@ export interface ReplayOverrides {
   seed?: number | string | null;
   noImages?: boolean;
   images?: readonly string[];
-  provider?: ProviderId | null;
+  provider?: string | null;
   model?: string | null;
   size?: string;
   quality?: string;
@@ -150,7 +150,7 @@ export interface ReplayRequest {
   prompt: string;
   seed: number | undefined;
   images: readonly string[];
-  provider: ProviderId | undefined;
+  provider: string | undefined;
   model: string | undefined;
   size: string | undefined;
   quality: string | undefined;

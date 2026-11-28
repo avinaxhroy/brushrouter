@@ -5,12 +5,13 @@ import {
   buildReplayRequest,
   computeStats,
   generate,
+  listProviderIds,
   planAttemptOrder,
   findRecipes as findRecipesFromRoot,
   type ProviderId,
 } from "brushrouter";
 import { getHistoryPath, loadConfig, providerConfig } from "brushrouter/config";
-import { HISTORY_SCHEMA_VERSION, getHistoryEntry, listHistory, tryRecordHistory } from "brushrouter/history";
+import { HISTORY_SCHEMA_VERSION, buildHistoryRecord, getHistoryEntry, listHistory, tryRecordHistory } from "brushrouter/history";
 import { OPAQUE_BYTES, redact, redactValue, registerSecret, safeError } from "brushrouter/redact";
 import {
   TokenIndex,
@@ -85,8 +86,19 @@ if (firstEntry && recorded) {
   const version: typeof HISTORY_SCHEMA_VERSION = firstEntry.v;
   const replay = buildReplayRequest(recorded, { noImages: true });
   const seed: number | undefined = replay.seed;
-  generate({ ...replay, history: { replayOf: replay.replayOf } }, config);
+  const provider = listProviderIds().find((id) => id === replay.provider);
+  if (provider) generate({ ...replay, provider, history: { replayOf: replay.replayOf } }, config);
 }
+const rejected = buildHistoryRecord({
+  ok: false,
+  prompt: "Snowy owl",
+  provider: "not-registered",
+  requestedProvider: "not-registered",
+});
+const rejectedProvider: string | null = rejected.provider;
+const replayProvider: string | undefined = buildReplayRequest(rejected).provider;
+// @ts-expect-error History can contain an unregistered provider that must be checked before routing.
+const registeredProvider: ProviderId | undefined = buildReplayRequest(rejected).provider;
 const latency: number | null = computeStats().summary.latencyMs.p95;
 // @ts-expect-error History selectors are strings, even for relative lookups.
 getHistoryEntry(1);
