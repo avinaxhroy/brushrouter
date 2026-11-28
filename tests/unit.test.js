@@ -4072,6 +4072,7 @@ test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, l
     const mcpItemsRes = await handleToolCall(
       "batch_generate_images",
       {
+        provider: "mock-br",
         outDir: join(dir, "mcp-items"),
         values: { ratio: "4:5" },
         items: [
@@ -4093,6 +4094,7 @@ test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, l
     const mcpBrainstormRes = await handleToolCall(
       "batch_generate_images",
       {
+        provider: "mock-br",
         outDir: join(dir, "mcp-brainstorm"),
         brainstorm: "editorial",
         recipe: "product-hero",
