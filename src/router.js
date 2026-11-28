@@ -10,6 +10,7 @@ import { loadConfig, providerConfig, getUserConfigPath } from "./config.js";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { saveImage, batchItemPath, detectImageMime, pngSize } from "./util/common.js";
+import { resolveBatchItem } from "./library.js";
 import { tryRecordHistory } from "./history.js";
 import { codexCliProvider } from "./providers/codex-cli.js";
 import { codexProvider, readAuth } from "./providers/codex.js";
@@ -357,10 +358,13 @@ export async function batchGenerate(
     : allowedProviders.reduce((sum, id) => sum + providerLimit.get(id), 0);
 
   const queue = items.map((it, idx) => {
-    const obj = typeof it === "string" ? { prompt: it } : { ...it };
+    let obj = typeof it === "string" ? { prompt: it } : { ...it };
+    if (!obj._composed && (obj.recipe || obj.look)) {
+      obj = resolveBatchItem(obj, {}, { index: idx, label: "batchGenerate items" });
+    }
     let outPath = obj.out;
     if (!outPath && outDir) {
-      outPath = batchItemPath(outDir, idx + 1, items.length, obj.prompt);
+      outPath = batchItemPath(outDir, idx + 1, items.length, obj.slugLabel || obj.prompt);
     }
     return {
       index: idx,
@@ -372,6 +376,9 @@ export async function batchGenerate(
       seed: obj.seed,
       model: obj.model,
       images: obj.images || [],
+      ...(obj.recipe ? { recipe: obj.recipe } : {}),
+      ...(obj.look ? { look: obj.look } : {}),
+      ...(obj.source ? { source: obj.source } : {}),
       out: outPath,
       attempts: [],
       failedProviders: new Set(),
@@ -624,6 +631,8 @@ export {
   publicRecipe,
   fill,
   composePrompt,
+  resolveBatchItem,
+  expandBrainstormBatch,
   ratioToSize,
   listCategories,
   loadRecipes,

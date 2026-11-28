@@ -4001,3 +4001,325 @@ test("MCP exposes native prompts/resources and direct recipe+look generate_image
   assert.equal(multiRes.status, 2);
   assert.match(multiRes.stderr, /cannot be combined/);
 });
+
+test("batchGenerate, MCP batch_generate_images, and CLI batch support recipes, looks, values, twist, and brainstorm", async () => {
+  const { handleToolCall, handleRequest } = await import("../src/mcp.js");
+  const { batchGenerate, PROVIDERS, loadRecipes, ratioToSize } = await import("../src/router.js");
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const look = loadRecipes().recipesByKind.look.find((r) => r.styleLock?.length && r.doNotClone?.length);
+  const dir = mkdtempSync(join(tmpdir(), "br-batch-recipes-"));
+
+  writeFileSync(
+    join(dir, "brushrouter.config.json"),
+    JSON.stringify({ priority: ["mock-br"], providers: { "mock-br": { enabled: true, concurrency: 4 } } }),
+  );
+  const seen = [];
+  PROVIDERS["mock-br"] = {
+    id: "mock-br",
+    supportsImages: true,
+    async probe() {
+      return { available: true };
+    },
+    async generate({ prompt, size }) {
+      seen.push({ prompt, size });
+      return { buffer: PNG, meta: { model: "mock-m" } };
+    },
+  };
+
+  try {
+    // 1. MCP tools/list advertises recipe/look/values/twist/includeNegatives and brainstorm fields
+    const listed = await handleRequest({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { cwd: dir });
+    const batchTool = listed.result.tools.find((t) => t.name === "batch_generate_images");
+    const itemProps = batchTool.inputSchema.properties.items.items.properties;
+    for (const k of ["recipe", "look", "values", "twist", "includeNegatives"]) {
+      assert.ok(itemProps[k], `batch item schema missing "${k}"`);
+      assert.ok(batchTool.inputSchema.properties[k], `batch top-level schema missing "${k}"`);
+    }
+    for (const k of ["brainstorm", "count", "kind", "category", "shape", "seed"]) {
+      assert.ok(batchTool.inputSchema.properties[k], `batch schema missing "${k}"`);
+    }
+    assert.ok(!batchTool.inputSchema.properties.items.items.required, "item prompt should be optional when recipe/look is supplied");
+
+    // 2. Programmatic batchGenerate resolves per-item recipe + look directly
+    const directRes = await batchGenerate(
+      {
+        items: [
+          { recipe: "logo-mark", look: look.id, values: { text: "APEX", ratio: "16:9" }, twist: "brushed steel" },
+        ],
+        outDir: join(dir, "direct"),
+        cwd: dir,
+      },
+      { priority: ["mock-br"], providers: { "mock-br": { enabled: true, concurrency: 2 } } },
+    );
+    assert.equal(directRes.completed, 1);
+    assert.equal(directRes.results[0].item.recipe, "logo-mark");
+    assert.equal(directRes.results[0].item.look, look.id);
+    assert.equal(directRes.results[0].item.source?.license, "MIT");
+    assert.match(directRes.results[0].savedPath, /01-logo-mark-/);
+    assert.equal(seen[0].size, ratioToSize("16:9"));
+    assert.match(seen[0].prompt, /APEX/);
+    assert.match(seen[0].prompt, /brushed steel/);
+
+    // 3. MCP batch_generate_images with per-item recipe/look/values/twist + batch defaults
+    seen.length = 0;
+    const mcpItemsRes = await handleToolCall(
+      "batch_generate_images",
+      {
+        outDir: join(dir, "mcp-items"),
+        values: { ratio: "4:5" },
+        items: [
+          { recipe: "logo-mark", values: { text: "KILO" }, twist: "copper ink" },
+          { recipe: "product-hero", look: look.id, values: { subject: "ceramic kettle" } },
+        ],
+      },
+      { cwd: dir },
+    );
+    assert.equal(mcpItemsRes.isError, false, mcpItemsRes.content[0].text);
+    assert.equal(seen.length, 2);
+    assert.ok(seen.every((s) => s.size === ratioToSize("4:5")));
+    assert.match(mcpItemsRes.content[0].text, /\[logo-mark\]/);
+    assert.match(mcpItemsRes.content[0].text, new RegExp(`\\[product-hero \\+ ${look.id}\\]`));
+    assert.match(mcpItemsRes.content[0].text, /Attribution:/);
+
+    // 4. MCP batch_generate_images with brainstorm fan-out (sync)
+    seen.length = 0;
+    const mcpBrainstormRes = await handleToolCall(
+      "batch_generate_images",
+      {
+        outDir: join(dir, "mcp-brainstorm"),
+        brainstorm: "editorial",
+        recipe: "product-hero",
+        count: 3,
+        seed: 2,
+        values: { subject: "matte espresso kettle" },
+        twist: "soft morning sun",
+      },
+      { cwd: dir },
+    );
+    assert.equal(mcpBrainstormRes.isError, false, mcpBrainstormRes.content[0].text);
+    assert.equal(seen.length, 3);
+    assert.ok(seen.every((s) => /matte espresso kettle/.test(s.prompt) && /soft morning sun/.test(s.prompt)));
+    assert.match(mcpBrainstormRes.content[0].text, /Attribution:/);
+
+    // 5. MCP fail-fast validation before starting async jobs
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { items: [{ recipe: "logo-mark" }], async: true }, { cwd: dir }),
+      /missing required slot.*\{text\}/,
+    );
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { brainstorm: "product", items: ["a fox"], async: true }, { cwd: dir }),
+      /cannot combine "brainstorm"/,
+    );
+    await assert.rejects(
+      () => handleToolCall("batch_generate_images", { brainstorm: "qqzzxx flibbertigibbet", values: { subject: "x" }, async: true }, { cwd: dir }),
+      /found no recipes matching/,
+    );
+
+    // 6. CLI batch with JSON + JSONL recipe/look files and batch-level defaults (--dry-run --json)
+    const bin = join(process.cwd(), "bin/brushrouter.js");
+    const jsonFile = join(dir, "batch.json");
+    writeFileSync(
+      jsonFile,
+      JSON.stringify([
+        { recipe: "logo-mark", values: { text: "EMBER" }, twist: "matte gold" },
+        { recipe: "product-hero", values: { subject: "glass carafe" } },
+      ]),
+    );
+    const jsonDry = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [bin, "batch", jsonFile, "--look", look.id, "--set", "ratio=16:9", "--dry-run", "--json"],
+        { encoding: "utf8", cwd: dir },
+      ),
+    );
+    assert.equal(jsonDry.dryRun, true);
+    assert.equal(jsonDry.totalItems, 2);
+    assert.equal(jsonDry.items[0].recipe, "logo-mark");
+    assert.equal(jsonDry.items[0].look, look.id);
+    assert.equal(jsonDry.items[0].size, ratioToSize("16:9"));
+    assert.match(jsonDry.items[0].prompt, /EMBER/);
+    assert.match(jsonDry.items[0].prompt, /matte gold/);
+    assert.equal(jsonDry.items[1].recipe, "product-hero");
+    assert.equal(jsonDry.items[1].source?.license, "MIT");
+
+    const jsonlFile = join(dir, "batch.jsonl");
+    writeFileSync(
+      jsonlFile,
+      [
+        JSON.stringify({ recipe: "logo-mark", values: { text: "WAVE" } }),
+        JSON.stringify({ prompt: "plain fallback prompt" }),
+      ].join("\n"),
+    );
+    const jsonlDry = JSON.parse(
+      execFileSync(process.execPath, [bin, "batch", jsonlFile, "--dry-run", "--json"], { encoding: "utf8", cwd: dir }),
+    );
+    assert.equal(jsonlDry.totalItems, 2);
+    assert.equal(jsonlDry.items[0].recipe, "logo-mark");
+    assert.equal(jsonlDry.items[1].prompt, "plain fallback prompt");
+
+    // JSONL rows with only `values` inherit CLI --recipe
+    const inheritedFile = join(dir, "inherited.jsonl");
+    writeFileSync(
+      inheritedFile,
+      [
+        JSON.stringify({ values: { text: "ALPHA" } }),
+        JSON.stringify({ values: { text: "BETA" }, twist: "neon outline" }),
+      ].join("\n"),
+    );
+    const inheritedDry = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [bin, "batch", inheritedFile, "--recipe", "logo-mark", "--dry-run", "--json"],
+        { encoding: "utf8", cwd: dir },
+      ),
+    );
+    assert.equal(inheritedDry.totalItems, 2);
+    assert.equal(inheritedDry.items[0].recipe, "logo-mark");
+    assert.match(inheritedDry.items[0].prompt, /ALPHA/);
+    assert.match(inheritedDry.items[1].prompt, /BETA/);
+    assert.match(inheritedDry.items[1].prompt, /neon outline/);
+
+    // 7. CLI batch --brainstorm fan-out (--dry-run --json) and --mode brainstorm
+    const bsDry = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [bin, "batch", "--brainstorm", "product", "--set", "subject=ceramic kettle", "-n", "4", "--dry-run", "--json"],
+        { encoding: "utf8", cwd: dir },
+      ),
+    );
+    assert.equal(bsDry.dryRun, true);
+    assert.equal(bsDry.totalItems, 4);
+    assert.equal(bsDry.brainstorm.query, "product");
+    assert.ok(bsDry.items.every((it) => /ceramic kettle/.test(it.prompt)));
+    assert.ok(bsDry.items.some((it) => it.look), "CLI brainstorm should include look-layered directions");
+
+    const bsModeDry = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [bin, "batch", "--mode", "brainstorm", "editorial", "--recipe", "product-hero", "--set", "subject=kettle", "-n", "3", "--dry-run", "--json"],
+        { encoding: "utf8", cwd: dir },
+      ),
+    );
+    assert.equal(bsModeDry.totalItems, 3);
+    assert.ok(bsModeDry.items.every((it) => it.recipe === "product-hero" && Boolean(it.look)));
+
+    // 8. CLI batch fail-fast errors
+    const missingSlotRes = spawnSync(
+      process.execPath,
+      [bin, "batch", "--recipe", "logo-mark", "--dry-run"],
+      { encoding: "utf8", cwd: dir },
+    );
+    assert.equal(missingSlotRes.status, 2);
+    assert.match(missingSlotRes.stderr, /missing required slot.*\{text\}/);
+
+    const zeroHitRes = spawnSync(
+      process.execPath,
+      [bin, "batch", "--brainstorm", "qqzzxx flibbertigibbet", "--set", "subject=x", "--dry-run"],
+      { encoding: "utf8", cwd: dir },
+    );
+    assert.equal(zeroHitRes.status, 2);
+    assert.match(zeroHitRes.stderr, /found no recipes matching/);
+
+    // 9. Recipe-only CLI batch does not block/EAGAIN on an open non-TTY stdin pipe
+    const { spawn } = await import("node:child_process");
+    const openStdinOut = await new Promise((resolvePromise, rejectPromise) => {
+      const child = spawn(
+        process.execPath,
+        [bin, "batch", "--recipe", "logo-mark", "--set", "text=PIPEOK", "--dry-run", "--json"],
+        { cwd: dir, stdio: ["pipe", "pipe", "pipe"] },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      const timer = setTimeout(() => {
+        child.kill();
+        rejectPromise(new Error(`recipe-only batch hung on open stdin pipe (stderr: ${stderr})`));
+      }, 4000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code !== 0) rejectPromise(new Error(`exited ${code}: ${stderr}`));
+        else resolvePromise(stdout);
+      });
+    });
+    const openStdinJson = JSON.parse(openStdinOut);
+    assert.equal(openStdinJson.totalItems, 1);
+    assert.match(openStdinJson.items[0].prompt, /PIPEOK/);
+
+    // 9b. Piped stdin prompts/JSONL still work when combined with a shared --recipe
+    const pipedRecipeOut = execFileSync(
+      process.execPath,
+      [bin, "batch", "--recipe", "logo-mark", "--dry-run", "--json"],
+      {
+        encoding: "utf8",
+        cwd: dir,
+        input: [
+          JSON.stringify({ values: { text: "PIPED1" } }),
+          JSON.stringify({ values: { text: "PIPED2" } }),
+        ].join("\n"),
+      },
+    );
+    const pipedRecipeJson = JSON.parse(pipedRecipeOut);
+    assert.equal(pipedRecipeJson.totalItems, 2);
+    assert.match(pipedRecipeJson.items[0].prompt, /PIPED1/);
+    assert.match(pipedRecipeJson.items[1].prompt, /PIPED2/);
+
+    // 9c. Explicitly piped empty batch `[]` is rejected rather than synthesizing a default item
+    const emptyPipedRes = spawnSync(
+      process.execPath,
+      [bin, "batch", "--recipe", "logo-mark", "--set", "text=SHOULDNOTRUN", "--dry-run"],
+      { encoding: "utf8", cwd: dir, input: "[]" },
+    );
+    assert.equal(emptyPipedRes.status, 2);
+    assert.match(emptyPipedRes.stderr, /batch input contains no prompts/);
+
+    // 10. MCP batch_generate_images redacts secret-shaped tokens in recipe tags and look credits
+    const { resetRecipesCache } = await import("../src/library.js");
+    const extraDir = join(dir, "extra-recipes");
+    mkdirSync(extraDir, { recursive: true });
+    const fakeSecret = "sk-proj-batchsecret9876543210abcdef";
+    writeFileSync(
+      join(extraDir, "custom-look.json"),
+      JSON.stringify({
+        id: `look-${fakeSecret}`,
+        title: "Custom Look",
+        kind: "look",
+        shape: "single",
+        styleLock: ["clean vector shading"],
+        text: "Illustrate {subject}.",
+        slots: { subject: { free: true } },
+        source: {
+          styleName: `SecretStyle ${fakeSecret}`,
+          repo: `https://example.com/${fakeSecret}`,
+          license: "MIT",
+        },
+      }),
+    );
+    const prevExtra = process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS;
+    process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = extraDir;
+    resetRecipesCache();
+    try {
+      const secRes = await handleToolCall(
+        "batch_generate_images",
+        {
+          items: [{ look: `look-${fakeSecret}`, values: { subject: "a lantern" } }],
+          provider: "mock-br",
+          outDir: join(dir, "mcp-sec-out"),
+          embedImages: false,
+        },
+        { cwd: dir },
+      );
+      const secText = secRes.content[0].text;
+      assert.doesNotMatch(secText, new RegExp(fakeSecret), "secret token in recipe tag / attribution must be redacted");
+      assert.match(secText, /\[look-sk-\*\*\*\]/);
+      assert.match(secText, /Attribution: SecretStyle sk-\*\*\* \(https:\/\/example\.com\/sk-\*\*\*, MIT\)/);
+    } finally {
+      if (prevExtra === undefined) delete process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS;
+      else process.env.BRUSHROUTER_EXTRA_RECIPES_DIRS = prevExtra;
+      resetRecipesCache();
+    }
+  } finally {
+    delete PROVIDERS["mock-br"];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

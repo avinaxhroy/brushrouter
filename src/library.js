@@ -1214,6 +1214,383 @@ export function composePrompt({
   };
 }
 
+function isPlainObject(v) {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+}
+
+/**
+ * Resolve a single batch item (string, prompt object, or recipe/look object)
+ * against optional batch-level defaults into a concrete generation item.
+ *
+ * Fails fast on unknown recipes/looks or unfilled free slots so a batch never
+ * sends literal `{slot}` placeholders to a provider.
+ */
+export function resolveBatchItem(item, defaults = {}, { index = null, label = "batch item" } = {}) {
+  const prefix = index == null ? label : `${label}[${index}]`;
+  const entry = typeof item === "string" ? { prompt: item } : item;
+  if (!isPlainObject(entry)) {
+    throw new Error(`${prefix} must be a prompt string or an object`);
+  }
+  if (entry.values !== undefined && entry.values !== null && !isPlainObject(entry.values)) {
+    throw new Error(`${prefix} "values" must be an object of slot key/value pairs`);
+  }
+  if (defaults.values !== undefined && defaults.values !== null && !isPlainObject(defaults.values)) {
+    throw new Error(`batch "values" must be an object of slot key/value pairs`);
+  }
+  if (entry.recipe !== undefined && entry.recipe !== null && typeof entry.recipe !== "string") {
+    throw new Error(`${prefix} "recipe" must be a string`);
+  }
+  if (entry.look !== undefined && entry.look !== null && typeof entry.look !== "string") {
+    throw new Error(`${prefix} "look" must be a string`);
+  }
+
+  const recipeId = (typeof entry.recipe === "string" && entry.recipe.trim())
+    || (typeof defaults.recipe === "string" && defaults.recipe.trim())
+    || null;
+  const lookId = (typeof entry.look === "string" && entry.look.trim())
+    || (typeof defaults.look === "string" && defaults.look.trim())
+    || null;
+  const images = Array.isArray(entry.images)
+    ? entry.images
+    : (Array.isArray(defaults.images) ? defaults.images : []);
+  const includeNegatives = entry.includeNegatives !== undefined
+    ? entry.includeNegatives !== false
+    : defaults.includeNegatives !== false;
+
+  const nonEmpty = (v) => (typeof v === "string" ? (v.trim() || undefined) : (v ?? undefined));
+
+  if (recipeId || lookId) {
+    const mergedValues = { ...(defaults.values || {}), ...(entry.values || {}) };
+    const extraTwist = [
+      defaults.twist,
+      entry.twist,
+      typeof entry.prompt === "string" ? entry.prompt : null,
+    ]
+      .filter((s) => s && String(s).trim())
+      .map((s) => String(s).trim())
+      .join(" ");
+
+    const composed = composePrompt({
+      recipeId,
+      lookId,
+      values: mergedValues,
+      input: images.length ? "image" : "text",
+      includeNegatives,
+      twist: extraTwist || null,
+    });
+    if (composed.missing.length) {
+      throw new Error(
+        `${prefix} recipe "${composed.recipeId}" is missing required slot(s): ${composed.missing.map((m) => `{${m}}`).join(", ")} — pass them in values:{...}`,
+      );
+    }
+    const slugLabel = [
+      composed.recipeId,
+      composed.lookId && composed.lookId !== composed.recipeId ? composed.lookId : null,
+    ]
+      .filter(Boolean)
+      .join("-");
+    return {
+      ...entry,
+      prompt: composed.text,
+      size: nonEmpty(entry.size) ?? nonEmpty(defaults.size) ?? composed.suggestedSize ?? undefined,
+      quality: nonEmpty(entry.quality) ?? nonEmpty(defaults.quality),
+      background: nonEmpty(entry.background) ?? nonEmpty(defaults.background),
+      model: nonEmpty(entry.model) ?? nonEmpty(defaults.model),
+      images,
+      recipe: composed.recipeId,
+      look: composed.lookId,
+      source: composed.source || null,
+      slugLabel,
+      _composed: true,
+    };
+  }
+
+  if (typeof entry.prompt !== "string" || entry.prompt.trim() === "") {
+    throw new Error(`${prefix} is missing a non-empty "prompt"`);
+  }
+  return {
+    ...entry,
+    prompt: entry.prompt,
+    size: nonEmpty(entry.size) ?? nonEmpty(defaults.size),
+    quality: nonEmpty(entry.quality) ?? nonEmpty(defaults.quality),
+    background: nonEmpty(entry.background) ?? nonEmpty(defaults.background),
+    model: nonEmpty(entry.model) ?? nonEmpty(defaults.model),
+    images,
+    _composed: true,
+  };
+}
+
+/**
+ * Fan out a brainstorm query directly into contrasting batch items.
+ *
+ * - With `recipe`: varies contrasting visual looks layered onto that recipe.
+ * - With `look`: varies contrasting job recipes styled with that look.
+ * - With neither: mixes contrasting jobs and looks (pairing looks onto the
+ *   top fillable matching job when their standalone slots aren't all provided).
+ */
+export function expandBrainstormBatch({
+  query = "",
+  count = 4,
+  kind = null,
+  category = null,
+  shape = null,
+  input = "text",
+  seed = 0,
+  recipe = null,
+  look = null,
+  values = {},
+  twist = null,
+  includeNegatives = true,
+  size = null,
+  quality = null,
+  background = null,
+  model = null,
+  images = [],
+} = {}) {
+  const n = Number(count);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > MAX_LIMIT) {
+    throw new Error(`brainstorm count must be an integer between 1 and ${MAX_LIMIT} (got ${JSON.stringify(count)})`);
+  }
+  if (values !== undefined && values !== null && !isPlainObject(values)) {
+    throw new Error('brainstorm "values" must be an object of slot key/value pairs');
+  }
+  const slotValues = values || {};
+  const recipeId = typeof recipe === "string" && recipe.trim() ? recipe.trim() : null;
+  const lookId = typeof look === "string" && look.trim() ? look.trim() : null;
+  if (recipeId && lookId) {
+    throw new Error('brainstorm cannot fix both "recipe" and "look" — omit one so brainstorm can vary it');
+  }
+  if (recipeId && kind === "job") {
+    throw new Error('brainstorm with "recipe" fans out across looks — omit "kind" or pass kind:"look"');
+  }
+  if (lookId && kind === "look") {
+    throw new Error('brainstorm with "look" fans out across recipes — omit "kind" or pass kind:"job"');
+  }
+  if (recipeId) getRecipe(recipeId);
+  if (lookId) getRecipe(lookId);
+
+  const effectiveKind = kind || (recipeId ? "look" : lookId ? "job" : null);
+  const effectiveImages = Array.isArray(images) ? images : [];
+  if (input === "image" && effectiveImages.length === 0) {
+    throw new Error('brainstorm with input:"image" requires at least one reference image in "images"');
+  }
+  const effectiveInput = input === "image" || effectiveImages.length > 0 ? "image" : "text";
+  const cleanQuery = typeof query === "string" ? query.trim() : "";
+  const cleanTwist = typeof twist === "string" && twist.trim() ? twist.trim() : null;
+
+  const firstPage = findRecipes({
+    query: cleanQuery,
+    mode: "brainstorm",
+    kind: effectiveKind,
+    category,
+    shape,
+    input: recipeId ? "text" : effectiveInput,
+    limit: MAX_LIMIT,
+    offset: 0,
+    seed,
+  });
+
+  if (!firstPage.matched) {
+    const near = firstPage.suggestions?.nearMatches?.map((m) => m.id).slice(0, 4) || [];
+    const cats = firstPage.suggestions?.categories?.map((c) => c.id).slice(0, 4) || [];
+    const hints = [];
+    if (near.length) hints.push(`near matches: ${near.join(", ")}`);
+    if (cats.length) hints.push(`categories: ${cats.join(", ")}`);
+    throw new Error(
+      `brainstorm found no recipes matching "${cleanQuery}"${hints.length ? ` (${hints.join("; ")})` : ""}`,
+    );
+  }
+
+  // Gather a bounded candidate pool across pages so skipping unfillable entries
+  // can still reach `n` contrasting items.
+  const candidates = [...firstPage.rows];
+  const maxPool = Math.min(firstPage.total, 50);
+  for (let offset = candidates.length; offset < maxPool && candidates.length < n * 4; offset += MAX_LIMIT) {
+    const page = findRecipes({
+      query: cleanQuery,
+      mode: "brainstorm",
+      kind: effectiveKind,
+      category,
+      shape,
+      input: recipeId ? "text" : effectiveInput,
+      limit: MAX_LIMIT,
+      offset,
+      seed,
+    });
+    if (!page.rows.length) break;
+    candidates.push(...page.rows);
+  }
+
+  const makeItem = (composed) => {
+    const slugLabel = [
+      composed.recipeId,
+      composed.lookId && composed.lookId !== composed.recipeId ? composed.lookId : null,
+    ]
+      .filter(Boolean)
+      .join("-");
+    return {
+      prompt: composed.text,
+      size: size || composed.suggestedSize || undefined,
+      quality: quality || undefined,
+      background: background || undefined,
+      model: model || undefined,
+      images: effectiveImages,
+      recipe: composed.recipeId,
+      look: composed.lookId,
+      source: composed.source || null,
+      slugLabel,
+      _composed: true,
+    };
+  };
+
+  const items = [];
+  const seen = new Set();
+  let bestMissing = null;
+  const trackMissing = (missing, id) => {
+    if (!missing?.length) return;
+    if (!bestMissing || missing.length < bestMissing.missing.length) {
+      bestMissing = { id, missing };
+    }
+  };
+
+  if (recipeId) {
+    // Validate base recipe slots once up front.
+    const baseCheck = fill(getRecipe(recipeId), { values: slotValues, input: effectiveInput, includeNegatives, twist: cleanTwist });
+    if (baseCheck.missing.length) {
+      throw new Error(
+        `brainstorm recipe "${recipeId}" is missing required slot(s): ${baseCheck.missing.map((m) => `{${m}}`).join(", ")} — pass them in values:{...}`,
+      );
+    }
+    for (const row of candidates) {
+      if (items.length >= n) break;
+      if (row.id === recipeId) continue;
+      const key = `${recipeId}+${row.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const composed = composePrompt({
+        recipeId,
+        lookId: row.id,
+        values: slotValues,
+        input: effectiveInput,
+        includeNegatives,
+        twist: cleanTwist,
+      });
+      items.push(makeItem(composed));
+    }
+  } else if (lookId) {
+    for (const row of candidates) {
+      if (items.length >= n) break;
+      if (row.id === lookId) continue;
+      const key = `${row.id}+${lookId}`;
+      if (seen.has(key)) continue;
+      const composed = composePrompt({
+        recipeId: row.id,
+        lookId,
+        values: slotValues,
+        input: effectiveInput,
+        includeNegatives,
+        twist: cleanTwist,
+      });
+      if (composed.missing.length) {
+        trackMissing(composed.missing, row.id);
+        continue;
+      }
+      seen.add(key);
+      items.push(makeItem(composed));
+    }
+  } else {
+    let anchorJob = candidates.find(
+      (r) => r.kind === "job" && fill(r, { values: slotValues, input: effectiveInput }).missing.length === 0,
+    ) || null;
+    if (!anchorJob && effectiveKind !== "look") {
+      const jobSearch = findRecipes({
+        query: cleanQuery,
+        mode: "brainstorm",
+        kind: "job",
+        category,
+        shape,
+        input: effectiveInput,
+        limit: MAX_LIMIT,
+        seed,
+      });
+      if (jobSearch.matched) {
+        anchorJob = jobSearch.rows.find(
+          (r) => fill(r, { values: slotValues, input: effectiveInput }).missing.length === 0,
+        ) || null;
+      }
+    }
+
+    for (const row of candidates) {
+      if (items.length >= n) break;
+      if (row.kind === "job") {
+        const composed = composePrompt({
+          recipeId: row.id,
+          values: slotValues,
+          input: effectiveInput,
+          includeNegatives,
+          twist: cleanTwist,
+        });
+        if (composed.missing.length) {
+          trackMissing(composed.missing, row.id);
+          continue;
+        }
+        const key = `job:${composed.recipeId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push(makeItem(composed));
+      } else {
+        const solo = composePrompt({
+          lookId: row.id,
+          values: slotValues,
+          input: effectiveInput,
+          includeNegatives,
+          twist: cleanTwist,
+        });
+        if (solo.missing.length === 0) {
+          const key = `look:${solo.recipeId}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push(makeItem(solo));
+        } else if (anchorJob && effectiveKind !== "look") {
+          const paired = composePrompt({
+            recipeId: anchorJob.id,
+            lookId: row.id,
+            values: slotValues,
+            input: effectiveInput,
+            includeNegatives,
+            twist: cleanTwist,
+          });
+          if (paired.missing.length === 0) {
+            const key = `pair:${paired.recipeId}+${paired.lookId}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            items.push(makeItem(paired));
+          }
+        } else {
+          trackMissing(solo.missing, row.id);
+        }
+      }
+    }
+  }
+
+  if (!items.length) {
+    const slotHint = bestMissing
+      ? ` — missing required slot(s) for "${bestMissing.id}": ${bestMissing.missing.map((m) => `{${m}}`).join(", ")}`
+      : "";
+    const lookHint = effectiveKind === "look" && !recipeId
+      ? ' (or pass recipe:"<job-id>" / --recipe <job-id> to layer these looks onto a job layout)'
+      : "";
+    throw new Error(`brainstorm${cleanQuery ? ` for "${cleanQuery}"` : ""} could not fill any matching recipe${slotHint}${lookHint}`);
+  }
+
+  return {
+    query: cleanQuery,
+    seed,
+    totalMatched: firstPage.total,
+    items,
+  };
+}
+
 /** A one-line gist, so an agent can judge an entry without the full text. */
 export function gistOf(recipe, chars = 200) {
   const s = String(recipe.goal || recipe.when || "");
