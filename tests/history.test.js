@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -719,11 +719,13 @@ test("review fixes: terminal sanitization, configured pricing on subscription, f
     assert.equal(replayReq.model, "google/gemini-3.1-flash-image");
 
     // 4. Relative reference image paths are resolved against cwd when recorded
+    const projCwd = join(dir, "proj");
+    const absImg = join(dir, "abs", "b.png");
     const imgRec = recordHistory(
-      { ok: true, prompt: "edit ref", provider: "fal", images: ["refs/a.png", "/abs/b.png"] },
-      { path: histPath, cwd: "/tmp/proj" },
+      { ok: true, prompt: "edit ref", provider: "fal", images: ["refs/a.png", absImg] },
+      { path: histPath, cwd: projCwd },
     );
-    assert.deepEqual(imgRec.images, ["/tmp/proj/refs/a.png", "/abs/b.png"]);
+    assert.deepEqual(imgRec.images, [resolve(projCwd, "refs/a.png"), absImg]);
 
     // 5. Provider-filtered stats do not count another provider's spend/results
     const codexStats = computeStats({ provider: "codex" }, { path: histPath });
