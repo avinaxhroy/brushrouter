@@ -2,12 +2,15 @@ import type { Buffer } from "node:buffer";
 import {
   PROVIDERS,
   batchGenerate,
+  buildReplayRequest,
+  computeStats,
   generate,
   planAttemptOrder,
   findRecipes as findRecipesFromRoot,
   type ProviderId,
 } from "brushrouter";
-import { loadConfig, providerConfig } from "brushrouter/config";
+import { getHistoryPath, loadConfig, providerConfig } from "brushrouter/config";
+import { HISTORY_SCHEMA_VERSION, getHistoryEntry, listHistory, tryRecordHistory } from "brushrouter/history";
 import { OPAQUE_BYTES, redact, redactValue, registerSecret, safeError } from "brushrouter/redact";
 import {
   TokenIndex,
@@ -25,6 +28,8 @@ const config = loadConfig({
   overrides: {
     priority: ["custom-http", "codex-cli"],
     providers: { "custom-http": { url: "https://example.com/images", headers: { Accept: "image/png" } } },
+    history: { enabled: false },
+    pricing: { "custom-http": 0.02 },
   },
 });
 const url: string | undefined = providerConfig(config, "custom-http").url;
@@ -42,15 +47,19 @@ const ids: ProviderId[] = await planAttemptOrder(config, { images: ["reference.p
 const models: string[] = PROVIDERS.openrouter.defaultModels;
 const generated = await generate({
   prompt: "A snowy owl",
+  seed: 42,
+  history: { path: getHistoryPath(), source: "api" },
   onProgress(message, percent) {
     const status: string = `${message}: ${percent.toFixed(0)}%`;
   },
 }, config);
 const bytes: Buffer = generated.buffer;
 const imagesUsed: boolean = generated.meta.imagesUsed;
+const duration: number = generated.durationMs;
+const historyId: string | undefined = generated.historyId;
 
 const batch = await batchGenerate({
-  items: ["A snowy owl", { id: "second", prompt: "A dragon", out: "dragon.png" }],
+  items: ["A snowy owl", { id: "second", prompt: "A dragon", out: "dragon.png", seed: 42 }],
   retainBuffers: false,
   onItemFail(result) {
     const error: string = result.error;
@@ -60,6 +69,7 @@ for (const result of batch.results) {
   if (result.ok) {
     const bytes: Buffer | null = result.buffer;
     const path: string | null = result.savedPath;
+    const bytesWritten: number = result.bytes;
   } else {
     const code: string | undefined = result.code;
     // @ts-expect-error Failed items do not carry image bytes.
@@ -67,6 +77,19 @@ for (const result of batch.results) {
   }
 }
 const emptyTotal: number = (await batchGenerate({ items: [] }, config)).total;
+
+const entries = listHistory({ limit: 0 }, { path: getHistoryPath() }).entries;
+const firstEntry = entries.at(0);
+const recorded = tryRecordHistory({ prompt: "Snowy owl", ok: true, seed: "42" }, { cfg: config });
+if (firstEntry && recorded) {
+  const version: typeof HISTORY_SCHEMA_VERSION = firstEntry.v;
+  const replay = buildReplayRequest(recorded, { noImages: true });
+  const seed: number | undefined = replay.seed;
+  generate({ ...replay, history: { replayOf: replay.replayOf } }, config);
+}
+const latency: number | null = computeStats().summary.latencyMs.p95;
+// @ts-expect-error History selectors are strings, even for relative lookups.
+getHistoryEntry(1);
 
 const literal: "example" = registerSecret("example");
 const text: string = redact(42);

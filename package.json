@@ -26,7 +26,10 @@
       "types": "./src/library.d.ts",
       "default": "./src/library.js"
     },
-    "./history": "./src/history.js"
+    "./history": {
+      "types": "./src/history.d.ts",
+      "default": "./src/history.js"
+    }
   },
   "scripts": {
     "test": "node --test",

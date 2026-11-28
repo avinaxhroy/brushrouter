@@ -41,6 +41,11 @@ jobs:
       - name: Verify vendored styles hash
         run: npm run styles:check
 
+      - name: Check TypeScript package exports
+        run: |
+          npm ci
+          npm run test:types
+
   package:
     name: package smoke test
     runs-on: ubuntu-latest

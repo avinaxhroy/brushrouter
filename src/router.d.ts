@@ -1,5 +1,6 @@
 import type { Buffer } from "node:buffer";
 import type { Config, ProviderConfigs, ProviderId } from "./config.js";
+import type { HistoryMetadata, UsageInput } from "./history.js";
 
 export type { ProviderId } from "./config.js";
 
@@ -46,6 +47,7 @@ export interface ImageOptions {
   size?: string;
   quality?: string;
   background?: string;
+  seed?: number;
   model?: string;
   images?: readonly string[];
   out?: string;
@@ -56,7 +58,9 @@ export interface ProviderGenerateOptions extends ImageOptions {
   onProgress?: (message: string, percent: number) => void;
 }
 
-export interface GenerateOptions extends ProviderGenerateOptions, RoutingOptions {}
+export interface GenerateOptions extends ProviderGenerateOptions, RoutingOptions {
+  history?: boolean | (HistoryMetadata & { path?: string });
+}
 
 export interface ProviderMeta {
   provider?: ProviderId;
@@ -69,6 +73,10 @@ export interface ProviderMeta {
   billing?: "subscription" | "web-session";
   cli?: "agy" | "gemini";
   route?: ProviderId;
+  seed?: number;
+  mime?: string;
+  usage?: UsageInput;
+  costUsd?: number;
 }
 
 export interface ProviderResult {
@@ -80,7 +88,7 @@ export interface GenerationMeta extends ProviderMeta {
   imagesUsed: boolean;
 }
 
-export type GenerationAttempt = { provider: ProviderId } & (
+export type GenerationAttempt = { provider: ProviderId; durationMs: number } & (
   | { outcome: "ok"; model?: string | null }
   | { outcome: "skipped"; reason?: string }
   | { outcome: "failed"; reason?: string; code?: string }
@@ -90,6 +98,8 @@ export interface GenerationResult extends ProviderResult {
   provider: ProviderId;
   meta: GenerationMeta;
   attempts: GenerationAttempt[];
+  durationMs: number;
+  historyId?: string;
 }
 
 export interface BatchImageOptions extends ImageOptions {
@@ -102,6 +112,7 @@ export interface BatchItem extends BatchImageOptions {
   images: readonly string[];
   attempts: GenerationAttempt[];
   failedProviders: Set<ProviderId>;
+  startedAt: number | null;
 }
 
 interface BatchItemResultBase {
@@ -114,6 +125,10 @@ export interface BatchItemSuccess extends BatchItemResultBase {
   ok: true;
   buffer: Buffer | null;
   savedPath: string | null;
+  bytes: number;
+  mime: string | null;
+  actualSize: string | null;
+  durationMs: number;
   provider: ProviderId;
   meta: GenerationMeta;
 }
@@ -122,6 +137,7 @@ export interface BatchItemFailure extends BatchItemResultBase {
   ok: false;
   error: string;
   code?: string;
+  durationMs?: number;
 }
 
 export interface BatchOptions extends RoutingOptions {
@@ -180,3 +196,20 @@ export {
   MODES,
   STRICT_SLOTS,
 } from "./library.js";
+
+export {
+  recordHistory,
+  tryRecordHistory,
+  readHistory,
+  listHistory,
+  getHistoryEntry,
+  buildReplayRequest,
+  pruneHistory,
+  clearHistory,
+  computeStats,
+  estimateCost,
+  parseSince,
+  renderHistoryList,
+  renderHistoryDetail,
+  renderStats,
+} from "./history.js";

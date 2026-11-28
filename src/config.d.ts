@@ -55,10 +55,19 @@ export interface ProviderConfigs {
 export type ProviderId = keyof ProviderConfigs;
 export type ProviderSettings = Partial<ProviderConfigs> & Record<string, ProviderConfig | undefined>;
 
+export interface HistoryConfig {
+  enabled?: boolean;
+  maxEntries?: number;
+}
+
+export type PricingConfig = Record<string, number>;
+
 export interface ConfigOverrides {
   priority?: string[];
   instructions?: string;
   providers?: ProviderSettings;
+  history?: HistoryConfig;
+  pricing?: PricingConfig;
   [key: string]: unknown;
 }
 
@@ -69,6 +78,8 @@ export interface Config extends ConfigOverrides {
 export interface LoadedConfig extends Config {
   instructions: string;
   providers: ProviderConfigs & Record<string, ProviderConfig | undefined>;
+  history: HistoryConfig;
+  pricing: PricingConfig;
 }
 
 export interface LoadConfigOptions {
@@ -90,6 +101,8 @@ type PresentValue<Input, Key extends PropertyKey> = Input extends unknown
 type ResolvedConfig<Overrides> = ConfigOverrides & {
   priority: string[] | UndefinedOverride<Overrides, "priority">;
   instructions: string | UndefinedOverride<Overrides, "instructions">;
+  history: HistoryConfig | UndefinedOverride<Overrides, "history">;
+  pricing: PricingConfig | UndefinedOverride<Overrides, "pricing">;
   providers: ({
     [Id in ProviderId]: ProviderConfigs[Id]
       | UndefinedOverride<PresentValue<Overrides, "providers">, Id>
@@ -100,6 +113,7 @@ type ResolvedConfig<Overrides> = ConfigOverrides & {
 export function getConfigDir(): string;
 export function getUserConfigPath(): string;
 export function getKeysPath(): string;
+export function getHistoryPath(): string;
 
 export const CONFIG_DIR: string;
 export const USER_CONFIG_PATH: string;
