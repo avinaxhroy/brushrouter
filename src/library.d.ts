@@ -222,6 +222,67 @@ export interface ComposedPrompt extends FilledPrompt {
   source: RecipeSource | null;
 }
 
+export interface BatchCompositionOptions {
+  recipe?: string | null;
+  look?: string | null;
+  values?: Record<string, unknown> | null;
+  twist?: string | null;
+  includeNegatives?: boolean;
+}
+
+export interface BatchItemOptions extends BatchCompositionOptions {
+  prompt?: string;
+  id?: string;
+  size?: string | undefined;
+  quality?: string | undefined;
+  background?: string | undefined;
+  model?: string | undefined;
+  images?: readonly string[];
+  seed?: number;
+  out?: string;
+  source?: RecipeSource | null;
+  slugLabel?: string;
+  _composed?: boolean;
+}
+
+export type BatchItemDefaults = BatchCompositionOptions & {
+  [Key in "size" | "quality" | "background" | "model"]?: string | null | undefined;
+} & Pick<BatchItemOptions, "images">;
+
+export interface ResolvedBatchItem extends BatchItemOptions {
+  prompt: string;
+  size: string | undefined;
+  quality: string | undefined;
+  background: string | undefined;
+  model: string | undefined;
+  images: readonly string[];
+  _composed: true;
+}
+
+export interface ComposedBatchItem extends ResolvedBatchItem {
+  recipe: string;
+  look: string | null;
+  source: RecipeSource | null;
+  slugLabel: string;
+}
+
+export interface BrainstormBatchOptions extends BatchItemDefaults {
+  query?: string;
+  count?: number | `${number}`;
+  kind?: RecipeKind | null;
+  category?: string | null;
+  shape?: string | null;
+  input?: RecipeInput;
+  seed?: number | string;
+}
+
+export interface BrainstormBatchResult {
+  query: string;
+  seed: number | string;
+  totalMatched: number;
+  items: [ComposedBatchItem, ...ComposedBatchItem[]];
+}
+
 export interface PublicRecipeOptions extends FillOptions {
   full?: boolean;
   lookId?: string | null;
@@ -267,6 +328,14 @@ export function getRecipe(id: string): IndexedRecipe;
 export function findRecipes(options?: FindRecipesOptions): FindRecipesResult;
 export function fill(recipe: Pick<Recipe, "text" | "slots" | "image" | "styleLock" | "doNotClone" | "negatives"> & { _defaultValues?: Record<string, string> }, options?: FillOptions): FilledPrompt;
 export function composePrompt(options: ComposePromptOptions): ComposedPrompt;
+/** @throws {Error} If the item cannot be resolved to a non-empty prompt. */
+export function resolveBatchItem(
+  item: string | (Omit<BatchItemOptions, keyof BatchItemDefaults> & BatchItemDefaults),
+  defaults?: BatchItemDefaults,
+  options?: { index?: number | null; label?: string },
+): ResolvedBatchItem;
+/** @throws {Error} If the options are invalid or no matching item can be composed. */
+export function expandBrainstormBatch(options?: BrainstormBatchOptions): BrainstormBatchResult;
 export function gistOf(recipe: Pick<Partial<Recipe>, "goal" | "when">, chars?: number): string;
 export function publicRecipe(recipe: Recipe, options?: PublicRecipeOptions & { full?: false }): RecipePreview;
 export function publicRecipe(recipe: Recipe, options: PublicRecipeOptions & { full: true }): FullPublicRecipe;

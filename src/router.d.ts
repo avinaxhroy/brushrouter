@@ -1,6 +1,7 @@
 import type { Buffer } from "node:buffer";
 import type { Config, ProviderConfigs, ProviderId } from "./config.js";
 import type { HistoryMetadata, UsageInput } from "./history.js";
+import type { BatchItemOptions, RecipeSource } from "./library.js";
 
 export type { ProviderId } from "./config.js";
 
@@ -102,17 +103,25 @@ export interface GenerationResult extends ProviderResult {
   historyId?: string;
 }
 
-export interface BatchImageOptions extends ImageOptions {
-  id?: string;
+export interface BatchImageOptions extends BatchItemOptions {
+  prompt: string;
 }
 
-export interface BatchItem extends BatchImageOptions {
+export type BatchRecipeOptions = BatchItemOptions & { _composed?: false } & (
+  | { recipe: string }
+  | { look: string }
+);
+
+export interface BatchItem extends ImageOptions {
   id: string;
   index: number;
   images: readonly string[];
   attempts: GenerationAttempt[];
   failedProviders: Set<ProviderId>;
   startedAt: number | null;
+  recipe?: string;
+  look?: string;
+  source?: RecipeSource;
 }
 
 interface BatchItemResultBase {
@@ -141,7 +150,7 @@ export interface BatchItemFailure extends BatchItemResultBase {
 }
 
 export interface BatchOptions extends RoutingOptions {
-  items: readonly (string | BatchImageOptions)[];
+  items: readonly (string | BatchImageOptions | BatchRecipeOptions)[];
   concurrency?: number;
   cooldownMs?: number;
   outDir?: string;
@@ -181,6 +190,8 @@ export {
   publicRecipe,
   fill,
   composePrompt,
+  resolveBatchItem,
+  expandBrainstormBatch,
   ratioToSize,
   listCategories,
   loadRecipes,

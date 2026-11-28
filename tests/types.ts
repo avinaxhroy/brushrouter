@@ -4,9 +4,11 @@ import {
   batchGenerate,
   buildReplayRequest,
   computeStats,
+  expandBrainstormBatch as expandBrainstormBatchFromRoot,
   generate,
   listProviderIds,
   planAttemptOrder,
+  resolveBatchItem as resolveBatchItemFromRoot,
   findRecipes as findRecipesFromRoot,
   type ProviderId,
 } from "brushrouter";
@@ -16,12 +18,15 @@ import { OPAQUE_BYTES, redact, redactValue, registerSecret, safeError } from "br
 import {
   TokenIndex,
   composePrompt,
+  expandBrainstormBatch,
   fill,
   findRecipes,
   getRecipe,
   listCategories,
   publicRecipe,
   renderResult,
+  resolveBatchItem,
+  type RecipeSource,
 } from "brushrouter/library";
 
 const config = loadConfig({
@@ -59,14 +64,37 @@ const imagesUsed: boolean = generated.meta.imagesUsed;
 const duration: number = generated.durationMs;
 const historyId: string | undefined = generated.historyId;
 
+const resolved = resolveBatchItem(
+  { recipe: "logo-mark", values: { subject: "An owl" }, seed: 42 },
+  { twist: "Monochrome", images: ["reference.png"] },
+  { index: 0, label: "items" },
+);
+const composed: true = resolved._composed;
+const defaultedPrompt: string = resolveBatchItem({}, { recipe: "logo-mark", values: { subject: "An owl" } }).prompt;
+const literalPrompt: string = resolveBatchItem("A snowy owl", {}).prompt;
+const expanded = expandBrainstormBatch({ query: "product", values: { subject: "A teapot" }, count: "2", seed: "42" });
+const firstSlug: string = expanded.items[0].slugLabel;
+const firstLook: string | null = expanded.items[0].look;
+const firstSource: RecipeSource | null = expanded.items[0].source;
+const matchedCount: number = expanded.totalMatched;
+const sameResolve: typeof resolveBatchItem = resolveBatchItemFromRoot;
+const sameExpand: typeof expandBrainstormBatch = expandBrainstormBatchFromRoot;
+const defaultBrainstormQuery: string = expandBrainstormBatch().query;
+
 const batch = await batchGenerate({
-  items: ["A snowy owl", { id: "second", prompt: "A dragon", out: "dragon.png", seed: 42 }],
+  items: ["A snowy owl", { id: "second", prompt: "A dragon", out: "dragon.png", seed: 42 },
+    { recipe: "logo-mark", values: { subject: "An owl" }, includeNegatives: false },
+    { look: "editorial", twist: "Monochrome" }, resolved, ...expanded.items],
+  outDir: "batch",
   retainBuffers: false,
   onItemFail(result) {
     const error: string = result.error;
+    const look: string | undefined = result.item.look;
   },
 }, config);
 for (const result of batch.results) {
+  const recipeId: string | undefined = result.item.recipe;
+  const source: RecipeSource | undefined = result.item.source;
   if (result.ok) {
     const bytes: Buffer | null = result.buffer;
     const path: string | null = result.savedPath;
@@ -149,3 +177,11 @@ const number: number = redact(42);
 composePrompt({ values: {} });
 // @ts-expect-error Search modes are restricted to the runtime vocabulary.
 findRecipes({ mode: "all" });
+// @ts-expect-error Slot values are keyed by slot name, not an array.
+resolveBatchItem({ recipe: "logo-mark", values: ["An owl"] });
+// @ts-expect-error Brainstorm counts must be numeric.
+expandBrainstormBatch({ count: "many" });
+// @ts-expect-error A batch item needs a prompt, recipe, or look.
+batchGenerate({ items: [{ size: "1024x1024" }] }, config);
+// @ts-expect-error An already composed item must supply its own prompt.
+batchGenerate({ items: [{ recipe: "logo-mark", _composed: true }] }, config);
