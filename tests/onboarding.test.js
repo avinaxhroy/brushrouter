@@ -1,16 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, cpSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, cpSync, realpathSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const bin = fileURLToPath(new URL("../bin/brushrouter.js", import.meta.url));
 const recipeCheck = fileURLToPath(new URL("../scripts/check-recipes.mjs", import.meta.url));
 
 function fixture(t) {
-  const cwd = mkdtempSync(join(tmpdir(), "br-onboarding-"));
+  const cwd = mkdtempSync(join(realpathSync(tmpdir()), "br-onboarding-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const home = join(cwd, "home");
   const configDir = join(home, ".config", "brushrouter");
@@ -21,7 +21,7 @@ function fixture(t) {
     const argv = shim ? ["--input-type=module", "-e", `
       process.argv = [process.execPath, ${JSON.stringify(script)}, ...${JSON.stringify(args)}];
       ${shim}
-      await import(${JSON.stringify(script)});
+      await import(${JSON.stringify(pathToFileURL(script).href)});
     `] : [script, ...args];
     const result = spawnSync(process.execPath, argv, { cwd: workingDir, env: { ...env, ...extraEnv }, timeout: 10000, encoding: "utf8", input: "" });
     assert.ifError(result.error);
