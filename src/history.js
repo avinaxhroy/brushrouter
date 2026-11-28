@@ -979,12 +979,12 @@ export function renderHistoryDetail(entry) {
     lines.push(`  library:    ${[entry.recipe ? `recipe=${entry.recipe}` : null, entry.look ? `look=${entry.look}` : null].filter(Boolean).join(", ")}`);
   }
   if (entry.images?.length) {
-    lines.push(`  images:     ${entry.images.join(", ")} (used: ${entry.imagesUsed ? "yes" : "no"})`);
+    lines.push(`  images:     ${entry.images.map(sanitizeTerminalText).join(", ")} (used: ${entry.imagesUsed ? "yes" : "no"})`);
   }
-  if (entry.mask) lines.push(`  mask:       ${entry.mask}`);
+  if (entry.mask) lines.push(`  mask:       ${sanitizeTerminalText(entry.mask)}`);
   if (entry.out) {
     const kb = entry.bytes != null ? ` (${Math.round(entry.bytes / 1024)} KB${entry.mime ? `, ${entry.mime}` : ""})` : "";
-    lines.push(`  output:     ${entry.out}${kb}`);
+    lines.push(`  output:     ${sanitizeTerminalText(entry.out)}${kb}`);
   }
   if (entry.replayOf) lines.push(`  replay of:  ${entry.replayOf}`);
   if (entry.batchId) lines.push(`  batch:      ${entry.batchId}`);

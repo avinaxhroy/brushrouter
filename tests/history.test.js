@@ -570,6 +570,19 @@ test("CLI: history, replay --dry-run, stats, and --seed validation", async () =>
   }
 });
 
+test("history detail strips terminal control characters from recorded paths", () => {
+  const path = (name) => `fixtures/\x1b[32m${name}\x1b[0m.png`;
+  const detail = renderHistoryDetail({
+    id: "test",
+    ok: true,
+    images: [path("base")],
+    mask: path("mask"),
+    out: path("output"),
+  });
+  assert.doesNotMatch(detail, /\x1b/);
+  for (const name of ["base", "mask", "output"]) assert.ok(detail.includes(`fixtures/${name}.png`));
+});
+
 test("masked history replays the original mask across working directories", async (t) => {
   const dir = makeTempDir();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
