@@ -45,7 +45,7 @@ import { saveImage, detectImageMime, assertImageFile, batchItemPath, pngSize } f
 import { redact, redactValue, registerSecret } from "../src/util/redact.js";
 import { discoverKey, saveKey, describeKey } from "../src/util/keys.js";
 import { findCodexCli, findGoogleClis, isOnPath } from "../src/util/discover.js";
-import { findRecipes, renderResult, listCategories, publicRecipe, composePrompt, MODES, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
+import { findRecipes, renderResult, listCategories, publicRecipe, composePrompt, resolveBatchItem, expandBrainstormBatch, MODES, RECIPES_DIR, STYLES_FILE, recipeCounts } from "../src/library.js";
 import { getKnownAgentConfigs, detectInstalledAgents, getBrushrouterMcpEntry, installMcpToAgent } from "../src/util/mcp-install.js";
 import { detectRuleFiles, injectRuleToFile } from "../src/util/rules.js";
 // NOTE: ../src/mcp.js is imported dynamically in the `serve` case below. A static
@@ -190,6 +190,7 @@ function parse(argv) {
         recipe: { type: "string" },
         look: { type: "string" },
         twist: { type: "string" },
+        brainstorm: { type: "boolean", default: false },
         diverse: { type: "boolean", default: false },
         "no-negatives": { type: "boolean", default: false },
         set: { type: "string", multiple: true },
@@ -319,9 +320,15 @@ ${paint(C.bold, "OPTIONS")}
   -c, --category <id>      Recipes: restrict to one category
       --kind <k>           Recipes: job (a layout we wrote, ${LIB_COUNTS.job}) | look
                            (a vendored visual system, ${LIB_COUNTS.look}). Omit for both
-      --mode <m>           Recipes: categories | related (default) | one
-  -n, --limit <n>          Recipes: how many to return (default 4, max 10)
+      --mode <m>           Recipes: categories | related (default) | one | brainstorm
+  -n, --limit <n>          Recipes/brainstorm: how many to return (default 4, max 10)
       --prompt <text>      Prompt to generate (repeatable for multiple prompts in gen/batch)
+      --recipe <id>        gen/batch: generate directly from a recipe or look id
+      --look <id>          gen/batch/prompts: layer a visual look onto a recipe
+      --twist <text>       gen/batch/prompts: extra creative direction before STYLE LOCK
+      --no-negatives       gen/batch/prompts: omit DO NOT REPRODUCE and AVOID blocks
+      --brainstorm         batch: fan out a brainstorm query straight into contrasting items
+      --diverse            prompts: diversify results across categories and kinds
       --concurrency <n>    Batch: max concurrent requests across providers
       --input <kind>       Recipes: text (default) | image — use image if you
                            already have a reference photo
@@ -353,6 +360,8 @@ ${paint(C.bold, "EXAMPLES")}
   brushrouter gen "product shot" --provider fal --fallback
   brushrouter gen "logo" --provider openrouter --model x-ai/grok-imagine-image-2.0
   brushrouter gen "logo" -s 1024x1024 -q high --seed 42
+  brushrouter gen --recipe product-hero --look retro-pop-sticker-cutout --set subject="kettle"
+  brushrouter batch --brainstorm "product" --set subject="ceramic kettle" -n 4 -o ./out
   brushrouter history -n 10                # recent generations & outputs
   brushrouter replay last --provider fal   # replay last prompt+seed on fal
   brushrouter stats --since 7d             # provider latency, success rate & spend
@@ -662,20 +671,17 @@ async function cmdGenerate(args) {
   }
 }
 
-function loadBatchItems(filePath, cwd) {
-  let content = "";
-  if (filePath === "-" || !filePath) {
-    content = readFileSync(0, "utf8");
-  } else {
-    const abs = resolve(cwd, filePath);
-    if (!existsSync(abs)) {
-      const err = new Error(`batch input file not found: ${filePath}`);
-      err.code = "ENOENT";
-      throw err;
-    }
-    content = readFileSync(abs, "utf8");
-  }
+function isUsableBatchObject(item, allowInherited = false) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  if (allowInherited) return true;
+  return (
+    (typeof item.prompt === "string" && item.prompt.trim() !== "") ||
+    (typeof item.recipe === "string" && item.recipe.trim() !== "") ||
+    (typeof item.look === "string" && item.look.trim() !== "")
+  );
+}
 
+function parseBatchContent(content, { allowInherited = false } = {}) {
   const trimmed = content.trim();
   if (!trimmed) return [];
 
@@ -706,8 +712,8 @@ function loadBatchItems(filePath, cwd) {
         }
         return { prompt: item };
       }
-      if (item && typeof item === "object" && typeof item.prompt === "string" && item.prompt.trim()) return item;
-      const err = new Error(`batch item ${i} has no usable "prompt" (got ${JSON.stringify(item)?.slice(0, 80)})`);
+      if (isUsableBatchObject(item, allowInherited)) return item;
+      const err = new Error(`batch item ${i} has no usable "prompt" (or "recipe"/"look") (got ${JSON.stringify(item)?.slice(0, 80)})`);
       err.code = "BAD_ITEM";
       throw err;
     });
@@ -729,8 +735,8 @@ function loadBatchItems(filePath, cwd) {
         err.code = "BAD_JSON";
         throw err;
       }
-      if (!obj || typeof obj.prompt !== "string" || !obj.prompt.trim()) {
-        const err = new Error(`batch line ${i + 1} has no usable "prompt"`);
+      if (!isUsableBatchObject(obj, allowInherited)) {
+        const err = new Error(`batch line ${i + 1} has no usable "prompt" (or "recipe"/"look")`);
         err.code = "BAD_ITEM";
         throw err;
       }
@@ -740,6 +746,76 @@ function loadBatchItems(filePath, cwd) {
     items.push({ prompt: line });
   }
   return items;
+}
+
+function loadBatchItems(filePath, cwd, { allowInherited = false } = {}) {
+  let content = "";
+  if (filePath === "-" || !filePath) {
+    content = readFileSync(0, "utf8");
+  } else {
+    const abs = resolve(cwd, filePath);
+    if (!existsSync(abs)) {
+      const err = new Error(`batch input file not found: ${filePath}`);
+      err.code = "ENOENT";
+      throw err;
+    }
+    content = readFileSync(abs, "utf8");
+  }
+  return parseBatchContent(content, { allowInherited });
+}
+
+function readStdinIfAvailable(idleTimeoutMs = 50) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const chunks = [];
+    let gotData = false;
+    let settled = false;
+    const finish = (val, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onError);
+      if (err) rejectPromise(err);
+      else resolvePromise(val);
+    };
+    const onData = (chunk) => {
+      gotData = true;
+      clearTimeout(timer);
+      chunks.push(chunk);
+    };
+    const onEnd = () => finish(Buffer.concat(chunks).toString("utf8"));
+    const onError = (err) => {
+      if (!gotData && (err?.code === "EAGAIN" || err?.code === "EWOULDBLOCK")) {
+        finish("");
+      } else {
+        finish(null, err);
+      }
+    };
+    const timer = setTimeout(() => {
+      if (!gotData) {
+        process.stdin.pause();
+        process.stdin.unref?.();
+        finish("");
+      }
+    }, idleTimeoutMs);
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("error", onError);
+    process.stdin.resume();
+  });
+}
+
+function parseSlotPairs(pairs) {
+  const slotValues = {};
+  for (const pair of pairs || []) {
+    const eq = pair.indexOf("=");
+    if (eq < 1) {
+      throw new Error(`--set expects key=value, got "${redact(pair)}"`);
+    }
+    slotValues[pair.slice(0, eq).trim()] = pair.slice(eq + 1);
+  }
+  return slotValues;
 }
 
 async function cmdBatch(args) {
@@ -758,47 +834,143 @@ async function cmdBatch(args) {
     }
   }
 
-  let rawItems = [];
-  if (values.prompt && values.prompt.length > 0) {
-    rawItems = values.prompt.map((p) => ({ prompt: p }));
-  } else if (positionals.length > 1) {
-    // Multiple prompts provided as CLI arguments:
-    // brushrouter batch "a red fox in snow" "a blue jay in a pine tree"
-    rawItems = positionals.map((p) => ({ prompt: p }));
-  } else if (positionals.length === 1 && positionals[0] !== "-" && !existsSync(resolve(cwd, positionals[0]))) {
-    const arg = positionals[0];
-    if (arg.endsWith(".txt") || arg.endsWith(".json") || arg.endsWith(".jsonl")) {
-      console.error(bad(`error: batch input file not found: ${arg}`));
-      return exitAfterFlush(1);
+  let slotValues;
+  try {
+    slotValues = parseSlotPairs(values.set);
+  } catch (e) {
+    console.error(bad(`error: ${e.message}`));
+    return exitAfterFlush(2);
+  }
+
+  const isBrainstorm = Boolean(values.brainstorm || values.mode === "brainstorm");
+  let resolvedItems = [];
+  let brainstormMeta = null;
+
+  if (isBrainstorm) {
+    if (values.prompt && values.prompt.length > 0) {
+      console.error(bad("error: --brainstorm cannot be combined with --prompt"));
+      return exitAfterFlush(2);
     }
-    rawItems = [{ prompt: arg }];
-  } else {
-    const inputArg = positionals[0] || (process.stdin.isTTY ? null : "-");
-    if (!inputArg) {
-      console.error(bad("error: no prompts or batch file provided"));
-      console.error(dim('usage: brushrouter batch "prompt 1" "prompt 2" ... [-o ./out-dir]'));
-      console.error(dim("       brushrouter batch prompts.txt [-o ./out-dir]"));
-      console.error(dim("       cat prompts.txt | brushrouter batch [-o ./out-dir]"));
+    const count = values.limit !== undefined ? Number(values.limit) : 4;
+    if (!Number.isInteger(count) || count < 1 || count > 10) {
+      console.error(bad(`error: --limit expects an integer between 1 and 10, got "${values.limit}"`));
+      return exitAfterFlush(2);
+    }
+    const seed = values.seed !== undefined ? Number(values.seed) : 0;
+    if (!Number.isFinite(seed)) {
+      console.error(bad(`error: --seed expects a number, got "${values.seed}"`));
       return exitAfterFlush(2);
     }
     try {
-      rawItems = loadBatchItems(inputArg, cwd);
+      const expanded = expandBrainstormBatch({
+        query: positionals.join(" ").trim(),
+        count,
+        kind: values.kind || null,
+        category: values.category || null,
+        shape: values.shape || null,
+        input: values.input || ((values.images || []).length ? "image" : "text"),
+        seed,
+        recipe: values.recipe || null,
+        look: values.look || null,
+        values: slotValues,
+        twist: values.twist || null,
+        includeNegatives: !values["no-negatives"],
+        size: values.size || null,
+        quality: values.quality || null,
+        background: values.background || null,
+        model: values.model || null,
+        images: values.images || [],
+      });
+      resolvedItems = expanded.items;
+      brainstormMeta = { query: expanded.query, seed: expanded.seed, totalMatched: expanded.totalMatched };
     } catch (e) {
       console.error(bad(`error: ${redact(e.message)}`));
-      return exitAfterFlush(1);
+      return exitAfterFlush(2);
     }
-  }
+  } else {
+    let rawItems = [];
+    if (values.prompt && values.prompt.length > 0) {
+      rawItems = values.prompt.map((p) => ({ prompt: p }));
+    } else if (positionals.length > 1) {
+      // Multiple prompts provided as CLI arguments:
+      // brushrouter batch "a red fox in snow" "a blue jay in a pine tree"
+      rawItems = positionals.map((p) => ({ prompt: p }));
+    } else if (positionals.length === 1 && positionals[0] !== "-" && !existsSync(resolve(cwd, positionals[0]))) {
+      const arg = positionals[0];
+      if (arg.endsWith(".txt") || arg.endsWith(".json") || arg.endsWith(".jsonl")) {
+        console.error(bad(`error: batch input file not found: ${arg}`));
+        return exitAfterFlush(1);
+      }
+      rawItems = [{ prompt: arg }];
+    } else {
+      const allowInherited = Boolean(values.recipe || values.look);
+      const inputArg = positionals[0] || (process.stdin.isTTY ? null : "-");
+      if (!inputArg) {
+        if (allowInherited) {
+          rawItems = [{}];
+        } else {
+          console.error(bad("error: no prompts or batch file provided"));
+          console.error(dim('usage: brushrouter batch "prompt 1" "prompt 2" ... [-o ./out-dir]'));
+          console.error(dim("       brushrouter batch prompts.txt [-o ./out-dir]"));
+          console.error(dim('       brushrouter batch --brainstorm "product" --set subject="kettle" -n 4'));
+          console.error(dim("       cat prompts.txt | brushrouter batch [-o ./out-dir]"));
+          return exitAfterFlush(2);
+        }
+      } else if (!positionals[0] && inputArg === "-" && allowInherited) {
+        // When --recipe/--look is passed without a positional file or explicit `-`,
+        // consume piped stdin if data arrives, but fall back cleanly to a single
+        // recipe/look item only when no stdin content was provided.
+        try {
+          const piped = await readStdinIfAvailable();
+          rawItems = piped.trim()
+            ? parseBatchContent(piped, { allowInherited: true })
+            : [{}];
+        } catch (e) {
+          console.error(bad(`error: ${redact(e.message)}`));
+          return exitAfterFlush(1);
+        }
+      } else {
+        try {
+          rawItems = loadBatchItems(inputArg, cwd, { allowInherited });
+        } catch (e) {
+          console.error(bad(`error: ${redact(e.message)}`));
+          return exitAfterFlush(1);
+        }
+      }
+    }
 
-  if (!rawItems.length) {
-    console.error(bad("error: batch input contains no prompts"));
-    return exitAfterFlush(2);
+    if (!rawItems.length) {
+      console.error(bad("error: batch input contains no prompts"));
+      return exitAfterFlush(2);
+    }
+
+    const batchDefaults = {
+      recipe: values.recipe || null,
+      look: values.look || null,
+      values: Object.keys(slotValues).length ? slotValues : undefined,
+      twist: values.twist || null,
+      includeNegatives: !values["no-negatives"],
+      size: values.size || undefined,
+      quality: values.quality || undefined,
+      background: values.background || undefined,
+      model: values.model || undefined,
+      images: values.images || [],
+    };
+    try {
+      resolvedItems = rawItems.map((item, idx) =>
+        resolveBatchItem(item, batchDefaults, { index: idx, label: "batch item" }),
+      );
+    } catch (e) {
+      console.error(bad(`error: ${redact(e.message)}`));
+      return exitAfterFlush(2);
+    }
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = resolve(cwd, values.out || `brushrouter-batch-${timestamp}`);
 
   let batchSeed;
-  if (values.seed !== undefined) {
+  if (!isBrainstorm && values.seed !== undefined) {
     const n = Number(values.seed);
     if (!Number.isInteger(n)) {
       console.error(bad(`error: --seed expects an integer, got "${values.seed}"`));
@@ -807,15 +979,10 @@ async function cmdBatch(args) {
     batchSeed = n;
   }
 
-  const items = rawItems.map((item, idx) => ({
+  const items = resolvedItems.map((item, idx) => ({
     ...item,
-    size: item.size || values.size,
-    quality: item.quality || values.quality,
-    background: item.background || values.background,
-    seed: item.seed !== undefined ? item.seed : batchSeed,
-    model: item.model || values.model,
-    images: item.images || values.images || [],
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.prompt),
+    ...(item.seed !== undefined ? { seed: item.seed } : batchSeed !== undefined ? { seed: batchSeed } : {}),
+    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, resolvedItems.length, item.slugLabel || item.prompt),
   }));
 
   const onProgress = values.verbose
@@ -851,8 +1018,17 @@ async function cmdBatch(args) {
             totalItems: items.length,
             outDir,
             concurrency,
+            ...(brainstormMeta ? { brainstorm: brainstormMeta } : {}),
             readyProviders: readyProbes.map((p) => ({ id: p.id, concurrency: perProviderLimit(p.id) })),
-            items: items.map((it, idx) => ({ index: idx + 1, prompt: it.prompt, out: it.out })),
+            items: items.map((it, idx) => ({
+              index: idx + 1,
+              prompt: it.prompt,
+              out: it.out,
+              ...(it.size ? { size: it.size } : {}),
+              ...(it.recipe ? { recipe: it.recipe } : {}),
+              ...(it.look ? { look: it.look } : {}),
+              ...(it.source ? { source: it.source } : {}),
+            })),
           }),
           null,
           2,
@@ -870,7 +1046,10 @@ async function cmdBatch(args) {
     }
     console.log(dim("\n  items to process:"));
     for (let i = 0; i < Math.min(items.length, 10); i++) {
-      console.log(`    ${String(i + 1).padStart(2, " ")}. "${items[i].prompt.slice(0, 50)}" -> ${items[i].out}`);
+      const it = items[i];
+      const tagParts = [it.recipe, it.look && it.look !== it.recipe ? it.look : null].filter(Boolean);
+      const tag = tagParts.length ? `[${tagParts.join(" + ")}] ` : "";
+      console.log(`    ${String(i + 1).padStart(2, " ")}. ${tag}"${it.prompt.slice(0, 50)}" -> ${it.out}`);
     }
     if (items.length > 10) console.log(dim(`    ... and ${items.length - 10} more`));
     console.log("");
@@ -939,6 +1118,9 @@ async function cmdBatch(args) {
             batchId,
             index: res.index + 1,
             prompt: res.item.prompt,
+            ...(res.item.recipe ? { recipe: res.item.recipe } : {}),
+            ...(res.item.look ? { look: res.item.look } : {}),
+            ...(res.item.source ? { source: res.item.source } : {}),
             savedPath: res.savedPath,
             provider: res.provider,
             model: res.meta?.model || null,
@@ -951,7 +1133,9 @@ async function cmdBatch(args) {
           };
           appendFileSync(manifestPath, JSON.stringify(redactValue(record)) + "\n");
           if (!values.json) {
-            console.log(ok(`✓ [${res.index + 1}/${items.length}] ${res.provider} -> ${res.savedPath}`));
+            const tagParts = [res.item.recipe, res.item.look && res.item.look !== res.item.recipe ? res.item.look : null].filter(Boolean);
+            const tag = tagParts.length ? `[${tagParts.join(" + ")}] ` : "";
+            console.log(ok(`✓ [${res.index + 1}/${items.length}] ${tag}${res.provider} -> ${res.savedPath}`));
           }
         },
         onItemFail: (fail) => {
@@ -984,6 +1168,9 @@ async function cmdBatch(args) {
             batchId,
             index: fail.index + 1,
             prompt: fail.item.prompt,
+            ...(fail.item.recipe ? { recipe: fail.item.recipe } : {}),
+            ...(fail.item.look ? { look: fail.item.look } : {}),
+            ...(fail.item.source ? { source: fail.item.source } : {}),
             error: redact(fail.error),
             code: fail.code,
             durationMs: fail.durationMs ?? null,
@@ -1028,6 +1215,9 @@ async function cmdBatch(args) {
             ok: r.ok,
             index: r.index + 1,
             prompt: r.item.prompt,
+            ...(r.item.recipe ? { recipe: r.item.recipe } : {}),
+            ...(r.item.look ? { look: r.item.look } : {}),
+            ...(r.item.source ? { source: r.item.source } : {}),
             savedPath: r.savedPath || null,
             provider: r.provider || null,
             error: r.error || null,

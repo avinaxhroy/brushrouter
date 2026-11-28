@@ -699,3 +699,190 @@ test("layered custom recipes load from BRUSHROUTER_EXTRA_RECIPES_DIRS on top of 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("resolveBatchItem composes per-item recipe/look/values/twist, merges batch defaults, and fails fast", async () => {
+  const { resolveBatchItem, ratioToSize } = await import("../src/library.js");
+  const look = looks.find((r) => r.styleLock?.length && r.doNotClone?.length);
+
+  // Per-item recipe + look + values + twist + ratio->size auto-mapping
+  const item = resolveBatchItem(
+    {
+      recipe: "logo-mark",
+      look: look.id,
+      values: { text: "NORTHWIND", ratio: "16:9" },
+      twist: "embossed brass foil",
+      prompt: "minimal shadow",
+    },
+    {},
+    { index: 0 },
+  );
+  assert.equal(item.recipe, "logo-mark");
+  assert.equal(item.look, look.id);
+  assert.equal(item.size, ratioToSize("16:9"));
+  assert.equal(item.source?.license, "MIT");
+  assert.equal(item.slugLabel, `logo-mark-${look.id}`);
+  assert.match(item.prompt, /NORTHWIND/);
+  assert.match(item.prompt, /CREATIVE DIRECTION — embossed brass foil minimal shadow/);
+  assert.match(item.prompt, /STYLE LOCK —/);
+  assert.match(item.prompt, /DO NOT REPRODUCE —/);
+
+  // Explicit size overrides ratio suggestion; includeNegatives:false drops DO NOT REPRODUCE / AVOID
+  const overridden = resolveBatchItem(
+    {
+      recipe: "logo-mark",
+      look: look.id,
+      values: { text: "ACME", ratio: "16:9" },
+      size: "1024x1024",
+      includeNegatives: false,
+    },
+    {},
+    { index: 1 },
+  );
+  assert.equal(overridden.size, "1024x1024");
+  assert.match(overridden.prompt, /STYLE LOCK —/);
+  assert.doesNotMatch(overridden.prompt, /DO NOT REPRODUCE —/);
+  assert.doesNotMatch(overridden.prompt, /AVOID —/);
+
+  // Batch-level defaults merge with per-item values (per-item wins)
+  const merged = resolveBatchItem(
+    { values: { text: "SOLAR" }, twist: "warm sunset" },
+    { recipe: "logo-mark", look: look.id, values: { text: "DEFAULT", ratio: "4:5" }, twist: "clean lines" },
+    { index: 2 },
+  );
+  assert.match(merged.prompt, /SOLAR/);
+  assert.doesNotMatch(merged.prompt, /DEFAULT/);
+  assert.equal(merged.size, ratioToSize("4:5"));
+  assert.match(merged.prompt, /CREATIVE DIRECTION — clean lines warm sunset/);
+
+  // Empty/whitespace per-item fields fall back to batch defaults
+  const blankFallback = resolveBatchItem(
+    { prompt: "a fox", size: "", quality: "   ", background: "", model: "" },
+    { size: "1024x1024", quality: "high", background: "transparent", model: "gpt-image-1" },
+    { index: 3 },
+  );
+  assert.equal(blankFallback.size, "1024x1024");
+  assert.equal(blankFallback.quality, "high");
+  assert.equal(blankFallback.background, "transparent");
+  assert.equal(blankFallback.model, "gpt-image-1");
+
+  // Missing required free slot fails fast
+  assert.throws(
+    () => resolveBatchItem({ recipe: "logo-mark" }, {}, { index: 0 }),
+    /missing required slot.*\{text\}/,
+  );
+  // Unknown recipe fails fast
+  assert.throws(
+    () => resolveBatchItem({ recipe: "does-not-exist", values: { subject: "x" } }, {}, { index: 0 }),
+    /unknown recipe/i,
+  );
+  // Non-object values fails fast
+  assert.throws(
+    () => resolveBatchItem({ recipe: "logo-mark", values: ["bad"] }, {}, { index: 0 }),
+    /"values" must be an object/,
+  );
+});
+
+test("expandBrainstormBatch fans out contrasting directions across recipes and looks", async () => {
+  const { expandBrainstormBatch, ratioToSize } = await import("../src/library.js");
+
+  // 1. Mixed brainstorm for "product" with { subject } fills jobs and pairs looks with anchor job
+  const mixed = expandBrainstormBatch({
+    query: "product",
+    count: 4,
+    values: { subject: "matte black ceramic kettle", ratio: "16:9" },
+    twist: "morning window light",
+    seed: 1,
+  });
+  assert.equal(mixed.items.length, 4);
+  const seenKeys = new Set(mixed.items.map((it) => `${it.recipe || ""}+${it.look || ""}`));
+  assert.equal(seenKeys.size, 4, "every brainstormed item should be distinct");
+  assert.ok(mixed.items.some((it) => it.look), "mixed brainstorm should include look-layered items");
+  for (const it of mixed.items) {
+    assert.match(it.prompt, /matte black ceramic kettle/);
+    assert.match(it.prompt, /morning window light/);
+    assert.equal(it.size, ratioToSize("16:9"));
+    assert.doesNotMatch(it.prompt, /\{[a-z_]+\}/, `unfilled slot leaked in ${it.recipe}+${it.look}`);
+  }
+  const withLook = mixed.items.find((it) => it.look);
+  assert.equal(withLook.source?.license, "MIT", "look-layered brainstorm items carry MIT attribution");
+
+  // 2. Fixed recipe + brainstorm fans out across contrasting looks
+  const byRecipe = expandBrainstormBatch({
+    query: "editorial",
+    recipe: "product-hero",
+    count: 3,
+    values: { subject: "brass espresso tamper" },
+    seed: 2,
+  });
+  assert.equal(byRecipe.items.length, 3);
+  assert.ok(byRecipe.items.every((it) => it.recipe === "product-hero" && Boolean(it.look)));
+  assert.equal(new Set(byRecipe.items.map((it) => it.look)).size, 3);
+
+  // 2b. Fixed recipe + reference images still fans out across looks (looks don't need acceptsImage)
+  const byRecipeWithRef = expandBrainstormBatch({
+    query: "editorial",
+    recipe: "product-hero",
+    count: 3,
+    values: { subject: "brass espresso tamper" },
+    images: ["ref.png"],
+    seed: 2,
+  });
+  assert.equal(byRecipeWithRef.items.length, 3);
+  assert.ok(byRecipeWithRef.items.every((it) => it.recipe === "product-hero" && Boolean(it.look) && it.images.length === 1));
+
+  // 3. Fixed look + brainstorm fans out across contrasting job recipes
+  const look = looks[0];
+  const byLook = expandBrainstormBatch({
+    query: "product",
+    look: look.id,
+    count: 3,
+    values: { subject: "ceramic kettle" },
+    seed: 1,
+  });
+  assert.equal(byLook.items.length, 3);
+  assert.ok(byLook.items.every((it) => it.look === look.id && it.recipe !== look.id));
+  assert.equal(new Set(byLook.items.map((it) => it.recipe)).size, 3);
+
+  // 4. Empty query explores the whole library
+  const explore = expandBrainstormBatch({
+    query: "",
+    count: 4,
+    values: { subject: "a red fox" },
+    seed: 7,
+  });
+  assert.equal(explore.items.length, 4);
+
+  // 5. Validation & failure cases
+  assert.throws(
+    () => expandBrainstormBatch({ query: "qqzzxx flibbertigibbet", values: { subject: "x" } }),
+    /found no recipes matching.*categories:/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "", category: "typography-text", values: { subject: "a courier" } }),
+    /could not fill any matching recipe.*\{text\}/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "editorial", kind: "look", values: { subject: "kettle" } }),
+    /--recipe/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "product", recipe: "product-hero", kind: "job", values: { subject: "x" } }),
+    /kind:"look"/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "product", look: look.id, kind: "look", values: { subject: "x" } }),
+    /kind:"job"/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "product", recipe: "product-hero", look: look.id, values: { subject: "x" } }),
+    /cannot fix both/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "product", count: 11, values: { subject: "x" } }),
+    /between 1 and 10/,
+  );
+  assert.throws(
+    () => expandBrainstormBatch({ query: "product", input: "image", values: { subject: "x" } }),
+    /requires at least one reference image/,
+  );
+});

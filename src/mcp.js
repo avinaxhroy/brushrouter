@@ -11,7 +11,7 @@ import { generate, probeAll, batchGenerate } from "./router.js";
 import { loadConfig } from "./config.js";
 import { saveImage, detectImageMime, batchVariantPath, batchItemPath, pngSize } from "./util/common.js";
 import { redact, redactValue, safeParseMessage, OPAQUE_BYTES } from "./util/redact.js";
-import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, getRecipe, loadRecipes } from "./library.js";
+import { findRecipes, renderResult, categoryIds, recipeCounts, publicRecipe, listCategories, composePrompt, resolveBatchItem, expandBrainstormBatch, getRecipe, loadRecipes } from "./library.js";
 import {
   tryRecordHistory,
   listHistory,
@@ -105,9 +105,11 @@ const TOOL_SCHEMA = {
 const BATCH_TOOL_SCHEMA = {
   name: BATCH_TOOL_NAME,
   description:
-    "Generate multiple images in a batch from a list of prompts. Automatically routes and distributes " +
-    "work across available backends in parallel (ChatGPT subscription, Gemini CLI, OpenRouter, etc.) " +
+    "Generate multiple images in a batch from prompts, per-item prompt-library recipes/looks, or a brainstorm query fan-out. " +
+    "Automatically routes and distributes work across available backends in parallel (ChatGPT subscription, Gemini CLI, OpenRouter, etc.) " +
     "with per-provider concurrency limits and rate-limit circuit breaking so no backend is bottlenecked. " +
+    "Each item in `items` accepts `prompt`, `recipe`, `look`, `values`, `twist`, and `includeNegatives` (auto-mapping `ratio` to `size`), " +
+    "or pass `brainstorm` (with optional `count`, `seed`, `kind`, `category`, `shape`, `recipe`/`look`, `values`, `twist`) to fan out contrasting directions straight into a batch. " +
     "Generations can take several minutes, so async:true is strongly recommended.",
   inputSchema: {
     type: "object",
@@ -115,14 +117,19 @@ const BATCH_TOOL_SCHEMA = {
       prompts: {
         type: "array",
         items: { type: "string" },
-        description: "List of prompt strings to generate.",
+        description: "List of prompt strings to generate (or extra creative directions when combined with batch-level `recipe`/`look`).",
       },
       items: {
         type: "array",
         items: {
           type: "object",
           properties: {
-            prompt: { type: "string" },
+            prompt: { type: "string", description: "Text prompt. Optional when `recipe` or `look` is set (if also provided, appended as creative direction)." },
+            recipe: { type: "string", description: "Optional prompt-library recipe or look id for this item." },
+            look: { type: "string", description: "Optional visual look id to layer onto `recipe`, or use standalone." },
+            values: { type: "object", description: "Slot values for this item's `recipe`/`look` (merged over batch-level `values`).", additionalProperties: { type: "string" } },
+            twist: { type: "string", description: "Optional creative direction injected before STYLE LOCK / AVOID for this item." },
+            includeNegatives: { type: "boolean", description: "Include DO NOT REPRODUCE and AVOID blocks when using `recipe`/`look` (default true)." },
             out: { type: "string" },
             size: { type: "string" },
             quality: { type: "string" },
@@ -134,9 +141,77 @@ const BATCH_TOOL_SCHEMA = {
               description: "Optional reference image paths for this item.",
             },
           },
-          required: ["prompt"],
         },
-        description: "List of items with per-item options (e.g. prompt, out, size, quality, background, model, images).",
+        description: "List of items with per-item options (prompt, recipe, look, values, twist, includeNegatives, out, size, quality, background, model, images).",
+      },
+      brainstorm: {
+        type: "string",
+        description: "Brainstorm query to fan out directly into contrasting batch items (pass \"\" to explore the whole library). Cannot be combined with `prompts` or `items`.",
+      },
+      count: {
+        type: "integer",
+        description: "Number of contrasting directions to generate when using `brainstorm` (default 4, max 10).",
+      },
+      kind: {
+        type: "string",
+        enum: ["job", "look"],
+        description: "Filter `brainstorm` to `job` recipes or `look` visual styles.",
+      },
+      category: {
+        type: "string",
+        description: "Restrict `brainstorm` to a specific category id.",
+      },
+      shape: {
+        type: "string",
+        enum: ["single", "grid", "sheet", "document"],
+        description: "Restrict `brainstorm` to an output shape.",
+      },
+      seed: {
+        type: "integer",
+        description: "Seed for varying `brainstorm` picks (default 0).",
+      },
+      recipe: {
+        type: "string",
+        description: "Optional batch-level default recipe id for all items, or base job layout to fan out across looks with `brainstorm`.",
+      },
+      look: {
+        type: "string",
+        description: "Optional batch-level default visual look id for all items, or look to apply across recipes with `brainstorm`.",
+      },
+      values: {
+        type: "object",
+        description: "Optional batch-level default slot values (merged under per-item `values`, and used to fill `brainstorm` items).",
+        additionalProperties: { type: "string" },
+      },
+      twist: {
+        type: "string",
+        description: "Optional batch-level creative direction for recipe/look/brainstorm items.",
+      },
+      includeNegatives: {
+        type: "boolean",
+        description: "Batch-level default for DO NOT REPRODUCE and AVOID blocks (default true).",
+      },
+      size: {
+        type: "string",
+        description: "Optional batch-level default image size (per-item `size` overrides; otherwise auto-mapped from recipe `ratio`).",
+      },
+      quality: {
+        type: "string",
+        description: "Optional batch-level default quality hint (low | medium | high | auto).",
+      },
+      background: {
+        type: "string",
+        enum: ["opaque", "transparent"],
+        description: "Optional batch-level default background.",
+      },
+      model: {
+        type: "string",
+        description: "Optional batch-level default model id.",
+      },
+      images: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional batch-level default reference image paths.",
       },
       outDir: {
         type: "string",
@@ -422,32 +497,65 @@ function assertGenerateArgs(args, cwd = process.cwd()) {
 }
 
 function validateBatchArgs(args) {
-  let rawItems = [];
-  if (Array.isArray(args.items) && args.items.length) {
-    rawItems = args.items;
-  } else if (Array.isArray(args.prompts) && args.prompts.length) {
-    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
-  } else {
-    throw new Error("batch_generate_images requires 'prompts' or 'items' array");
+  const concurrency = args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency");
+  const hasItems = Array.isArray(args.items) && args.items.length > 0;
+  const hasPrompts = Array.isArray(args.prompts) && args.prompts.length > 0;
+  const hasBrainstorm = typeof args.brainstorm === "string" || args.brainstorm === true;
+
+  if (hasBrainstorm) {
+    if (hasItems || hasPrompts) {
+      throw new Error('batch_generate_images cannot combine "brainstorm" with "prompts" or "items"');
+    }
+    const expanded = expandBrainstormBatch({
+      query: typeof args.brainstorm === "string" ? args.brainstorm : "",
+      count: args.count ?? 4,
+      kind: args.kind || null,
+      category: args.category || null,
+      shape: args.shape || null,
+      input: Array.isArray(args.images) && args.images.length ? "image" : "text",
+      seed: Number(args.seed) || 0,
+      recipe: args.recipe || null,
+      look: args.look || null,
+      values: args.values || {},
+      twist: args.twist || null,
+      includeNegatives: args.includeNegatives !== false,
+      size: args.size || null,
+      quality: args.quality || null,
+      background: args.background || null,
+      model: args.model || null,
+      images: args.images || [],
+    });
+    return { rawItems: expanded.items, concurrency, brainstorm: expanded };
   }
 
-  // The schema declares `prompt` required, but MCP clients are not obliged to
-  // validate against it. Sending an empty prompt to a provider costs a real
-  // request and reports "✓" for a blank image, so reject it here and name the
-  // offending index. A bare string entry is a prompt, not an object to spread —
-  // spreading "a red fox" gave {0:'a',1:' ',...} and lost the prompt entirely.
-  const normalized = rawItems.map((item, idx) => {
-    const entry = typeof item === "string" ? { prompt: item } : item;
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`batch_generate_images items[${idx}] must be a prompt string or an object with a prompt`);
-    }
-    if (typeof entry.prompt !== "string" || entry.prompt.trim() === "") {
-      throw new Error(`batch_generate_images items[${idx}] is missing a non-empty "prompt"`);
-    }
-    return entry;
-  });
-  const concurrency = args.concurrency == null ? undefined : positiveInt(args.concurrency, "concurrency");
-  return { rawItems: normalized, concurrency };
+  let rawItems = [];
+  if (hasItems) {
+    rawItems = args.items;
+  } else if (hasPrompts) {
+    rawItems = args.prompts.map((p) => (typeof p === "string" ? { prompt: p } : p));
+  } else {
+    throw new Error("batch_generate_images requires 'prompts' or 'items' array (or 'brainstorm')");
+  }
+
+  const batchDefaults = {
+    recipe: args.recipe || null,
+    look: args.look || null,
+    values: args.values || undefined,
+    twist: args.twist || null,
+    includeNegatives: args.includeNegatives !== false,
+    size: args.size || undefined,
+    quality: args.quality || undefined,
+    background: args.background || undefined,
+    model: args.model || undefined,
+    images: Array.isArray(args.images) ? args.images : undefined,
+  };
+
+  // Validate and compose every item up front so async jobs fail fast on missing
+  // prompts, unknown recipes/looks, or unfilled free slots before spending quota.
+  const normalized = rawItems.map((item, idx) =>
+    resolveBatchItem(item, batchDefaults, { index: idx, label: "batch_generate_images items" }),
+  );
+  return { rawItems: normalized, concurrency, brainstorm: null };
 }
 
 // Runs the generation and returns the exact tools/call content the agent would
@@ -673,7 +781,7 @@ async function runBatchGenerate(args, ctx, onProgress) {
 
   const items = rawItems.map((item, idx) => ({
     ...item,
-    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.prompt),
+    out: item.out ? resolve(outDir, item.out) : batchItemPath(outDir, idx + 1, rawItems.length, item.slugLabel || item.prompt),
   }));
 
   const shouldEmbed = args.embedImages === true || (!("embedImages" in args) && rawItems.length <= 3);
@@ -756,13 +864,25 @@ async function runBatchGenerate(args, ctx, onProgress) {
         })
         .filter(Boolean)
     : [];
+  const itemTag = (it) => {
+    const parts = [it?.recipe, it?.look && it.look !== it.recipe ? it.look : null].filter(Boolean);
+    return parts.length ? `[${parts.join(" + ")}] ` : "";
+  };
+  const credits = [...new Set(
+    items
+      .map((it) => it.source?.repo ? `${it.source.styleName || it.look || it.recipe} (${it.source.repo}, ${it.source.license || "MIT"})` : null)
+      .filter(Boolean),
+  )];
   const textLines = [
     `Batch generation finished: ${batchRes.completed}/${batchRes.total} completed (${batchRes.failed} failed).`,
     `Directory: ${outDir}`,
     ...batchRes.results.map((r, i) =>
-      r.ok ? `✓ [${i + 1}] ${r.provider} -> ${r.savedPath}` : `✗ [${i + 1}] failed: ${redact(r.error)}`,
+      r.ok ? `✓ [${i + 1}] ${itemTag(r.item)}${r.provider} -> ${r.savedPath}` : `✗ [${i + 1}] ${itemTag(r.item)}failed: ${redact(r.error)}`,
     ),
   ];
+  if (credits.length) {
+    textLines.push(`Attribution: ${credits.join("; ")}`);
+  }
   if (!shouldEmbed && completedResults.length > 0) {
     textLines.push(`(Image files written to ${outDir}; pass embedImages:true to include base64 payload in response)`);
   }
