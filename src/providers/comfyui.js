@@ -70,7 +70,7 @@ export const comfyUIProvider = {
   async probe(cfg) {
     try {
       await apiRequest(id, `${endpoint(cfg)}/system_stats`, {}, Math.min(Number(cfg?.timeoutMs) || 2500, 2500));
-      return { available: true, auth: "not-required", detail: "ComfyUI is reachable" };
+      return { available: true, auth: "not-required", verification: "verified", detail: "ComfyUI is reachable" };
     } catch (err) {
       return { available: false, auth: "unreachable", detail: `ComfyUI is not reachable: ${err.message}` };
     }

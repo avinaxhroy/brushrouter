@@ -5,7 +5,7 @@ import type { BatchItemOptions, RecipeSource } from "./library.js";
 
 export type { ProviderId } from "./config.js";
 
-export type ProviderKind = "native-cli" | "subscription" | "web-session" | "cli-oauth" | "api-key" | "user-defined";
+export type ProviderKind = "native-cli" | "subscription" | "web-session" | "cli-oauth" | "api-key" | "user-defined" | "local";
 
 export interface ProviderProbe {
   available: boolean;
@@ -13,6 +13,8 @@ export interface ProviderProbe {
   detail: string;
   expires?: string | null;
   clientId?: string;
+  verification?: "verified";
+  acceptsPinnedModel?: boolean;
 }
 
 export interface ProviderStatus extends ProviderProbe {
@@ -21,6 +23,7 @@ export interface ProviderStatus extends ProviderProbe {
   kind: ProviderKind;
   note: string;
   supportsImages: boolean;
+  supportsMask: boolean;
   enabled: boolean;
 }
 
@@ -177,7 +180,11 @@ export const PROVIDERS: { [Id in ProviderId]: Provider<Id> } & {
 export const DEFAULT_PROVIDER_CONCURRENCY: Record<ProviderId, number>;
 
 export function listProviderIds(): ProviderId[];
-export function probeAll(config: Config): Promise<ProviderStatus[]>;
+export function probeAll(config: Config, options?: { skipDisabled?: boolean }): Promise<ProviderStatus[]>;
+export function batchProbeAllowsModel(
+  probe: Pick<ProviderStatus, "enabled" | "available" | "acceptsPinnedModel"> | null | undefined,
+  model?: unknown,
+): boolean;
 export function planAttemptOrder(config: Config, options?: AttemptOrderOptions): Promise<ProviderId[]>;
 export function generate(options: GenerateOptions, config?: Config | null): Promise<GenerationResult>;
 export function isRateLimitError(err: unknown): boolean;

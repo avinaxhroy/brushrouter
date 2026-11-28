@@ -138,6 +138,10 @@ export function validateStyles(file = STYLES_FILE) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  if (process.argv.length > 2) {
+    console.error("This script only checks bundled recipes and looks. For custom directories, run: brushrouter recipes validate [dir...]");
+    process.exit(2);
+  }
   const recipes = validateRecipes();
   const looks = validateStyles();
   console.log(

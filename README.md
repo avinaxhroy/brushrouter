@@ -52,11 +52,16 @@ npm link
 brushrouter setup
 ```
 
-`setup` auto-detects image backends (ChatGPT desktop CLI, ChatGPT subscriptions, Google/Antigravity CLI, agent auth stores), offers one-command login if none are found, verifies `brushrouter` is on your PATH, wires every detected agent's MCP config, and offers an optional test generation. Diagnose any time:
+`setup` detects image backends, checks your PATH, and can offer login, MCP wiring, project rules and a test generation. In CI, without a TTY, or with `--non-interactive` or `--json`, it never prompts and only writes MCP settings or rules if you give `--yes`. `--dry-run` never prompts or writes. Setup exits nonzero if it finds no usable provider.
 
 ```bash
-brushrouter doctor     # diagnoses all provider backends + agent MCP integrations
+brushrouter setup --non-interactive --json
+brushrouter doctor --json                  # health check; nonzero if no provider is ready
+brushrouter doctor --fix --dry-run         # preview safe user-config repairs
+brushrouter doctor --fix                   # apply repairs and diagnose again
 ```
+
+Doctor does not probe disabled providers. It distinguishes verified connectivity from providers that are only configured. Repairs are opt-in and local: create missing user config, secure its permissions, or back up and replace malformed user config. They do not enable paid routes, sign you in, or install anything.
 
 ## Use
 
@@ -86,7 +91,8 @@ br providers        # what is connected, and how
 br routes           # which routes auto-routing may use
 br models           # model ids (live for OpenRouter)
 br prompts          # 27 recipes + 137 looks for briefing an image
-br doctor           # full connectivity diagnosis
+br recipes validate # validate configured custom recipe and look directories
+br doctor           # connectivity diagnosis for enabled providers
 br setup            # first-run auto-connect
 br login            # sign in to ChatGPT for the codex route (browser OAuth, no API key)
 br vendor gptweb2api  # install the browserless ChatGPT-web gateway binary
@@ -100,6 +106,8 @@ br rules            # inject compact guidance into AGENTS.md / .cursorrules
 br update           # update to latest version and verify health
 br serve            # run as an MCP server on stdio
 ```
+
+`brushrouter models [provider...] --json` lists static models and the live OpenRouter catalogue. Unknown providers fail; if a live listing fails, its provider has an `error` field (not a fake model). The command exits nonzero if none of the selected providers can be listed.
 
 ### Reference images
 
@@ -342,7 +350,10 @@ Aspect ratios and slow generations: MCP has no standard late-answer for a `tools
 
 ```bash
 brushrouter update          # pulls latest (git or npm global), refreshes links, runs doctor
+brushrouter update --dry-run --json
 ```
+
+Update reports failed pull, link or install steps and skips the health check on failure. In JSON mode the post-update `doctor` result is separate from the update result.
 
 ```bash
 npm install -g brushrouter@latest

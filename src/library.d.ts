@@ -104,6 +104,12 @@ export interface IndexedCategory extends CategorySummary {
 
 export type RecipeCounts = Record<RecipeKind, number>;
 
+export interface CustomRecipeValidation {
+  ok: boolean;
+  directories: string[];
+  files: { file: string; entries: number; errors: string[] }[];
+}
+
 export interface RecipeLibrary {
   version: number;
   note: string;
@@ -120,6 +126,7 @@ export interface RecipeLibrary {
   recipeIds: Record<RecipeKind | "all", string[]>;
   listCategories: Record<RecipeKind | "all", RecipeCategory[]>;
   styleSource: StyleSource | null;
+  customWarnings: { file: string; message: string }[];
   categoryById: Map<string, IndexedCategory>;
   recipeById: Map<string, IndexedRecipe>;
 }
@@ -317,6 +324,7 @@ export interface FullPublicRecipe extends PublicRecipeBase {
 }
 
 export function ratioToSize(ratio?: unknown): ImageSize | null;
+export function validateCustomRecipes(paths?: readonly string[]): CustomRecipeValidation;
 export function loadRecipes(): RecipeLibrary;
 export function resetRecipesCache(): void;
 export function categoryIds(kind?: RecipeKind | null): string[];

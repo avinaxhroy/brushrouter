@@ -31,6 +31,10 @@ export interface ProviderConfigs {
     resolution?: string | null;
   };
   fal: ApiKeyProviderConfig;
+  openai: ApiKeyProviderConfig;
+  "gemini-api": ApiKeyProviderConfig;
+  replicate: ApiKeyProviderConfig;
+  comfyui: ProviderConfig & { baseUrl?: string };
   gptweb2api: AuthFileProviderConfig & {
     bin?: string | null;
     cookie?: string | null;

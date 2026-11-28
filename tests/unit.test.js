@@ -2603,7 +2603,7 @@ test("CLI setup --dry-run writes nothing", async () => {
     }
   })();
   const r = run(["setup", "--dry-run"], { home, cwd, stdin: "" });
-  assert.equal(r.status, 0, `setup --dry-run should exit 0, got ${r.status}: ${r.stderr}`);
+  assert.equal(r.status, 1, `setup without a provider should exit 1, got ${r.status}: ${r.stderr}`);
   const after = (() => {
     try {
       return readdirSync(home.home, { recursive: true }).sort();
@@ -2622,8 +2622,7 @@ test("CLI setup --dry-run writes nothing", async () => {
 });
 
 // The real hazard is the interactive half: Phase 2 is only reached with a TTY.
-// Fake one, pick "sign in with ChatGPT", and assert the OAuth login is
-// described rather than performed.
+// Fake one and leave stdin open with no answers: a dry run must not prompt.
 test("CLI setup --dry-run does not run the interactive login", async () => {
   const { spawn } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
@@ -2659,24 +2658,6 @@ await import(${JSON.stringify(pathToFileURL(bin).href)});
   let out = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (out += d));
-  // Answer every prompt: pick "Sign in with ChatGPT" (the mutating branch), then
-  // decline MCP wiring, rules injection and the smoke test so setup can finish.
-  const answers = [];
-  const plan = [
-    [/Select \[1-4\]/, "1\n"],
-    [/Wire brushrouter MCP into/, "n\n"],
-    [/Inject clean brushrouter guidance/, "n\n"],
-    [/Generate a quick test image/, "n\n"],
-  ];
-  const iv = setInterval(() => {
-    for (let i = answers.length; i < plan.length; i++) {
-      if (plan[i][0].test(out)) {
-        child.stdin.write(plan[i][1]);
-        answers.push(i);
-        break;
-      }
-    }
-  }, 100);
   const code = await new Promise((resolve) => {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -2687,9 +2668,9 @@ await import(${JSON.stringify(pathToFileURL(bin).href)});
       resolve(c);
     });
   });
-  clearInterval(iv);
   assert.notEqual(code, "timeout", "setup --dry-run hung at the provider prompt");
-  assert.match(out, /Dry run: would sign in to ChatGPT/i, `the login was not dry-guarded:\n${out.slice(-600)}`);
+  assert.match(out, /Dry run: would offer sign-in/i, `the login was not dry-guarded:\n${out.slice(-600)}`);
+  assert.doesNotMatch(out, /Select \[1-4\]|Wire brushrouter MCP into|Inject clean brushrouter guidance|Generate a quick test image/);
   assert.ok(!existsSync(join(home.cfgDir, "auth.json")), "a dry run wrote auth.json");
   assert.ok(!existsSync(home.userConfig), "a dry run wrote config.json");
   assert.ok(!/Opening browser for ChatGPT OAuth sign-in/i.test(out), "a dry run actually opened the OAuth flow");
@@ -2928,8 +2909,9 @@ test("CLI setup terminates instead of hanging on an open stdin", async () => {
   const started = Date.now();
   const r = run(["setup", "--dry-run"], { home, cwd, stdin: "" });
   const elapsed = Date.now() - started;
-  assert.equal(r.status, 0, `setup should exit 0, got ${r.status}: ${r.stderr}`);
-  assert.match(r.stdout, /brushrouter is ready/, "setup did not reach its final screen");
+  assert.equal(r.status, 1, `setup without a provider should exit 1, got ${r.status}: ${r.stderr}`);
+  assert.match(r.stdout, /Setup did not find a usable provider/, "setup did not reach its final screen");
+  assert.doesNotMatch(r.stdout, /brushrouter is ready!/);
   // spawnSync itself would time out on a leak; assert it finished well inside
   // the timeout so a regression fails with a clear message rather than a hang.
   assert.ok(elapsed < 30000, `setup took ${elapsed}ms — it is holding the event loop open`);
@@ -3079,6 +3061,7 @@ fake(process.stdin); fake(process.stdout); fake(process.stderr);
 const setRaw = process.stdin.setRawMode.bind(process.stdin);
 const modes = [];
 process.stdin.setRawMode = (v) => { modes.push(v); return setRaw(v); };
+process.env.CI = "false";
 process.argv = [process.argv[0], ${JSON.stringify(bin)}, "setup"];
 process.on("exit", (c) => process.stderr.write("\\nMODES:" + JSON.stringify(modes) + " CODE:" + c + "\\n"));
 await import(${JSON.stringify(pathToFileURL(bin).href)});
@@ -3569,7 +3552,7 @@ test("openrouterProvider.probe strips trailing slash from baseUrl", async () => 
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     urls.push(String(url));
-    return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ data: [{ id: "fixture/image-model" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   try {
     const res = await openrouterProvider.probe({ apiKey: "sk-or-test-key-1234567890", baseUrl: "https://example.test/api/v1/" });

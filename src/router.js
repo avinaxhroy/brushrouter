@@ -52,7 +52,7 @@ export function listProviderIds() {
   return Object.keys(PROVIDERS);
 }
 
-export async function probeAll(cfg) {
+export async function probeAll(cfg, { skipDisabled = false } = {}) {
   // Probes are independent — each spawns a process or makes a request of its
   // own — so running them together costs the slowest probe instead of the sum.
   // `Promise.all` preserves this order, which callers (doctor, routes) display.
@@ -62,7 +62,9 @@ export async function probeAll(cfg) {
       const pcfg = providerConfig(cfg, id);
       let status;
       try {
-        status = await p.probe(pcfg);
+        status = skipDisabled && pcfg.enabled === false
+          ? { available: false, auth: "disabled", detail: "" }
+          : await p.probe(pcfg);
       } catch (e) {
         status = { available: false, auth: "error", detail: e.message };
       }
@@ -78,6 +80,10 @@ export async function probeAll(cfg) {
       };
     }),
   );
+}
+
+export function batchProbeAllowsModel(probe, model) {
+  return Boolean(probe?.enabled && (probe.available || (probe.acceptsPinnedModel && typeof model === "string" && model.trim())));
 }
 
 // Exported so the CLI's `gen --dry-run` reports the exact order the router
@@ -350,6 +356,7 @@ export async function batchGenerate(
   for (const item of items) requireMaskImage(item?.mask, item?.images);
 
   let allowedProviders = [];
+  let autoProbes;
   if (provider) {
     if (!PROVIDERS[provider]) throw new Error(`unknown provider "${provider}" (known: ${listProviderIds().join(", ")})`);
     // Same gate as attemptOrder: a batch naming a disabled route would otherwise
@@ -363,11 +370,8 @@ export async function batchGenerate(
     }
   } else {
     const probes = await probeAll(cfg);
-    const probeMap = new Map(probes.map((p) => [p.id, p]));
-    allowedProviders = cfg.priority.filter((p) => {
-      const pr = probeMap.get(p);
-      return pr && pr.enabled && pr.available;
-    });
+    autoProbes = new Map(probes.map((p) => [p.id, p]));
+    allowedProviders = cfg.priority.filter((p) => items.some((item) => batchProbeAllowsModel(autoProbes.get(p), item?.model)));
   }
 
   if (!allowedProviders.length) {
@@ -427,11 +431,14 @@ export async function batchGenerate(
   let completedCount = 0;
   let failedCount = 0;
   let retryTimer = null;
+  function compatible(item, id) {
+    return acceptsItem(id, item) && (!autoProbes || batchProbeAllowsModel(autoProbes.get(id), item.model));
+  }
   function findFreeProvider(item) {
     const now = Date.now();
     for (const id of allowedProviders) {
       if (item.failedProviders.has(id)) continue;
-      if (!acceptsItem(id, item)) continue;
+      if (!compatible(item, id)) continue;
       const until = cooldownUntil.get(id) || 0;
       if (until > now) continue;
       const active = activeCount.get(id) || 0;
@@ -483,7 +490,7 @@ export async function batchGenerate(
         for (const item of pendingQueue) {
           for (const id of allowedProviders) {
             if (item.failedProviders.has(id)) continue;
-            if (!acceptsItem(id, item)) continue;
+            if (!compatible(item, id)) continue;
             const until = cooldownUntil.get(id) || 0;
             if (until > now) nextExpiry = Math.min(nextExpiry, until - now);
           }
@@ -600,7 +607,7 @@ export async function batchGenerate(
         }
 
         const hasCandidate = allowedProviders.some(
-          (cand) => !item.failedProviders.has(cand) && acceptsItem(cand, item),
+          (cand) => !item.failedProviders.has(cand) && compatible(item, cand),
         );
 
         if (hasCandidate && (!provider || fallback)) {
